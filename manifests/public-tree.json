@@ -24,6 +24,7 @@
   ],
   "excluded_roots": [
     ".ao",
+    ".ao-mission",
     ".local",
     ".worktrees",
     "build",

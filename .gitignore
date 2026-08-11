@@ -4,6 +4,7 @@
 # Local mission, handoff, and operator material: never publish
 /.local/
 /.ao/
+/.ao-mission/
 /.worktrees/
 /.env
 /.env.*

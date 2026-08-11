@@ -9,6 +9,20 @@ the handoff prompt. Do not run the mission from the AO Mission source checkout.
 AO Mission writes durable records under `.ao/mission/`. The `.ao/` and `.local/`
 trees stay outside Git.
 
+Always pass the state root explicitly:
+
+```sh
+.local/bin/ao-mission --home .ao/mission init
+.local/bin/ao-mission --home .ao/mission start "Build AO Office Pool through the months 1-6 developer-preview gate"
+```
+
+AO Mission records the objective; the LLM agent reads the Markdown handoff.
+
+On macOS, ExFAT writes extended attributes as `._*` AppleDouble files. Use an
+APFS scratch checkout for write-heavy tests and remove those metadata files
+from `.ao/mission/` before mission enumeration. Windows qualification still
+requires the fixed NTFS installation root.
+
 ## Public repository
 
 ```text
