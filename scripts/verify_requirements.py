@@ -34,7 +34,7 @@ def verify_requirements(path: Path) -> dict[str, Requirement]:
     for row in rows:
         if not isinstance(row, dict) or set(row) != _REQUIREMENT_FIELDS:
             raise ValueError("invalid requirement fields")
-        if any(not isinstance(row[field], str) or not row[field] for field in _REQUIREMENT_FIELDS):
+        if any(not isinstance(row[field], str) or not row[field].strip() for field in _REQUIREMENT_FIELDS):
             raise ValueError("requirement fields must be nonempty strings")
         if row["id"] in requirements or row["test_id"] in test_ids:
             raise ValueError("requirement and test ids must be unique")

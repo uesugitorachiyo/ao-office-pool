@@ -7,6 +7,11 @@ from urllib.parse import urlsplit
 
 _LOCK_FIELDS = {"schema_version", "components"}
 _COMPONENT_FIELDS = {"name", "version", "repository", "commit", "asset", "license", "sha256"}
+_EXPECTED_COMPONENTS = {
+    "ao-architecture", "ao-mission", "ao2", "ao2-control-plane", "ao-blueprint",
+    "ao-atlas", "ao-foundry", "ao-forge", "ao-covenant", "ao-command", "ao-arena",
+    "ao-crucible", "ao-sentinel", "ao-promoter",
+}
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -30,7 +35,7 @@ def _asset_path(component: dict[str, str], component_root: Path) -> Path:
         raise ValueError("component path fields must be nonempty strings")
     if any("/" in value or "\\" in value or value in {".", ".."} for value in (name, version)):
         raise ValueError("component name and version must be path segments")
-    if Path(asset).name != asset or asset in {".", ".."}:
+    if "/" in asset or "\\" in asset or Path(asset).name != asset or asset in {".", ".."}:
         raise ValueError("asset must be a file name")
     root = component_root.resolve()
     path = (root / name / version / asset).resolve()
@@ -55,6 +60,8 @@ def verify_lock(path: Path, component_root: Path) -> dict[str, str]:
     for component in components:
         if not isinstance(component, dict) or set(component) != _COMPONENT_FIELDS:
             raise ValueError("invalid component fields")
+        if any(not isinstance(value, str) or not value.strip() for value in component.values()):
+            raise ValueError("component fields must be nonblank strings")
         if component["name"] in verified:
             raise ValueError("duplicate component name")
         if not _COMMIT.fullmatch(component["commit"]) or not _SHA256.fullmatch(component["sha256"]):
@@ -68,4 +75,6 @@ def verify_lock(path: Path, component_root: Path) -> dict[str, str]:
         if not asset.is_file() or _digest(asset) != component["sha256"]:
             raise ValueError("asset digest does not match lock")
         verified[component["name"]] = component["sha256"]
+    if set(verified) != _EXPECTED_COMPONENTS:
+        raise ValueError("components must contain the exact expected name set")
     return verified
