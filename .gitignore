@@ -1,0 +1,40 @@
+# Local mission, handoff, and operator material
+/.local/
+/.ao/
+/.env
+/.env.*
+!/.env.example
+
+# Generated pool and runtime state
+/pool.json
+/.pool.lock
+/offices/
+/operator-secrets/
+/runtime/
+/updates/
+/support-bundles/
+
+# Credentials and private receipts
+*.receipt.json
+recovery-key*
+*.pem
+*.key
+*.p12
+
+# Build and test output
+/build/
+/dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local operating-system and editor files
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+Thumbs.db
+.idea/
+.vscode/
