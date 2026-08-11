@@ -4,11 +4,25 @@ from pathlib import PureWindowsPath
 
 _INVALID_CHARACTERS = frozenset('<>:"/\\|?*')
 _RESERVED_NAMES = frozenset(
-    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "conin$",
+        "conout$",
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
+    }
     | {f"com{number}" for number in range(1, 10)}
     | {f"lpt{number}" for number in range(1, 10)}
 )
 _SHORT_NAME = re.compile(r"^[^ .~]{1,6}~[0-9]+(?:\.[^.]*)?$", re.IGNORECASE)
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
 def validate_segment(value: str) -> str:
@@ -63,4 +77,4 @@ def canonical_windows_path(value: str) -> PureWindowsPath:
     else:
         raise ValueError("Windows path must be drive-absolute or UNC-absolute")
 
-    return PureWindowsPath(conventional.casefold())
+    return PureWindowsPath(conventional.translate(_ASCII_LOWER))

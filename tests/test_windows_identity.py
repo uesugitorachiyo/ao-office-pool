@@ -57,6 +57,14 @@ class WindowsIdentityPhysicalTests(unittest.TestCase):
         self.assertEqual(first, alias)
         self.assertIsNone(require_within(alias, open_identity(self.root)))
 
+    def test_unicode_spelling_does_not_alias_a_different_sibling(self):
+        # MUTATION: full Unicode casefold opens Strasse.txt for Straße.txt.
+        sharp_s = self.root / "Straße.txt"
+        expanded_s = self.root / "Strasse.txt"
+        sharp_s.write_text("sharp", encoding="utf-8")
+        expanded_s.write_text("expanded", encoding="utf-8")
+        self.assertNotEqual(open_identity(sharp_s), open_identity(expanded_s))
+
     def test_rejects_hard_link_alias(self):
         # MUTATION: checking ancestry alone admits an outside file hard-linked inside.
         original = self.outside / "original.txt"
