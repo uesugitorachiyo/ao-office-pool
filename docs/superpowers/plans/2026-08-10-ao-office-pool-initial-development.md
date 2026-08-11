@@ -25,6 +25,38 @@
 
 ---
 
+### Task 0: Materialized repository and AO stack layout
+
+**Files:**
+- Create: `docs/STACK_LAYOUT.md`
+- Create: `manifests/stack-layout.json`
+- Create: `manifests/public-tree.json`
+- Create: `.github/workflows/.gitkeep`
+- Create: `cmd/.gitkeep`
+- Create: `internal/.gitkeep`
+- Create: `schemas/.gitkeep`
+- Create: `skills/.gitkeep`
+- Create: `scripts/.gitkeep`
+- Create: `tests/.gitkeep`
+- Create: `packaging/windows/.gitkeep`
+- Modify: `.gitignore`
+- Modify: `.local/handoffs/AO_MISSION_HANDOFF.md`
+
+**Interfaces:**
+- AO Mission working directory: repository root `.`.
+- AO Mission component checkout: `.local/sources/ao-mission`; never the mission working directory.
+- Durable project mission state: `.ao/mission`.
+- Local AO source root: `.local/sources`.
+- Windows package staging root: `.local/staging/windows-x86_64`.
+- Public GitHub boundary: `manifests/public-tree.json`.
+
+- [x] Materialize all tracked roots, fourteen ignored AO source directories, thirteen shared component staging directories, O1–O5 runtime/history/work directories, and connected-project `.ao/` state roots.
+- [x] Confirm `manifests/stack-layout.json` contains exactly fourteen source components, thirteen shared Windows components, O1–O5, and `ao2` as the office-local runtime component.
+- [x] Confirm every excluded root, name, and pattern in `manifests/public-tree.json` has a matching `.gitignore` rule or an ignored parent.
+- [x] Run `git check-ignore` against `.local/sources/ao-mission`, `.local/staging/windows-x86_64/offices/O1/work`, `.ao/mission`, `offices/O1`, and `operator-secrets`; every path must report ignored.
+- [x] Run a tracked-file root audit; every candidate public file must be a listed root file or live under a listed tracked root.
+- [x] Commit with `git commit -m "build: materialize repository and AO stack layout"` before executing Task 1.
+
 ### Task 1: Requirement inheritance and source locks
 
 **Files:**

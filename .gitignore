@@ -1,11 +1,15 @@
-# Local mission, handoff, and operator material
+# GitHub public content lives only in the roots and root files documented by
+# manifests/public-tree.json.
+
+# Local mission, handoff, and operator material: never publish
 /.local/
 /.ao/
+/.worktrees/
 /.env
 /.env.*
 !/.env.example
 
-# Generated pool and runtime state
+# Generated pool and runtime state: never publish
 /pool.json
 /.pool.lock
 /offices/
@@ -14,14 +18,14 @@
 /updates/
 /support-bundles/
 
-# Credentials and private receipts
+# Credentials and private receipts: never publish
 *.receipt.json
 recovery-key*
 *.pem
 *.key
 *.p12
 
-# Build and test output
+# Build and test output: rebuild locally, never publish
 /build/
 /dist/
 __pycache__/
@@ -29,7 +33,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 
-# Local operating-system and editor files
+# Local operating-system and editor files: never publish
 .DS_Store
 ._*
 .Spotlight-V100/

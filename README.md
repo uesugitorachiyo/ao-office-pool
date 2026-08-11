@@ -18,9 +18,10 @@ Windows readiness.
 ## Read first
 
 1. [Architecture design](docs/superpowers/specs/2026-08-10-ao-office-pool-design.md)
-2. [Months 1–6 roadmap](docs/ROADMAP.md)
-3. [Months 7–12 roadmap](docs/ROADMAP_MONTHS_7_12.md)
-4. [Implementation plan](docs/superpowers/plans/2026-08-10-ao-office-pool-initial-development.md)
+2. [Folder and AO stack layout](docs/STACK_LAYOUT.md)
+3. [Months 1–6 roadmap](docs/ROADMAP.md)
+4. [Months 7–12 roadmap](docs/ROADMAP_MONTHS_7_12.md)
+5. [Implementation plan](docs/superpowers/plans/2026-08-10-ao-office-pool-initial-development.md)
 
 ## Public repository boundary
 
@@ -35,6 +36,10 @@ and mission state. AO Mission handoffs are stored at:
 
 - `.local/handoffs/AO_MISSION_HANDOFF.md`
 - `.local/handoffs/AO_MISSION_HANDOFF_MONTHS_7_12.md`
+
+`manifests/public-tree.json` lists the roots allowed in the public GitHub
+repository. `.gitignore` excludes local mission state, component checkouts,
+generated runtimes, credentials, receipts, caches, and support data.
 
 ## Component sources
 

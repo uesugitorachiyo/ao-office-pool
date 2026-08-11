@@ -67,6 +67,12 @@ ao-office-pool/
 └── .local/                 ignored handoffs, drafts, and mission state
 ```
 
+Development checkouts never live in tracked source folders. Each AO repository
+uses `.local/sources/<component-name>/`, downloads use `.local/downloads/`, and
+the generated Windows tree uses `.local/staging/windows-x86_64/`. AO Mission
+runs with the repository root as its working directory. Its source checkout is
+not a connected-project root.
+
 The finalized Windows installation adds generated private state:
 
 ```text
@@ -92,6 +98,16 @@ The finalized Windows installation adds generated private state:
 
 The installer chooses and records one fixed local NTFS root. Public source and
 release metadata must not hardcode a username or developer path.
+
+Shared component packages use `components/<component>/<version>/`. The accepted
+AO2 package may be staged there, but activation copies its verified runtime
+tree into each `offices/O1` through `offices/O5` runtime version directory.
+AO Architecture remains a source and contract reference unless a later lock
+records a separately qualified runtime asset.
+
+[The stack layout contract](../../STACK_LAYOUT.md) defines every development,
+staging, Production, and connected-project path. The machine-readable copy is
+`manifests/stack-layout.json`. AO Mission must verify both before Task 1.
 
 ## AO workflow and authority
 
