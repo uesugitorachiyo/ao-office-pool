@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Private office lifecycle state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "office_id", "generation", "status"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "office_id": {"enum": ["O1", "O2", "O3", "O4", "O5"]},
+    "generation": {"type": "integer", "minimum": 0},
+    "status": {"enum": ["free", "occupied", "recovery-required"]},
+    "holder_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "project_path": {"type": "string", "minLength": 1},
+    "project_volume": {"type": "integer", "minimum": 0},
+    "project_file_id": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["conversation", "pinned"]},
+    "authority_name": {"type": "string", "minLength": 1},
+    "authority_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reason": {"type": "string", "minLength": 1}
+  }
+}
