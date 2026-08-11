@@ -1,208 +1,280 @@
-# AO Office Pool Initial Development Implementation Plan
+# AO Office Pool v1.2 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build and qualify a Windows-native five-office coordination layer over a shared, version-pinned AO stack.
+**Goal:** Build and independently qualify a public Windows v1.2.0 release with five isolated AO offices, governed AO Mission intake, receipt-bound AO2 execution, and a lean portable skill package.
 
-**Architecture:** AO Mission accepts objectives after an office claim and routes governed work through the existing AO components. The product shares immutable component packages, gives O1-O5 independent AO2 runtime copies, and stores durable mission state in each connected project's `.ao/` directory.
+**Architecture:** A small coordination layer owns O1–O5 state, receipts, Windows identity, runtime activation, and public-safe readback. Shared immutable AO packages sit outside offices; each office has an independent equal AO2 runtime. Durable mission and evidence state stays in the connected project's `.ao/` tree.
 
-**Tech Stack:** Python 3.12 standard library for the initial control plane and tests, PowerShell 7 for Windows packaging, native AO component executables, JSON schemas, GitHub Actions Windows runners.
+**Tech Stack:** Python 3 standard library for portable coordination and release tooling, PowerShell 7-compatible packaging commands, native Windows file APIs for NTFS identity and locks, upstream AO executables, JSON schemas, and GitHub Actions Windows/macOS runners.
 
 ## Global Constraints
 
-- macOS construction folders are staging surfaces only.
+- macOS and external-drive paths are staging surfaces only.
 - Production qualification runs from a fixed path on a local Windows NTFS volume.
-- Public files contain no prompts, receipts, recovery data, owner identifiers, or absolute local project paths.
-- AO Mission records and routes; it does not execute, approve policy, call providers, or mutate repositories.
-- AO2 is the bounded execution runtime.
+- Public files contain no prompts, receipts, recovery data, owner identifiers, absolute local paths, office state, or private support data.
+- AO Mission records and routes; it does not execute, approve policy, call providers, publish, deploy, or mutate repositories.
+- AO2 is the receipt-bound execution runtime.
 - The product has exactly five offices, O1 through O5, and no automatic queue.
-- Component and runtime identity uses exact version, digest, and provenance records.
-- Runtime activation requires all offices to be free and rolls back on partial failure.
-- Use Python and PowerShell standard features before adding a dependency.
+- Component readiness distinguishes source-present, asset-verified, patched, executable-tested, accepted, activated, and routed.
+- Runtime activation requires all offices free and rolls back on partial failure.
+- Every `SKILL.md` has at most 200 physical lines and only `name` and `description` in frontmatter.
+- Reimplement predecessor behavior through contracts and tests; do not copy predecessor code, state, private paths, or acceptance claims.
+- Months 1–6 end at a private developer preview. Public v1.2.0 qualification occurs in months 11–12.
+- Use standard-library and native platform features before adding a dependency.
 
 ---
 
-### Task 1: Public repository boundary and leak scanner
+### Task 1: Requirement inheritance and source locks
+
+**Files:**
+- Create: `manifests/components.lock.json`
+- Create: `manifests/requirements.json`
+- Create: `scripts/verify_components.py`
+- Create: `scripts/verify_requirements.py`
+- Create: `tests/test_verify_components.py`
+- Create: `tests/test_verify_requirements.py`
+
+**Interfaces:**
+- Produces: `verify_lock(path: Path, component_root: Path) -> dict[str, str]`.
+- Produces: `verify_requirements(path: Path) -> dict[str, Requirement]`.
+- Requires: one row for every V1.1 inheritance invariant and B01–B19, each with a unique test id and release phase.
+
+- [ ] Write failing tests for duplicate component names, malformed commits, non-HTTPS repositories, missing licenses, wrong SHA-256 values, unknown fields, duplicate requirement ids, missing test ids, and missing B01–B19 rows.
+- [ ] Run `python -m unittest tests.test_verify_components tests.test_verify_requirements -v`; confirm both modules fail because the verifiers do not exist.
+- [ ] Implement strict JSON field sets, streaming SHA-256, repository validation, component-root containment, exact requirement-id sets, and nonempty test bindings with `json`, `hashlib`, `urllib.parse`, and `pathlib`.
+- [ ] Pin AO Mission, AO2, Blueprint, Atlas, Foundry, Forge, Covenant, Command, Arena, Crucible, Sentinel, Promoter, Control Plane, and AO Architecture only after source, asset, license, and digest review.
+- [ ] Run the focused tests on macOS and Windows and commit with `git commit -m "build: bind inherited requirements and sources"`.
+
+### Task 2: Public boundary and deterministic release tree
 
 **Files:**
 - Create: `scripts/scan_public_tree.py`
+- Create: `scripts/build_release.py`
 - Create: `tests/test_scan_public_tree.py`
+- Create: `tests/test_release_tree.py`
 - Create: `.github/workflows/verify.yml`
 - Modify: `.gitignore`
 
 **Interfaces:**
-- Consumes: repository root path.
-- Produces: `scan_tree(root: Path) -> list[Finding]`, where `Finding` is a frozen dataclass with `path`, `rule`, and `detail` strings.
+- Produces: `scan_tree(root: Path) -> list[Finding]` where `Finding` has `path`, `rule`, and `detail`.
+- Produces: `build_release(source: Path, output: Path, allowlist: Path) -> Path`.
 
-- [ ] **Step 1: Write tests that create a clean tree and trees containing `.env`, receipt JSON, recovery keys, macOS paths, Windows user paths, and token-shaped text.**
-- [ ] **Step 2: Run `python -m unittest tests.test_scan_public_tree -v` and confirm the missing scanner fails the suite.**
-- [ ] **Step 3: Implement a single filesystem walk with an allowlisted text decoder, explicit forbidden basenames, local-path patterns, and conservative secret patterns. Skip `.git` without following links.**
-- [ ] **Step 4: Run `python -m unittest tests.test_scan_public_tree -v` and confirm every fixture passes.**
-- [ ] **Step 5: Add a Windows and macOS GitHub Actions matrix that runs the scanner and `python -m unittest discover -s tests -v`.**
-- [ ] **Step 6: Commit with `git commit -m "build: enforce public repository boundary"`.**
+- [ ] Write failing fixtures for `.env`, receipt JSON, recovery keys, owner fields, prompt text, macOS and Windows user paths, unsafe links, duplicate ZIP names, parent paths, and nondeterministic timestamps.
+- [ ] Run `python -m unittest tests.test_scan_public_tree tests.test_release_tree -v`; confirm the scanner and builder are missing.
+- [ ] Implement one non-link-following tree walk, explicit forbidden basenames, conservative secret/path patterns, exact release allowlisting, normalized ZIP metadata, and deterministic ordering with standard-library modules.
+- [ ] Add macOS and Windows CI jobs that run the scanner, requirement verifiers, and `python -m unittest discover -s tests -v`.
+- [ ] Prove `.local/`, `.ao/`, offices, runtime state, receipts, and support data are ignored, then commit with `git commit -m "build: enforce the public repository boundary"`.
 
-### Task 2: Component lock and source verification
-
-**Files:**
-- Create: `manifests/components.lock.json`
-- Create: `scripts/verify_components.py`
-- Create: `tests/test_verify_components.py`
-
-**Interfaces:**
-- Consumes: lock records with `name`, `repository`, `commit`, `release`, `asset`, and `sha256`.
-- Produces: `verify_lock(path: Path, component_root: Path) -> dict[str, str]` mapping component names to verified commits.
-
-- [ ] **Step 1: Write tests for duplicate names, malformed commits, non-HTTPS repositories, missing assets, wrong SHA-256 values, unknown fields, and a valid two-component fixture.**
-- [ ] **Step 2: Run `python -m unittest tests.test_verify_components -v` and confirm failure because the verifier does not exist.**
-- [ ] **Step 3: Implement strict JSON parsing, exact field sets, SHA-256 streaming, and component-root containment with `json`, `hashlib`, and `pathlib`.**
-- [ ] **Step 4: Pin AO Mission, AO2, AO Blueprint, AO Atlas, AO Foundry, AO Forge, AO Covenant, AO Command, AO Arena, AO Crucible, AO Sentinel, AO Promoter, and AO2 Control Plane only after their release assets and licenses are verified.**
-- [ ] **Step 5: Run the component verifier and complete unit suite on macOS and Windows.**
-- [ ] **Step 6: Commit with `git commit -m "build: pin AO component identities"`.**
-
-### Task 3: Windows-safe path and identity model
+### Task 3: Windows path and file-identity boundary
 
 **Files:**
 - Create: `internal/windows_paths.py`
+- Create: `internal/windows_identity.py`
 - Create: `tests/test_windows_paths.py`
+- Create: `tests/test_windows_identity.py`
 
 **Interfaces:**
-- Produces: `validate_segment(value: str) -> str`, `canonical_windows_path(value: str) -> PureWindowsPath`, and `is_within(child: str, parent: str) -> bool`.
-- Denies: reserved device names, control characters, trailing spaces or periods, traversal, ambiguous roots, and unsupported path forms.
+- Produces: `validate_segment(value: str) -> str`.
+- Produces: `canonical_windows_path(value: str) -> PureWindowsPath`.
+- Produces: `open_identity(path: Path) -> FileIdentity` and `require_within(child: FileIdentity, root: FileIdentity) -> None`.
 
-- [ ] **Step 1: Write a table-driven test corpus covering drive paths, UNC paths, extended paths, mixed separators, case differences, `CON`, `NUL`, `COM1`, `LPT9`, trailing dots, 8.3 aliases, and parent traversal.**
-- [ ] **Step 2: Run `python -m unittest tests.test_windows_paths -v` and confirm failure.**
-- [ ] **Step 3: Implement lexical validation with `pathlib.PureWindowsPath`; keep physical identity checks in the Windows adapter because macOS cannot prove NTFS identity.**
-- [ ] **Step 4: Add Windows-only tests that resolve final handles and reject junction, reparse-point, and hard-link escapes.**
-- [ ] **Step 5: Run the path suite on Windows and macOS, with Windows-only tests explicitly skipped on macOS.**
-- [ ] **Step 6: Commit with `git commit -m "feat: add Windows path safety model"`.**
+- [ ] Write a table-driven lexical corpus for drive, UNC, extended, mixed-separator, case-folded, reserved-name, trailing-dot, 8.3, traversal, and long-path inputs.
+- [ ] Write Windows-only physical tests for junction, reparse-point, hard-link, symlink, alias, and delete/recreate escapes.
+- [ ] Run `python -m unittest tests.test_windows_paths tests.test_windows_identity -v`; confirm missing APIs fail and physical tests skip on macOS.
+- [ ] Implement lexical checks with `PureWindowsPath` and physical checks through Windows handles; compare volume and file identity rather than string prefixes.
+- [ ] Run the full corpus on Windows, confirm no physical test skips, and commit with `git commit -m "feat: enforce Windows path and file identity"`.
 
-### Task 4: Five-office ownership lifecycle
+### Task 4: Five-office ownership, release, and recovery
 
 **Files:**
 - Create: `internal/pool.py`
+- Create: `internal/transactions.py`
 - Create: `schemas/pool.schema.json`
 - Create: `schemas/office-state.schema.json`
 - Create: `schemas/claim-receipt.schema.json`
 - Create: `tests/test_pool.py`
+- Create: `tests/test_pool_crash.py`
 
 **Interfaces:**
-- Produces: `Pool.initialize(count: int = 5)`, `Pool.claim(owner_id, project_root, mode)`, `Pool.resume(owner_id, project_root)`, `Pool.release(receipt_path)`, and `Pool.public_status()`.
-- Persists: `pool.json`, `offices/O1` through `offices/O5`, private receipts, and resume pointers.
+- Produces: `Pool.initialize(count: int = 5)`, `Pool.claim(owner_id, task_id, project_root, mode)`, `Pool.resume(receipt_path)`, `Pool.release(receipt_path)`, `Pool.recover(key_path, office_id, generation)`, and `Pool.public_status()`.
+- Persists: `pool.json`, O1–O5 state, private receipts, resume pointers, transaction journals, and sanitized recovery records.
 
-- [ ] **Step 1: Write tests for exactly five offices, atomic first-free claim, sixth-claim failure, stale generation rejection, cross-owner rejection, cross-project rejection, and residue preservation.**
-- [ ] **Step 2: Run `python -m unittest tests.test_pool -v` and confirm failure.**
-- [ ] **Step 3: Implement atomic JSON replacement and one pool lock with standard-library file APIs plus the platform-specific lock primitive.**
-- [ ] **Step 4: Store receipt secrets only under `operator-secrets`; return receipt paths rather than secret values from the normal CLI.**
-- [ ] **Step 5: Run repeated concurrent claim and release tests on Windows. Confirm five unique winners and one clear full-capacity result.**
-- [ ] **Step 6: Commit with `git commit -m "feat: add five-office lifecycle"`.**
+- [ ] Write failing tests for atomic first-free claims, sixth-claim failure, required project binding, stale generation, wrong owner/task/project, missing pointer reconciliation, raw-key non-disclosure, dirty release, emergency recovery, and non-expiring pinning.
+- [ ] Add crash injection after each office, receipt, pointer, and journal transition; assert restart reaches the prior accepted state or `recovery-required` without losing unknown bytes.
+- [ ] Run `python -m unittest tests.test_pool tests.test_pool_crash -v`; confirm lifecycle APIs are absent.
+- [ ] Implement one pool lock, monotonic generations, receipt-only output, an atomic owner registry, journaled closeout, explicit recovery state, and exact-field public constructors.
+- [ ] Run repeated six-claim and release/recovery races on Windows, then commit with `git commit -m "feat: add crash-safe five-office ownership"`.
 
-### Task 5: Connected-project state and AO Mission bridge
+### Task 5: AO Mission intake and project-owned context
 
 **Files:**
 - Create: `internal/mission_bridge.py`
-- Create: `schemas/project-binding.schema.json`
-- Create: `tests/test_mission_bridge.py`
+- Create: `internal/conversation_lifecycle.py`
+- Create: `schemas/mission-record.schema.json`
+- Create: `schemas/context-handoff.schema.json`
 - Create: `templates/AO_OFFICE_POOL_TASK_TEMPLATE.txt`
+- Create: `tests/test_mission_bridge.py`
+- Create: `tests/test_conversation_lifecycle.py`
 
 **Interfaces:**
-- Consumes: an active receipt, objective text, AO Mission executable identity, and connected-project root.
-- Produces: `start_or_resume(receipt: Path, objective: str) -> MissionReadback` with mission id, objective digest, status, route, and next action.
-- Stores: durable records under `<connected-project>/.ao/mission/`.
+- Produces: `start_or_resume(receipt: Path, objective: str) -> MissionReadback`.
+- Produces: `transition(event: ConversationEvent, state: ConversationState) -> Transition`.
+- Stores durable records only under `<connected-project>/.ao/`.
 
-- [ ] **Step 1: Write tests proving one objective creates one digest-bound mission, repeated same-owner intake resumes it, another project is rejected, and Mission cannot request execution authority.**
-- [ ] **Step 2: Run `python -m unittest tests.test_mission_bridge -v` and confirm failure.**
-- [ ] **Step 3: Implement argument-array process launch without a shell, exact executable hash verification, bounded output capture, and project-root containment.**
-- [ ] **Step 4: Add cancellation and replacement transitions that checkpoint the mission before releasing the office.**
-- [ ] **Step 5: Run the focused tests with a deterministic fake Mission executable, then run the native Windows Mission identity and smoke test.**
-- [ ] **Step 6: Commit with `git commit -m "feat: route office work through AO Mission"`.**
+- [ ] Write failing tests for bounded conversation, explicit long-task pinning, same-task resume proof, cross-chat denial, no-file completion, Goal-state conflict, cancellation, replacement, compression recovery, and Mission authority escalation.
+- [ ] Run `python -m unittest tests.test_mission_bridge tests.test_conversation_lifecycle -v`; confirm the bridge and lifecycle are missing.
+- [ ] Implement exact executable-hash verification, argument-array launch, bounded output capture, digest-bound mission records, fixed transition rules, and compact handoff schemas.
+- [ ] Checkpoint cancel or replacement before exact release; stop when platform Goal and local Mission state disagree.
+- [ ] Run fake-executable tests and a native Windows Mission identity smoke test, then commit with `git commit -m "feat: route project conversations through AO Mission"`.
 
-### Task 6: Blueprint and Atlas planning routes
+### Task 6: Planning routes and governed AO2 execution
 
 **Files:**
 - Create: `internal/planning_routes.py`
+- Create: `internal/execution.py`
+- Create: `schemas/route-decision.schema.json`
+- Create: `schemas/execution-record.schema.json`
 - Create: `tests/test_planning_routes.py`
-- Create: `schemas/route-policy.schema.json`
+- Create: `tests/test_execution.py`
 
 **Interfaces:**
 - Produces: `select_route(mission: MissionReadback) -> RouteDecision`.
-- Routes underspecified objectives to Blueprint and oversized, mutation-class, or long-running authorized objectives to Atlas.
+- Produces: `execute(request: ExecutionRequest) -> ExecutionResult`.
+- Requires: Blueprint authorization, Atlas workgraph validation when routed, Forge packet, Covenant decision, active receipt, and connected-project target.
 
-- [ ] **Step 1: Write route tests for bounded work, missing requirements, oversized work, mutation-class work, long-running work, and blocked authorization.**
-- [ ] **Step 2: Run `python -m unittest tests.test_planning_routes -v` and confirm failure.**
-- [ ] **Step 3: Implement a fixed rule table. Do not create a plugin system or configurable expression language.**
-- [ ] **Step 4: Validate Blueprint authorization digests and Atlas workgraph/context-pack references before returning build-ready status.**
-- [ ] **Step 5: Run the route suite and native Windows identity smoke tests for Blueprint and Atlas.**
-- [ ] **Step 6: Commit with `git commit -m "feat: add governed planning routes"`.**
+- [ ] Write failing route tests for bounded, underspecified, oversized, mutation-class, long-running, blocked, and source-only capability cases.
+- [ ] Write failing execution tests for wrong receipt/generation/project, pool and sibling targets, path-option escape, shell metacharacters, timeout, runtime tampering, and Covenant digest mismatch.
+- [ ] Run `python -m unittest tests.test_planning_routes tests.test_execution -v`; confirm both APIs are absent.
+- [ ] Implement a fixed rule table, strict evidence schemas, argument-array AO2 launch, timeout, executable-hash checks, Windows file-identity containment, and allowlisted diagnostics.
+- [ ] Run deterministic fakes and native Windows AO2 smoke tests, then commit with `git commit -m "feat: add governed AO planning and execution"`.
 
-### Task 7: Governed AO2 execution
-
-**Files:**
-- Create: `internal/execution.py`
-- Create: `tests/test_execution.py`
-- Create: `schemas/execution-record.schema.json`
-
-**Interfaces:**
-- Consumes: active receipt, Covenant decision, Forge packet, AO2 arguments, and connected-project target.
-- Produces: `execute(request: ExecutionRequest) -> ExecutionResult` with exit code, artifact references, evidence digest, and sanitized diagnostics.
-
-- [ ] **Step 1: Write tests for valid execution, wrong receipt, wrong generation, wrong project, pool target, sibling-project target, path-option escape, shell metacharacters, timeout, and runtime tampering.**
-- [ ] **Step 2: Run `python -m unittest tests.test_execution -v` and confirm failure.**
-- [ ] **Step 3: Implement receipt validation, Covenant digest checks, executable hash verification, argument-array launch, timeout, and bounded output capture.**
-- [ ] **Step 4: Write private execution history under the office and export only allowlisted evidence references to the connected project.**
-- [ ] **Step 5: Run the execution suite with a fake executable, followed by the native Windows AO2 smoke test.**
-- [ ] **Step 6: Commit with `git commit -m "feat: execute receipt-bound AO2 work"`.**
-
-### Task 8: Runtime stage, activation, and rollback
+### Task 7: Runtime activation, evidence binding, and safe exports
 
 **Files:**
 - Create: `internal/runtime_update.py`
-- Create: `tests/test_runtime_update.py`
-- Create: `schemas/runtime-package.schema.json`
-
-**Interfaces:**
-- Produces: `stage(candidate: Path) -> StagedRuntime`, `activate(version: str) -> ActivationResult`, and `rollback(version: str) -> ActivationResult`.
-
-- [ ] **Step 1: Write tests for malformed manifests, wrong hashes, unsafe version segments, occupied-office activation, five equal independent copies, interruption at each office, and prior-version restoration.**
-- [ ] **Step 2: Run `python -m unittest tests.test_runtime_update -v` and confirm failure.**
-- [ ] **Step 3: Implement staging into a temporary sibling directory, full verification, atomic rename, and one all-office activation transaction under the pool lock.**
-- [ ] **Step 4: On failure, restore every prior office state and remove partial hidden staging while retaining a sanitized attempt record.**
-- [ ] **Step 5: Run interruption injection across O1-O5 on Windows and compare every runtime tree byte-for-byte.**
-- [ ] **Step 6: Commit with `git commit -m "feat: add transactional runtime updates"`.**
-
-### Task 9: Public readback, evaluation, and support exports
-
-**Files:**
+- Create: `internal/qualification.py`
 - Create: `internal/readback.py`
 - Create: `internal/support_bundle.py`
+- Create: `schemas/runtime-package.schema.json`
+- Create: `schemas/qualification-record.schema.json`
+- Create: `tests/test_runtime_update.py`
+- Create: `tests/test_qualification.py`
 - Create: `tests/test_readback.py`
-- Create: `tests/test_support_bundle.py`
 
 **Interfaces:**
-- Produces: `public_status() -> PublicPoolStatus`, `protected_status(receipt: Path) -> ProtectedStatus`, and `build_support_bundle(output: Path) -> Path`.
+- Produces: `stage(candidate: Path)`, `activate(version: str)`, `rollback(version: str)`, and `promote(evidence_set: Path, state: str)`.
+- Produces: exact-field public, protected, and support-bundle records.
 
-- [ ] **Step 1: Write tests that seed owner ids, prompts, receipts, recovery keys, absolute paths, and private histories, then prove none appear in public status or support archives.**
-- [ ] **Step 2: Run the focused test modules and confirm failure.**
-- [ ] **Step 3: Implement explicit output allowlists. Do not sanitize arbitrary dictionaries recursively and assume the result is safe.**
-- [ ] **Step 4: Bind Arena, Crucible, Sentinel, Promoter, Command, and Mission readbacks by exact evidence digest without granting execution authority.**
-- [ ] **Step 5: Run the leak scanner against generated status, bundles, and evaluation fixtures.**
-- [ ] **Step 6: Commit with `git commit -m "feat: add safe status and support exports"`.**
+- [ ] Write failing tests for unsafe versions, malformed manifests, occupied activation, substitution of executable plus manifest, interruption at O1–O5, semantic evidence omissions, nonexistent test bindings, non-durable promotion, and private export seeds.
+- [ ] Run the three focused test modules and confirm failure.
+- [ ] Implement independent trust-anchor checks, temporary sibling staging, all-office transaction journals, complete restoration, semantic-input fingerprints, exact assertion-set checks, and atomic hash-bound qualification records.
+- [ ] Build public and support outputs from explicit schemas; never recursively sanitize arbitrary private dictionaries.
+- [ ] Run Windows interruption injection and the leak scanner against every generated export, then commit with `git commit -m "feat: add transactional updates and evidence-bound qualification"`.
 
-### Task 10: Windows packaging and final qualification
+### Task 8: Months 1–6 Windows developer preview
 
 **Files:**
 - Create: `packaging/Install-AOOfficePool.ps1`
 - Create: `packaging/Verify-AOOfficePool.ps1`
 - Create: `packaging/Uninstall-AOOfficePool.ps1`
-- Create: `scripts/build_release.py`
-- Create: `tests/test_release_package.py`
+- Create: `tests/test_pilot_matrix.py`
 - Create: `docs/OPERATOR_GUIDE.md`
+- Create: `docs/PILOT_QUALIFICATION.md`
 
 **Interfaces:**
-- Produces: `ao-office-pool-v1.2.0-windows-x86_64.zip`, `SHA256SUMS`, SBOM, provenance, and qualification report.
+- Produces: a private `developer-preview` archive, checksums, SBOM, provenance, B01–B19 ledger, and pilot qualification record.
 
-- [ ] **Step 1: Write archive tests for exact allowlisted paths, normalized separators, deterministic metadata, forbidden private files, changed component hashes, and unsafe links.**
-- [ ] **Step 2: Run `python -m unittest tests.test_release_package -v` and confirm failure.**
-- [ ] **Step 3: Implement deterministic ZIP construction with Python's `zipfile`; PowerShell installs only after checksum, manifest, path, and NTFS checks pass.**
-- [ ] **Step 4: Run clean-room install, five-office claim/execution/release, update, rollback, support export, and uninstall on a fresh Windows host.**
-- [ ] **Step 5: Run the complete qualification twice against unchanged inputs and have an independent evaluator reproduce it.**
-- [ ] **Step 6: Commit with `git commit -m "release: qualify AO Office Pool v1.2.0"` only after the owner approves the license and public release.**
+- [ ] Bind every V1.1 invariant, B01–B19 row, and P01–P76-equivalent assertion to an existing test function.
+- [ ] Run `python -m unittest tests.test_pilot_matrix -v`; confirm failure until the exact set and all evidence files exist.
+- [ ] Implement PowerShell install, verify, update, rollback, and uninstall with checksum, manifest, NTFS, path, and all-free checks.
+- [ ] Run two clean Windows installations, six-claim concurrency, five-office execution, interruption rollback, emergency recovery, support export, and uninstall against unchanged bytes.
+- [ ] Record independent reproduction, label the archive `developer-preview`, and commit with `git commit -m "release: qualify private Windows developer preview"`.
+
+### Task 9: Lean product skills and instruction surfaces
+
+**Files:**
+- Create: `skills/ao2-approval-policy/SKILL.md`
+- Create: `skills/ao2-evidence-closure/SKILL.md`
+- Create: `skills/ao2-pulse-operator/SKILL.md`
+- Create: `skills/ao2-rsi-operator/SKILL.md`
+- Create: `skills/thought-experiment/SKILL.md`
+- Create: `skills/engineering-research/SKILL.md`
+- Create: `skills/scope-to-deliverable-workflow/SKILL.md`
+- Create: `scripts/validate_skills.py`
+- Create: `tests/test_validate_skills.py`
+- Create: `tests/test_skill_routing.py`
+- Create: `AGENTS.md`
+
+**Interfaces:**
+- Produces: `validate_skill(path: Path) -> list[Finding]` and `route_skill(request: str) -> tuple[str, ...]`.
+- Enforces: at most 200 physical lines, frontmatter keys exactly `name` and `description`, lowercase-hyphen name, one-level references, and no private or project-contaminated text.
+
+- [ ] Inventory candidate responsibilities and record `KEEP`, `UPDATE`, `MERGE`, `REPLACE`, `DELETE`, or `ADD`; update an existing responsibility before adding a new skill.
+- [ ] Write failing validator tests for 201 lines, extra frontmatter, bad names, broken/deep references, duplicate content, absolute paths, user identities, stale versions, README files, and untested scripts.
+- [ ] Write trigger-positive, trigger-negative, overlap, ordinary-task, heavy-task, and context-handoff behavior tests.
+- [ ] Implement the smallest seven-skill package with detailed rubrics and examples in one-level references and deterministic repeated work in tested scripts.
+- [ ] Measure root instructions below about 200 lines and 2,000 tokens, run both skill test modules, and commit with `git commit -m "feat: add lean portable AO skills"`.
+
+### Task 10: Advanced AO activation, Pulse, RSI, and evaluation
+
+**Files:**
+- Create: `internal/capabilities.py`
+- Create: `internal/evaluation.py`
+- Create: `schemas/capability-status.schema.json`
+- Create: `schemas/evaluation-chain.schema.json`
+- Create: `tests/test_capabilities.py`
+- Create: `tests/test_evaluation_chain.py`
+
+**Interfaces:**
+- Produces: truthful readiness records and digest-bound transitions among Pulse, RSI, Arena, Crucible, Sentinel, Promoter, Command, and Mission.
+
+- [ ] Write failing tests that prevent source-only execution claims, unavailable-toolchain activation, evaluator execution, Promoter bypass, stale evidence, duplicate retry side effects, and public readback mutation.
+- [ ] Run `python -m unittest tests.test_capabilities tests.test_evaluation_chain -v`; confirm missing integration fails.
+- [ ] Implement exact readiness transitions, native executable identity replay, authority-separated evaluation records, Sentinel holds, Covenant bindings, and read-only Command output.
+- [ ] Run provider-free deterministic fixtures plus native Windows smoke tests for every routed executable.
+- [ ] Commit with `git commit -m "feat: activate the governed AO evaluation stack"`.
+
+### Task 11: Windows endurance, recovery, and release security
+
+**Files:**
+- Create: `tests/test_windows_adversarial.py`
+- Create: `tests/test_crash_matrix.py`
+- Create: `scripts/run_endurance.py`
+- Create: `SECURITY.md`
+- Create: `docs/THREAT_MODEL.md`
+- Create: `docs/ENDURANCE_REPORT.md`
+
+**Interfaces:**
+- Produces: repeatable 72-hour workload records, crash/recovery results, and the public security boundary.
+
+- [ ] Write adversarial tests for ACLs, handles, junctions, reparse points, hard links, symlinks, 8.3 aliases, UNC and extended paths, process kills, disk pressure, and delete/recreate races.
+- [ ] Run focused adversarial and crash tests before endurance; fix every deterministic failure at the shared boundary.
+- [ ] Run a 72-hour five-office mixed workload with process and update faults, recording only sanitized metrics and evidence digests.
+- [ ] Complete security review, threat model, dependency/SBOM audit, recovery drills, and support-bundle inspection; obtain owner approval before promoting the private security draft to root `SECURITY.md`.
+- [ ] Confirm no unresolved release blocker and commit with `git commit -m "test: complete Windows endurance and security qualification"`.
+
+### Task 12: Independent release candidate and public v1.2.0
+
+**Files:**
+- Create: `tests/test_release_qualification.py`
+- Create: `docs/RELEASE_QUALIFICATION.md`
+- Create: `docs/MIGRATION_FROM_V1_1.md`
+- Modify: `docs/OPERATOR_GUIDE.md`
+- Modify: `manifests/components.lock.json`
+
+**Interfaces:**
+- Produces: `ao-office-pool-v1.2.0-windows-x86_64.zip`, checksums, SBOM, provenance, notices, migration guide, and hash-bound release qualification.
+
+- [ ] Freeze source and component identities; build the release candidate from a clean checkout with the deterministic allowlist builder.
+- [ ] Run `python -m unittest discover -s tests -v` on clean macOS and Windows hosts, then run every Windows-only native, endurance-smoke, install, update, rollback, recovery, support, and uninstall gate.
+- [ ] Have an independent evaluator repeat the full qualification twice against unchanged bytes and verify O1–O5 end free with zero task-output residue.
+- [ ] Run the public-tree scanner against source and archive, verify every checksum/SBOM/provenance link, and atomically record `release-qualified` against the exact archive digest.
+- [ ] After owner approval, tag and publish only the qualified bytes; commit final records with `git commit -m "release: qualify AO Office Pool v1.2.0"`.
+
+## Execution boundary
+
+Start with Task 1. Do not scaffold later task files before their inputs and gates
+exist. Use one reviewable commit per task, rerun the narrow focused tests before
+the full suite, and invalidate downstream qualification whenever a bound input
+changes.
