@@ -1,7 +1,12 @@
 import hashlib
+import hmac
 import json
+import os
+import stat
+import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +17,23 @@ from internal.conversation_lifecycle import (
     transition,
 )
 from internal.pool import Pool
+from internal.mission_bridge import start_or_resume
+
+
+MISSION_FAKE = r'''#!/usr/bin/env python3
+import hashlib, json, pathlib, sys
+home = pathlib.Path(sys.argv[sys.argv.index("--home") + 1])
+home.mkdir(parents=True, exist_ok=True)
+if "inspect" in sys.argv:
+    mission_id = sys.argv[sys.argv.index("--mission") + 1]
+    objective_digest = (home / "objective-digest").read_text()
+else:
+    objective_digest = "sha256:" + hashlib.sha256(sys.argv[-1].encode()).hexdigest()
+    (home / "objective-digest").write_text(objective_digest)
+    mission_id = "mission-0123456789abcdef"
+print(json.dumps({"mission_id":mission_id,"objective_digest":objective_digest,
+                  "status":"active","current_route":"ao-blueprint"}))
+'''
 
 
 class ConversationLifecycleTests(unittest.TestCase):
@@ -27,13 +49,57 @@ class ConversationLifecycleTests(unittest.TestCase):
         self.pool.initialize()
         self.chat = "chat-a"
         self.task = "task-a"
+        supplied_fake = os.environ.get("AO_TEST_FAKE_MISSION")
+        if os.name == "nt" and supplied_fake:
+            self.executable = self.base / "ao-mission.exe"
+            import shutil
+
+            shutil.copy2(supplied_fake, self.executable)
+        else:
+            self.executable = self.base / "ao-mission"
+            self.executable.write_text(MISSION_FAKE, encoding="utf-8")
+            self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
+        self.lock = self.base / "components.lock.json"
+        self.lock.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "components": [
+                        {
+                            "name": "ao-mission",
+                            "asset": self.executable.name,
+                            "sha256": hashlib.sha256(self.executable.read_bytes()).hexdigest(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.configuration = mock.patch.multiple(
+            "internal.mission_bridge",
+            MISSION_EXECUTABLE=self.executable,
+            COMPONENT_LOCK=self.lock,
+        )
+        self.configuration.start()
 
     def tearDown(self):
+        self.configuration.stop()
         self.temporary_directory.cleanup()
+
+    def _link_directory(self, link, target):
+        if os.name == "nt":
+            subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            link.symlink_to(target, target_is_directory=True)
 
     def _state(self, mode="conversation"):
         claim_path = self.pool.claim(self.chat, self.task, self.project, mode)
         authority = json.loads(claim_path.read_text(encoding="utf-8"))
+        start_or_resume(claim_path, self.task)
         state = ConversationState(
             claim_path,
             self.chat,
@@ -42,7 +108,7 @@ class ConversationLifecycleTests(unittest.TestCase):
             authority["office_id"],
             authority["generation"],
             mode,
-            "active",
+            "caller-controlled-value",
         )
         return claim_path, state
 
@@ -118,7 +184,7 @@ class ConversationLifecycleTests(unittest.TestCase):
         with self.assertRaises(ConversationError):
             transition(self._event("continue", state, chat_id="other-chat"), state)
         self.assertEqual(state.receipt.read_bytes(), before)
-        self.assertFalse((self.project / ".ao").exists())
+        self.assertTrue((self.project / ".ao/mission").is_dir())
 
     def test_conversation_completion_needs_no_file(self):
         # MUTATION: a file-deliverable gate strands conversational work.
@@ -129,8 +195,9 @@ class ConversationLifecycleTests(unittest.TestCase):
         self.assertFalse(receipt.exists())
 
     def test_goal_state_conflict_stops(self):
-        # MUTATION: preferring either Goal source silently continues disagreement.
+        # MUTATION: comparing two caller strings ignores authenticated Mission state.
         receipt, state = self._state()
+        state = replace(state, mission_goal="complete")
         result = transition(
             self._event("continue", state, platform_goal="complete"), state
         )
@@ -138,6 +205,18 @@ class ConversationLifecycleTests(unittest.TestCase):
         self.assertEqual(result.reason, "goal-state-conflict:active!=complete")
         self.assertFalse(result.released)
         self.assertTrue(receipt.exists())
+
+    def test_linked_checkpoint_storage_stops_before_release(self):
+        # MUTATION: lexical checkpoint paths write outside the connected project.
+        receipt, state = self._state()
+        outside = self.base / "outside-checkpoints"
+        outside.mkdir()
+        self._link_directory(self.project / ".ao/checkpoints", outside)
+        with self.assertRaises(ConversationError) as raised:
+            transition(self._event("cancel", state), state)
+        self.assertEqual(raised.exception.code, "conversation-storage-unsafe")
+        self.assertTrue(receipt.exists())
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_cancel_checkpoints_before_release(self):
         # MUTATION: releasing first loses the final restart checkpoint on failure.
@@ -185,9 +264,24 @@ class ConversationLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(compressed.action, "compress")
         self.assertTrue(compressed.handoff.is_relative_to(self.project / ".ao"))
-        resumed = transition(self._event("resume", compressed.state), compressed.state)
+        reconstructed = replace(compressed.state, handoff=None, handoff_digest=None)
+        resumed = transition(self._event("resume", reconstructed), reconstructed)
         self.assertEqual(resumed.action, "resume")
         self.assertEqual(resumed.handoff, compressed.handoff)
+
+    def test_linked_handoff_storage_is_rejected(self):
+        # MUTATION: lexical handoff paths can escape through a linked directory.
+        _, state = self._state()
+        outside = self.base / "outside-handoffs"
+        outside.mkdir()
+        self._link_directory(self.project / ".ao/mission/handoffs", outside)
+        with self.assertRaises(ConversationError) as raised:
+            transition(
+                self._event("compress", state, summary="one", next_action="two"),
+                state,
+            )
+        self.assertEqual(raised.exception.code, "conversation-storage-unsafe")
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_tampered_compression_handoff_is_denied(self):
         # MUTATION: trusting handoff fields without its digest accepts altered context.
@@ -198,8 +292,32 @@ class ConversationLifecycleTests(unittest.TestCase):
         handoff = json.loads(compressed.handoff.read_text(encoding="utf-8"))
         handoff["summary"] = "altered"
         compressed.handoff.write_text(json.dumps(handoff), encoding="utf-8")
+        handoff_raw = compressed.handoff.read_bytes()
+        compressed.handoff.with_suffix(".hmac").write_text(
+            hashlib.sha256(handoff_raw).hexdigest() + "\n", encoding="ascii"
+        )
+        reconstructed = replace(compressed.state, handoff=None, handoff_digest=None)
         with self.assertRaises(ConversationError) as raised:
-            transition(self._event("resume", compressed.state), compressed.state)
+            transition(self._event("resume", reconstructed), reconstructed)
+        self.assertEqual(raised.exception.code, "handoff-mismatch")
+
+    def test_schema_invalid_handoff_is_denied_even_with_valid_hmac(self):
+        # MUTATION: production parsing ignores declared string-length constraints.
+        _, state = self._state()
+        compressed = transition(
+            self._event("compress", state, summary="one", next_action="two"), state
+        )
+        value = json.loads(compressed.handoff.read_text(encoding="utf-8"))
+        value["summary"] = "x" * 4097
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        compressed.handoff.write_bytes(raw)
+        compressed.handoff.with_suffix(".hmac").write_text(
+            hmac.new(state.receipt.read_bytes(), raw, hashlib.sha256).hexdigest() + "\n",
+            encoding="ascii",
+        )
+        reconstructed = replace(compressed.state, handoff=None, handoff_digest=None)
+        with self.assertRaises(ConversationError) as raised:
+            transition(self._event("resume", reconstructed), reconstructed)
         self.assertEqual(raised.exception.code, "handoff-mismatch")
 
     def test_context_handoff_schema_has_exact_persisted_shape(self):

@@ -1,12 +1,23 @@
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from internal.mission_bridge import (
+    MissionBridgeError,
+    _canonical_bytes,
+    _load_authenticated_record,
+    _private_file,
+    _read_authenticated,
+    _validate_private_path,
+    _write_authenticated,
+)
 from internal.pool import Pool, PoolError, _bytes_digest, _digest
 from internal.transactions import atomic_write_json
 
 
+HANDOFF_SCHEMA = Path(__file__).parents[1] / "schemas/context-handoff.schema.json"
 _KINDS = frozenset(
     {
         "continue",
@@ -81,11 +92,12 @@ class Transition:
     next_task_digest: str | None = None
 
 
-def _load_authority(state: ConversationState) -> dict:
+def _load_authority(state: ConversationState) -> tuple[dict, bytes]:
     try:
         pool = Pool(state.receipt.parents[2])
         pool.resume(state.receipt)
-        authority = json.loads(state.receipt.read_text(encoding="utf-8"))
+        raw = state.receipt.read_bytes()
+        authority = json.loads(raw)
         project = pool._project_record(state.project)
     except (OSError, IndexError, PoolError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ConversationError("identity-mismatch") from error
@@ -99,7 +111,7 @@ def _load_authority(state: ConversationState) -> dict:
     }
     if any(authority.get(field) != value for field, value in expected.items()):
         raise ConversationError("identity-mismatch")
-    return authority
+    return authority, raw
 
 
 def _validate_event(event: ConversationEvent, state: ConversationState) -> None:
@@ -110,8 +122,15 @@ def _validate_event(event: ConversationEvent, state: ConversationState) -> None:
             raise ConversationError("identity-mismatch")
 
 
+def _mission_status(state: ConversationState) -> str:
+    try:
+        wrapper, _, _, _ = _load_authenticated_record(state.receipt, state.task_id)
+        return wrapper["mission_status"]
+    except (KeyError, MissionBridgeError) as error:
+        raise ConversationError("mission-state-mismatch") from error
+
+
 def _checkpoint(event: ConversationEvent, state: ConversationState) -> Path:
-    root = state.project / ".ao/checkpoints"
     value = {
         "schema_version": 1,
         "event": event.kind,
@@ -121,9 +140,17 @@ def _checkpoint(event: ConversationEvent, state: ConversationState) -> Path:
         "chat_digest": _digest(state.chat_id),
         "authority_digest": _bytes_digest(state.receipt.read_bytes()),
     }
-    path = root / f"{state.office_id}-{state.generation}-{event.kind}.json"
-    atomic_write_json(path, value)
-    return path
+    try:
+        path = _private_file(
+            state.project,
+            (".ao", "checkpoints"),
+            f"{state.office_id}-{state.generation}-{event.kind}.json",
+        )
+        atomic_write_json(path, value)
+        _validate_private_path(path, state.project, directory=False)
+        return path
+    except (OSError, TypeError, ValueError, MissionBridgeError) as error:
+        raise ConversationError("conversation-storage-unsafe") from error
 
 
 def _release(state: ConversationState) -> None:
@@ -134,23 +161,68 @@ def _release(state: ConversationState) -> None:
         raise ConversationError(error.code) from error
 
 
-def _read_handoff(state: ConversationState) -> Path | None:
-    if state.handoff is None and state.handoff_digest is None:
-        return None
+def _handoff_path(
+    state: ConversationState, authority: dict, authority_raw: bytes
+) -> Path:
+    identity = _canonical_bytes(
+        {
+            "authority_id": authority["authority_id"],
+            "chat_digest": authority["holder_digest"],
+            "task_digest": authority["task_digest"],
+            "project_path": authority["project_path"],
+        }
+    )
+    name = hmac.new(authority_raw, b"context-handoff\0" + identity, hashlib.sha256).hexdigest()
     try:
-        raw = state.handoff.read_bytes()
-        value = json.loads(raw)
-        if _bytes_digest(raw) != state.handoff_digest:
-            raise ValueError("handoff seal mismatch")
-        if (
-            value["task_digest"] != _digest(state.task_id)
-            or value["chat_digest"] != _digest(state.chat_id)
-            or value["office_id"] != state.office_id
-            or value["generation"] != state.generation
-        ):
+        return _private_file(
+            state.project, (".ao", "mission", "handoffs"), name + ".json"
+        )
+    except MissionBridgeError as error:
+        raise ConversationError("conversation-storage-unsafe") from error
+
+
+def _handoff_value(
+    event: ConversationEvent,
+    state: ConversationState,
+    authority: dict,
+    authority_raw: bytes,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "task_digest": authority["task_digest"],
+        "chat_digest": authority["holder_digest"],
+        "authority_digest": _bytes_digest(authority_raw),
+        "project_path": authority["project_path"],
+        "office_id": state.office_id,
+        "generation": state.generation,
+        "summary": event.summary,
+        "next_action": event.next_action,
+    }
+
+
+def _read_handoff(
+    state: ConversationState, authority: dict, authority_raw: bytes
+) -> Path | None:
+    path = _handoff_path(state, authority, authority_raw)
+    seal = path.with_suffix(".hmac")
+    if not path.exists() and not seal.exists():
+        return None
+    if not path.exists() or not seal.exists():
+        raise ConversationError("handoff-mismatch")
+    try:
+        value = _read_authenticated(path, authority_raw, HANDOFF_SCHEMA, state.project)
+        expected = {
+            "task_digest": authority["task_digest"],
+            "chat_digest": authority["holder_digest"],
+            "authority_digest": _bytes_digest(authority_raw),
+            "project_path": authority["project_path"],
+            "office_id": state.office_id,
+            "generation": state.generation,
+        }
+        if any(value.get(field) != expected_value for field, expected_value in expected.items()):
             raise ValueError("handoff identity mismatch")
-        return state.handoff
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return path
+    except (KeyError, TypeError, ValueError, MissionBridgeError) as error:
         raise ConversationError("handoff-mismatch") from error
 
 
@@ -158,12 +230,13 @@ def transition(event: ConversationEvent, state: ConversationState) -> Transition
     if not isinstance(event, ConversationEvent) or not isinstance(state, ConversationState):
         raise ConversationError("invalid-transition")
     _validate_event(event, state)
-    _load_authority(state)
-    if event.platform_goal != state.mission_goal:
+    authority, authority_raw = _load_authority(state)
+    mission_status = _mission_status(state)
+    if event.platform_goal != mission_status:
         return Transition(
             "stop",
             state,
-            reason=f"goal-state-conflict:{state.mission_goal}!={event.platform_goal}",
+            reason=f"goal-state-conflict:{mission_status}!={event.platform_goal}",
         )
     if event.kind in _ESCALATIONS:
         return Transition("deny", state, reason="mission-has-no-authority")
@@ -172,7 +245,9 @@ def transition(event: ConversationEvent, state: ConversationState) -> Transition
             raise ConversationError("pin-requires-pinned-receipt")
         return Transition("pin", state)
     if event.kind == "resume":
-        return Transition("resume", state, handoff=_read_handoff(state))
+        return Transition(
+            "resume", state, handoff=_read_handoff(state, authority, authority_raw)
+        )
     if event.kind == "continue":
         return Transition("continue", state)
     if event.kind == "complete":
@@ -193,17 +268,14 @@ def transition(event: ConversationEvent, state: ConversationState) -> Transition
         )
     if not event.summary or not event.next_action:
         raise ConversationError("compression-context-required")
-    value = {
-        "schema_version": 1,
-        "task_digest": _digest(state.task_id),
-        "chat_digest": _digest(state.chat_id),
-        "office_id": state.office_id,
-        "generation": state.generation,
-        "summary": event.summary,
-        "next_action": event.next_action,
-    }
-    path = state.project / ".ao/mission/handoffs" / f"{state.office_id}-{state.generation}.json"
-    atomic_write_json(path, value)
-    digest = _bytes_digest(path.read_bytes())
-    compressed = replace(state, handoff=path, handoff_digest=digest)
+    path = _handoff_path(state, authority, authority_raw)
+    value = _handoff_value(event, state, authority, authority_raw)
+    try:
+        _write_authenticated(path, value, authority_raw, HANDOFF_SCHEMA)
+    except (OSError, TypeError, ValueError, MissionBridgeError) as error:
+        if isinstance(error, MissionBridgeError) and error.code == "mission-storage-unsafe":
+            raise ConversationError("conversation-storage-unsafe") from error
+        raise ConversationError("handoff-mismatch") from error
+    tag = path.with_suffix(".hmac").read_text(encoding="ascii").strip()
+    compressed = replace(state, handoff=path, handoff_digest=tag)
     return Transition("compress", compressed, handoff=path)
