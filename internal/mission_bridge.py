@@ -39,8 +39,9 @@ _OBJECTIVE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class MissionBridgeError(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, reason: str | None = None):
         self.code = code
+        self.reason = reason
         super().__init__(code)
 
 
@@ -492,7 +493,7 @@ def _validate_private_path(path: Path, project: Path, *, directory: bool) -> Non
         raise ValueError("private path escaped project")
 
 
-def _open_windows_directory(path: Path):
+def _open_windows_directory(path: Path, *, share_write: bool = True):
     from internal.windows_identity import (
         _BY_HANDLE_FILE_INFORMATION,
         _FILE_ATTRIBUTE_DIRECTORY,
@@ -511,7 +512,7 @@ def _open_windows_directory(path: Path):
     handle = library.CreateFileW(
         _native_path(canonical),
         0x80000000,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        _FILE_SHARE_READ | (_FILE_SHARE_WRITE if share_write else 0),
         None,
         3,
         0x02000000 | 0x00200000,
@@ -631,6 +632,80 @@ def _private_file(
     parent = _private_directory(project, *directories)
     path = parent.path / name
     return _PrivateFile(path, parent, name)
+
+
+@contextmanager
+def _open_retained_file(path: _PrivateFile):
+    descriptor = None
+    handle = None
+    try:
+        if not isinstance(path, _PrivateFile):
+            raise TypeError("private file required")
+        if os.name == "nt":
+            import msvcrt
+
+            from internal.windows_identity import (
+                _BY_HANDLE_FILE_INFORMATION,
+                _FILE_ATTRIBUTE_DIRECTORY,
+                _FILE_ATTRIBUTE_REPARSE_POINT,
+                _FILE_SHARE_READ,
+                _INVALID_HANDLE_VALUE,
+                _final_path,
+                _kernel32,
+                _native_path,
+            )
+            from internal.windows_paths import canonical_windows_path
+
+            library = _kernel32()
+            canonical = canonical_windows_path(str(path.path))
+            handle = library.CreateFileW(
+                _native_path(canonical),
+                0x80000000,
+                _FILE_SHARE_READ,
+                None,
+                3,
+                0x00200000,
+                None,
+            )
+            if handle == _INVALID_HANDLE_VALUE:
+                raise ctypes.WinError(ctypes.get_last_error())
+            information = _BY_HANDLE_FILE_INFORMATION()
+            if not library.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if (
+                information.file_attributes
+                & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT)
+                or information.number_of_links != 1
+                or _final_path(library, handle) != canonical
+            ):
+                raise ValueError("unsafe retained file")
+            descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+            handle = None
+        else:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(
+                path.name,
+                flags,
+                dir_fd=path.directory.directory_descriptor,
+            )
+            information = os.fstat(descriptor)
+            if not stat.S_ISREG(information.st_mode) or information.st_nlink != 1:
+                raise ValueError("unsafe retained file")
+        yield descriptor
+    except (OSError, TypeError, ValueError) as error:
+        raise MissionBridgeError("mission-storage-unsafe") from error
+    finally:
+        if handle is not None:
+            from internal.windows_identity import _kernel32
+
+            _kernel32().CloseHandle(handle)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _private_exists(path: _PrivateFile) -> bool:
@@ -1136,9 +1211,13 @@ def _darwin_spawn_suspended(
     attributes = ctypes.c_void_p()
     actions_ready = False
     attributes_ready = False
+    inherited = []
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
     try:
+        for descriptor in retained_descriptors:
+            inherited.append((descriptor, os.get_inheritable(descriptor)))
+            os.set_inheritable(descriptor, True)
         _darwin_call(system.posix_spawn_file_actions_init, ctypes.byref(actions))
         actions_ready = True
         _darwin_call(
@@ -1224,6 +1303,11 @@ def _darwin_spawn_suspended(
                     pass
         raise MissionBridgeError("mission-launch-failed") from error
     finally:
+        for descriptor, inheritable in inherited:
+            try:
+                os.set_inheritable(descriptor, inheritable)
+            except OSError:
+                pass
         if attributes_ready:
             system.posix_spawnattr_destroy(ctypes.byref(attributes))
         if actions_ready:
@@ -1348,10 +1432,12 @@ def _read_bounded_streams(
         for stream in streams:
             stream.close()
     if too_large.is_set():
-        raise MissionBridgeError("mission-output-too-large")
+        raise MissionBridgeError(
+            "mission-output-too-large", reason="output-too-large"
+        )
     if return_code:
         kill()
-        raise MissionBridgeError("mission-launch-failed")
+        raise MissionBridgeError("mission-launch-failed", reason="failed")
     return bytes(buffers[0]), bytes(buffers[1])
 
 
@@ -1420,7 +1506,7 @@ def _run_darwin(
             if time.monotonic() >= deadline:
                 kill()
                 os.waitpid(child.pid, 0)
-                raise MissionBridgeError("mission-launch-failed")
+                raise MissionBridgeError("mission-launch-failed", reason="timeout")
             time.sleep(0.01)
 
     return _read_bounded_streams(streams, kill, wait)[0]
@@ -1514,7 +1600,9 @@ def _run_output(
             process.wait()
             if job is not None:
                 job.close()
-            raise MissionBridgeError("mission-launch-failed") from error
+            raise MissionBridgeError(
+                "mission-launch-failed", reason="timeout"
+            ) from error
 
     try:
         raw_output, _ = _read_bounded_streams(

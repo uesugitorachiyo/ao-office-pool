@@ -9,12 +9,23 @@ try:
 except ImportError:
     FileIdentity = open_identity = require_within = None
 
+try:
+    from internal.mission_bridge import (
+        _PrivateDirectory,
+        _open_retained_file,
+        _open_windows_directory,
+        _private_file,
+    )
+except ImportError:
+    _PrivateDirectory = _open_retained_file = _open_windows_directory = _private_file = None
+
 
 class WindowsIdentityApiTests(unittest.TestCase):
     def test_api_exists(self):
         self.assertIsNotNone(FileIdentity)
         self.assertIsNotNone(open_identity)
         self.assertIsNotNone(require_within)
+        self.assertIsNotNone(_open_retained_file)
 
     @unittest.skipIf(open_identity is None or os.name == "nt", "off-Windows behavior only")
     def test_identity_operations_fail_closed_off_windows(self):
@@ -137,6 +148,38 @@ class WindowsIdentityPhysicalTests(unittest.TestCase):
         child.write_text("replacement", encoding="utf-8")
         with self.assertRaises(ValueError):
             require_within(open_identity(child), stale_root)
+
+    def test_retained_workflow_handle_blocks_write_and_delete(self):
+        # MUTATION: write/delete sharing permits pathname substitution before AO2 opens it.
+        workflow = self.root / "workflow.yaml"
+        workflow.write_text("name: bounded\n", encoding="utf-8")
+        retained_root = _PrivateDirectory(
+            self.root,
+            self.root,
+            handles=(_open_windows_directory(self.root),),
+        )
+        private = _private_file(retained_root, (), workflow.name)
+        try:
+            with _open_retained_file(private):
+                with self.assertRaises(OSError):
+                    workflow.write_text("name: substituted\n", encoding="utf-8")
+                with self.assertRaises(OSError):
+                    workflow.unlink()
+        finally:
+            private.close()
+            retained_root.close()
+
+    def test_strict_project_handle_blocks_path_replacement(self):
+        # MUTATION: delete sharing permits replacement cwd after target verification.
+        parked = self.root.with_name("project-parked")
+        handle = _open_windows_directory(self.root, share_write=False)
+        try:
+            with self.assertRaises(OSError):
+                os.replace(self.root, parked)
+        finally:
+            from internal.windows_identity import _kernel32
+
+            _kernel32().CloseHandle(handle)
 
 
 if __name__ == "__main__":
