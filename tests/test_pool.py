@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ProcessPoolExecutor
@@ -111,6 +112,73 @@ class PoolTests(unittest.TestCase):
         for forbidden in ("holder-secret", "task-secret", str(self.project), "authority"):
             self.assertNotIn(forbidden, encoded)
         self.assertEqual(self._snapshot(), before)
+
+    def test_witness_key_is_private_and_stable(self):
+        key_path = self.root / "operator-secrets" / "governance-witness.key"
+        original = key_path.read_bytes()
+        self.assertEqual(len(original), 32)
+
+        self.pool.initialize()
+
+        self.assertEqual(key_path.read_bytes(), original)
+        encoded = json.dumps(self.pool.public_status(), sort_keys=True)
+        self.assertNotIn(original.hex(), encoded)
+        self.assertNotIn(key_path.name, encoded)
+
+    def test_invalid_witness_key_requires_recovery(self):
+        key_path = self.root / "operator-secrets" / "governance-witness.key"
+        original = key_path.read_bytes()
+        outside = self.base / "outside-witness.key"
+        outside.write_bytes(original)
+        mutations = (
+            lambda: key_path.unlink(),
+            lambda: key_path.write_bytes(b"short"),
+            lambda: (key_path.unlink(), key_path.symlink_to(outside)),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                key_path.unlink(missing_ok=True)
+                key_path.write_bytes(original)
+                try:
+                    mutate()
+                except OSError as error:
+                    self.skipTest(str(error))
+                with self.assertRaises(PoolError) as raised:
+                    self.pool.public_status()
+                self.assertEqual(raised.exception.code, "recovery-required")
+
+    def test_authority_lease_holds_release_lock(self):
+        authority = self.pool.claim("holder-a", "task-a", self.project, "pinned")
+        started = threading.Event()
+        finished = threading.Event()
+
+        def release():
+            started.set()
+            self.pool.release(authority)
+            finished.set()
+
+        with self.pool.authority_lease(authority) as lease:
+            thread = threading.Thread(target=release)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.1))
+            self.assertEqual(lease.authority_path, authority.resolve())
+            self.assertEqual(lease.authority_bytes, authority.read_bytes())
+            self.assertEqual(lease.authority["office_id"], "O1")
+            with self.assertRaises((AttributeError, TypeError)):
+                lease.authority_path = self.base
+        thread.join(2)
+        self.assertTrue(finished.is_set())
+
+    def test_runtime_containment_value_error_requires_recovery(self):
+        with (
+            mock.patch("internal.pool.os.name", "nt"),
+            mock.patch("internal.pool.open_identity", return_value=object()),
+            mock.patch("internal.pool.require_within", side_effect=ValueError("changed")),
+        ):
+            with self.assertRaises(PoolError) as raised:
+                self.pool._verify_runtime_containment()
+        self.assertEqual(raised.exception.code, "recovery-required")
 
     def test_pinned_work_does_not_expire(self):
         # MUTATION: timestamp-based expiry silently frees pinned work.
@@ -276,6 +344,7 @@ class PoolTests(unittest.TestCase):
             ("pool.json", False),
             ("runtime/generations.json", False),
             ("runtime/recovery-authority.json", False),
+            ("operator-secrets/governance-witness.key", False),
             ("operator-secrets/recovery-key-O1", False),
             ("offices/O1/office-state.json", False),
         )

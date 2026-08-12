@@ -5,6 +5,7 @@ import os
 import secrets
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from internal.transactions import LockError, atomic_write_bytes, atomic_write_json, pool_lock, read_json
@@ -42,6 +43,13 @@ class PoolError(RuntimeError):
 
 class InjectedCrash(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AuthorityLease:
+    authority_path: Path
+    authority_bytes: bytes
+    authority: dict
 
 
 def _digest(value: str) -> str:
@@ -104,6 +112,19 @@ class Pool:
     def _recovery_authority_path(self) -> Path:
         return self._runtime / "recovery-authority.json"
 
+    @property
+    def _witness_key_path(self) -> Path:
+        return self.root / "operator-secrets" / "governance-witness.key"
+
+    def _read_witness_key(self) -> bytes:
+        try:
+            value = self._witness_key_path.read_bytes()
+        except OSError as error:
+            raise PoolError("recovery-required") from error
+        if len(value) != 32:
+            raise PoolError("recovery-required")
+        return value
+
     def _checkpoint(self, name: str) -> None:
         if self.crash_after == name:
             if self.abrupt_crash:
@@ -158,6 +179,9 @@ class Pool:
             (self._runtime / "recovery").mkdir(exist_ok=True)
             operator = self.root / "operator-secrets"
             operator.mkdir(exist_ok=True)
+            if not self._witness_key_path.exists():
+                atomic_write_bytes(self._witness_key_path, secrets.token_bytes(32))
+            self._read_witness_key()
             authority_digests = {}
             generations = {office_id: 0 for office_id in OFFICE_IDS}
             if self._generations_path.exists():
@@ -242,6 +266,7 @@ class Pool:
                         paths.extend(base / name for name in names)
                         paths.extend(base / name for name in files)
             paths.append(self.root / "pool.json")
+            paths.append(self._witness_key_path)
             root_identity = open_identity(self.root) if os.name == "nt" else None
             for path in paths:
                 if path.is_symlink():
@@ -269,9 +294,12 @@ class Pool:
     def _verify_runtime_containment(self) -> None:
         if os.name != "nt":
             return
-        root_identity = open_identity(self.root)
-        for path in (self._runtime, self.root / "offices"):
-            require_within(open_identity(path), root_identity)
+        try:
+            root_identity = open_identity(self.root)
+            for path in (self._runtime, self.root / "offices"):
+                require_within(open_identity(path), root_identity)
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
 
     def _ensure_initialized(self) -> dict:
         try:
@@ -286,6 +314,7 @@ class Pool:
         }
         if value != expected:
             raise PoolError("recovery-required")
+        self._read_witness_key()
         self._generation_registry()
         self._validate_runtime_members()
         return value
@@ -674,6 +703,17 @@ class Pool:
                     self._mark_recovery(record["office_id"], state, "corrupt-pointer")
                     raise PoolError("recovery-required")
             return authority
+
+    @contextmanager
+    def authority_lease(self, receipt_path: Path):
+        with self._locked():
+            self._ensure_initialized()
+            self._reconcile()
+            path, raw, authority, state = self._authorize(receipt_path)
+            if self._unknown_paths(authority["office_id"]):
+                self._mark_recovery(authority["office_id"], state, "unknown-residue")
+                raise PoolError("recovery-required")
+            yield AuthorityLease(path, raw, authority)
 
     def release(self, receipt_path) -> None:
         with self._locked():

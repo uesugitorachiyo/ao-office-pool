@@ -125,6 +125,17 @@ class PoolCrashTests(unittest.TestCase):
                     ],
                 )
 
+    def test_interrupted_initialization_preserves_witness_key(self):
+        root = self.base / "initialize-witness"
+        self._abrupt(_crash_initialize, str(root), "initialize:office:O1")
+        key_path = root / "operator-secrets" / "governance-witness.key"
+        original = key_path.read_bytes()
+
+        Pool(root).initialize()
+
+        self.assertEqual(len(original), 32)
+        self.assertEqual(key_path.read_bytes(), original)
+
     def test_unknown_journal_bytes_are_quarantined_without_overwrite(self):
         # MUTATION: rollback unlinks a foreign replacement at an expected path.
         root, _ = self._pool("foreign-journal-bytes")
