@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -93,6 +94,87 @@ class GovernedExecution:
     requirements_evidence_digest: str
     ao2: MappingProxyType
     request_digest: str
+
+
+@dataclass
+class _RetainedFile:
+    private: object
+    descriptor: int
+    parent_change: int
+
+    @property
+    def path(self) -> Path:
+        if os.name != "nt":
+            for root in (Path("/proc/self/fd"), Path("/dev/fd")):
+                if root.is_dir():
+                    return root / str(self.descriptor)
+        return self.private.path
+
+    def read(self, limit: int) -> bytes:
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(self.descriptor, min(64 * 1024, limit + 1 - size))
+            if not chunk:
+                return b"".join(chunks)
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("retained file too large")
+            chunks.append(chunk)
+
+    def recheck(self) -> None:
+        opened = os.fstat(self.descriptor)
+        current = os.stat(
+            self.private.name,
+            dir_fd=self.private.directory.directory_descriptor,
+            follow_symlinks=False,
+        ) if self.private.directory.directory_descriptor is not None else self.private.path.stat(follow_symlinks=False)
+        parent = self.private.directory.directory_descriptor
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            or (parent is not None and os.fstat(parent).st_ctime_ns != self.parent_change)
+        ):
+            raise GovernanceError("governance-artifact-changed")
+
+    def refresh_parent_identity(self) -> None:
+        if self.private.directory.directory_descriptor is not None:
+            self.parent_change = os.fstat(
+                self.private.directory.directory_descriptor
+            ).st_ctime_ns
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+        self.private.close()
+
+
+@dataclass
+class _RetainedDirectory:
+    directory: _PrivateDirectory
+    digest: str
+    change: int | None
+
+    @property
+    def path(self) -> Path:
+        return Path(self.directory.launch_path)
+
+    @property
+    def descriptors(self) -> tuple[int, ...]:
+        return ((self.directory.directory_descriptor,) if self.directory.directory_descriptor is not None else ())
+
+    def recheck(self, project: _PrivateDirectory) -> None:
+        self.directory.require_current_paths()
+        if self.change is not None and os.fstat(self.directory.directory_descriptor).st_ctime_ns != self.change:
+            raise GovernanceError("governance-artifact-changed")
+        if not hmac.compare_digest(
+            _directory_digest(project, self.directory.path, _PRIVATE_PARTS), self.digest
+        ):
+            raise GovernanceError("governance-artifact-changed")
+
+    def close(self) -> None:
+        self.directory.close()
 
 
 def _now() -> datetime:
@@ -191,6 +273,7 @@ def _read_file(
     root: tuple[str, ...] | None,
     *,
     code: str = "governance-artifact-unsafe",
+    limit: int = _MAX_ARTIFACT,
 ) -> bytes:
     parts = _relative(project, path, root)
     candidate = None
@@ -198,7 +281,7 @@ def _read_file(
         candidate = _private_file(project, tuple(parts[:-1]), parts[-1])
         if not _private_exists(candidate):
             raise ValueError("missing artifact")
-        return _read_private_bytes(candidate, _MAX_ARTIFACT)
+        return _read_private_bytes(candidate, limit)
     except (OSError, TypeError, ValueError, MissionBridgeError) as error:
         raise GovernanceError(code) from error
     finally:
@@ -221,15 +304,16 @@ def _directory_digest(
             for name in filenames:
                 candidate = current / name
                 relative = candidate.relative_to(path).as_posix()
-                files.append((relative, _read_file(project, candidate, root)))
+                files.append((relative, candidate))
         if not files:
             raise ValueError("empty artifact directory")
         digest = hashlib.sha256()
         total = 0
-        for relative, data in sorted(files):
+        for relative, candidate in sorted(files):
+            data = _read_file(
+                project, candidate, root, limit=_MAX_ARTIFACT - total
+            )
             total += len(data)
-            if total > _MAX_ARTIFACT:
-                raise ValueError("artifact directory too large")
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
             digest.update(data)
@@ -252,6 +336,20 @@ def _json_artifact(
             raise ValueError("object required")
         return value, _digest_bytes(raw)
     except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise GovernanceError("governance-artifact-invalid") from error
+
+
+def _json_retained(retained: _RetainedFile) -> tuple[dict, str]:
+    try:
+        retained.recheck()
+        raw = retained.read(_MAX_ARTIFACT)
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("object required")
+        return value, _digest_bytes(raw)
+    except GovernanceError:
+        raise
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise GovernanceError("governance-artifact-invalid") from error
 
 
@@ -295,15 +393,15 @@ def _readback(name: str, raw: bytes) -> dict:
 def _run_producer(
     name: str,
     component: dict,
-    artifact: Path,
+    artifact,
     project: _PrivateDirectory,
     ledger: Path | None = None,
     output = None,
 ) -> dict:
     arguments = [
-        str(artifact)
+        str(artifact.path)
         if member == "{artifact}"
-        else str(ledger)
+        else str(ledger.path)
         if member == "{ledger}"
         else str(output.path)
         if member == "{output}"
@@ -313,7 +411,22 @@ def _run_producer(
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
     if os.environ.get("TMPDIR"):
         environment["TMPDIR"] = os.environ["TMPDIR"]
+    retained_descriptors = tuple(
+        descriptor
+        for descriptor in (
+            getattr(artifact, "descriptor", None),
+            *(getattr(artifact, "descriptors", ())),
+            getattr(ledger, "descriptor", None),
+            getattr(output, "descriptor", None),
+        )
+        if descriptor is not None
+    )
+    previous_inheritable = {}
     try:
+        if sys.platform == "darwin":
+            for descriptor in retained_descriptors:
+                previous_inheritable[descriptor] = os.get_inheritable(descriptor)
+                os.set_inheritable(descriptor, True)
         with _open_verified_file(
             BIN_DIR / component["asset"], component["sha256"]
         ) as executable:
@@ -323,6 +436,7 @@ def _run_producer(
                 executable,
                 timeout_seconds=10,
                 environment=environment,
+                retained_descriptors=retained_descriptors,
             )
     except MissionBridgeError as error:
         code = (
@@ -331,11 +445,13 @@ def _run_producer(
             else "governance-producer-failed"
         )
         raise GovernanceError(code) from error
+    finally:
+        for descriptor, inheritable in previous_inheritable.items():
+            os.set_inheritable(descriptor, inheritable)
     if name == "ao-blueprint":
         try:
-            if not _private_exists(output):
-                raise ValueError("authorization missing")
-            authorization = _read_private_bytes(output, _MAX_ENVELOPE)
+            output.recheck()
+            authorization = output.read(_MAX_ENVELOPE)
         except (OSError, ValueError, MissionBridgeError) as error:
             raise GovernanceError("governance-producer-readback") from error
         return _readback(name, authorization)
@@ -548,7 +664,7 @@ def _unlink_private(path) -> None:
 
 def _stage_file(
     project: _PrivateDirectory, path: Path, root: tuple[str, ...], label: str
-) -> tuple[Path, str]:
+) -> tuple[_RetainedFile, str]:
     raw = _read_file(project, path, root)
     digest = _digest_bytes(raw)
     staged = _private_file(
@@ -562,14 +678,27 @@ def _stage_file(
                 raise GovernanceError("governance-artifact-changed")
         if _read_private_bytes(staged, _MAX_ARTIFACT) != raw:
             raise GovernanceError("governance-artifact-changed")
-        return staged.path, digest
-    finally:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = (
+            os.open(staged.name, flags, dir_fd=staged.directory.directory_descriptor)
+            if staged.directory.directory_descriptor is not None
+            else os.open(staged.path, flags)
+        )
+        parent_change = (
+            os.fstat(staged.directory.directory_descriptor).st_ctime_ns
+            if staged.directory.directory_descriptor is not None else 0
+        )
+        return _RetainedFile(staged, descriptor, parent_change), digest
+    except BaseException:
         staged.close()
+        raise
 
 
 def _stage_directory(
     project: _PrivateDirectory, path: Path, root: tuple[str, ...]
-) -> tuple[Path, str]:
+) -> tuple[_RetainedDirectory, str]:
     digest = _directory_digest(project, path, root)
     destination_parts = (*_PRIVATE_PARTS, "producer-input", f"blueprint-{digest}")
     destination = _private_directory(project, *destination_parts)
@@ -601,9 +730,40 @@ def _stage_directory(
             _directory_digest(project, destination.path, _PRIVATE_PARTS), digest
         ):
             raise GovernanceError("governance-artifact-changed")
-        return destination.path, digest
-    finally:
+        change = (
+            os.fstat(destination.directory_descriptor).st_ctime_ns
+            if destination.directory_descriptor is not None else None
+        )
+        return _RetainedDirectory(destination, digest, change), digest
+    except BaseException:
         destination.close()
+        raise
+
+
+def _retained_output(project: _PrivateDirectory) -> _RetainedFile:
+    output = _private_file(
+        project,
+        (*_PRIVATE_PARTS, "producer-output"),
+        f"blueprint-{uuid.uuid4().hex}.json",
+    )
+    try:
+        _create_private(output, b"")
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = (
+            os.open(output.name, flags, dir_fd=output.directory.directory_descriptor)
+            if output.directory.directory_descriptor is not None
+            else os.open(output.path, flags)
+        )
+        parent_change = (
+            os.fstat(output.directory.directory_descriptor).st_ctime_ns
+            if output.directory.directory_descriptor is not None else 0
+        )
+        return _RetainedFile(output, descriptor, parent_change)
+    except BaseException:
+        output.close()
+        raise
 
 
 def _stage_workflow(project: _PrivateDirectory, path: Path) -> str:
@@ -616,9 +776,9 @@ def _stage_workflow(project: _PrivateDirectory, path: Path) -> str:
         try:
             _create_private(staged, raw)
         except FileExistsError:
-            if _read_private_bytes(staged) != raw:
+            if _read_private_bytes(staged, _MAX_ARTIFACT) != raw:
                 raise GovernanceError("governance-workflow-mismatch")
-        if _read_private_bytes(staged) != raw:
+        if _read_private_bytes(staged, _MAX_ARTIFACT) != raw:
             raise GovernanceError("governance-workflow-mismatch")
         return digest
     except (OSError, ValueError, MissionBridgeError) as error:
@@ -637,53 +797,6 @@ def _producer_record(component: dict, command: tuple[str, ...], digest: str) -> 
         "command_contract": " ".join((component["asset"], *command)),
         "artifact_sha256": digest,
     }
-
-
-def _issue_authenticated_record(
-    pool: Pool,
-    lease: AuthorityLease,
-    project: _PrivateDirectory,
-    envelope: dict,
-) -> Path:
-    pool._require_authority_lease(lease)
-    envelope["payload_digest"] = _digest_value(
-        {name: value for name, value in envelope.items() if name != "payload_digest"}
-    )
-    try:
-        _validate_schema(envelope, ENVELOPE_SCHEMA)
-    except ValueError as error:
-        raise GovernanceError("governance-envelope-mismatch") from error
-    for _ in range(128):
-        identifier = "witness-" + uuid.uuid4().hex
-        envelope["witness_id"] = identifier
-        envelope["payload_digest"] = _digest_value(
-            {name: value for name, value in envelope.items() if name != "payload_digest"}
-        )
-        raw = _canonical_bytes(envelope)
-        tag = hmac.new(
-            pool._read_witness_key(lease), raw, hashlib.sha256
-        ).hexdigest().encode("ascii") + b"\n"
-        record = _private_file(project, _PRIVATE_PARTS, identifier + ".json")
-        seal = _private_file(project, _PRIVATE_PARTS, identifier + ".hmac")
-        created_seal = False
-        try:
-            try:
-                _create_private(seal, tag)
-                created_seal = True
-                _create_private(record, raw)
-            except FileExistsError:
-                if created_seal:
-                    _unlink_private(seal)
-                continue
-            except BaseException:
-                if created_seal:
-                    _unlink_private(seal)
-                raise
-            return record.path
-        finally:
-            seal.close()
-            record.close()
-    raise GovernanceError("governance-envelope-collision")
 
 
 def issue_witness(
@@ -742,9 +855,7 @@ def issue_witness(
                     staged_paths[name], artifact_digests[name] = _stage_file(
                         project, path, _ROOTS[name], name
                     )
-                    native[name], _ = _json_artifact(
-                        project, staged_paths[name], _PRIVATE_PARTS
-                    )
+                    native[name], _ = _json_retained(staged_paths[name])
                 staged_ledger, ledger_digest = _stage_file(
                     project,
                     artifacts.covenant_ledger,
@@ -752,30 +863,26 @@ def issue_witness(
                     "ao-covenant-ledger",
                 )
                 del ledger_digest
-                authorization = _private_file(
-                    project,
-                    (*_PRIVATE_PARTS, "producer-output"),
-                    f"blueprint-{uuid.uuid4().hex}.json",
-                )
+                for retained in staged_paths.values():
+                    if isinstance(retained, _RetainedFile):
+                        retained.refresh_parent_identity()
+                staged_ledger.refresh_parent_identity()
+                authorization = _retained_output(project)
                 readbacks = {}
-                try:
-                    readbacks["ao-blueprint"] = _run_producer(
-                        "ao-blueprint",
-                        components["ao-blueprint"],
-                        staged_blueprint,
-                        project,
-                        None,
-                        authorization,
-                    )
-                    authorization_raw = _read_private_bytes(
-                        authorization, _MAX_ENVELOPE
-                    )
-                    artifact_digests["ao-blueprint"] = _digest_bytes(
-                        authorization_raw
-                    )
-                    native["ao-blueprint"] = readbacks["ao-blueprint"]
-                finally:
-                    authorization.close()
+                readbacks["ao-blueprint"] = _run_producer(
+                    "ao-blueprint",
+                    components["ao-blueprint"],
+                    staged_blueprint,
+                    project,
+                    None,
+                    authorization,
+                )
+                authorization.recheck()
+                authorization_raw = authorization.read(_MAX_ENVELOPE)
+                artifact_digests["ao-blueprint"] = _digest_bytes(
+                    authorization_raw
+                )
+                native["ao-blueprint"] = readbacks["ao-blueprint"]
                 for name in ("ao-atlas", "ao-forge", "ao-covenant"):
                     path = staged_paths[name]
                     if path is None:
@@ -787,9 +894,7 @@ def issue_witness(
                         project,
                         staged_ledger if name == "ao-covenant" else None,
                     )
-                    _, confirmed = _json_artifact(
-                        project, path, _PRIVATE_PARTS
-                    )
+                    _, confirmed = _json_retained(path)
                     if not hmac.compare_digest(confirmed, artifact_digests[name]):
                         raise GovernanceError("governance-artifact-changed")
                 requirements, requirements_digest = _requirements(
@@ -814,6 +919,12 @@ def issue_witness(
                     ao2,
                     objective,
                 )
+                staged_blueprint.recheck(project)
+                for retained in staged_paths.values():
+                    if isinstance(retained, _RetainedFile):
+                        retained.recheck()
+                staged_ledger.recheck()
+                authorization.recheck()
                 for name, path in source_paths.items():
                     if path is None:
                         continue
@@ -891,8 +1002,51 @@ def issue_witness(
                     "expires_at": _time(created + timedelta(seconds=lifetime_seconds)),
                     "payload_digest": "0" * 64,
                 }
-                return _issue_authenticated_record(pool, lease, project, envelope)
+                envelope["payload_digest"] = _digest_value(
+                    {name: value for name, value in envelope.items() if name != "payload_digest"}
+                )
+                try:
+                    _validate_schema(envelope, ENVELOPE_SCHEMA)
+                except ValueError as error:
+                    raise GovernanceError("governance-envelope-mismatch") from error
+                for _ in range(128):
+                    identifier = "witness-" + uuid.uuid4().hex
+                    envelope["witness_id"] = identifier
+                    envelope["payload_digest"] = _digest_value(
+                        {name: value for name, value in envelope.items() if name != "payload_digest"}
+                    )
+                    raw = _canonical_bytes(envelope)
+                    with pool._open_witness_key(lease) as key:
+                        tag = hmac.new(key, raw, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+                    record = _private_file(project, _PRIVATE_PARTS, identifier + ".json")
+                    seal = _private_file(project, _PRIVATE_PARTS, identifier + ".hmac")
+                    created_seal = False
+                    try:
+                        try:
+                            _create_private(seal, tag)
+                            created_seal = True
+                            _create_private(record, raw)
+                        except FileExistsError:
+                            if created_seal:
+                                _unlink_private(seal)
+                            continue
+                        except BaseException:
+                            if created_seal:
+                                _unlink_private(seal)
+                            raise
+                        return record.path
+                    finally:
+                        seal.close()
+                        record.close()
+                raise GovernanceError("governance-envelope-collision")
             finally:
+                for retained_name in ("authorization", "staged_ledger", "staged_blueprint"):
+                    retained = locals().get(retained_name)
+                    if retained is not None:
+                        retained.close()
+                for retained in locals().get("staged_paths", {}).values():
+                    if isinstance(retained, _RetainedFile):
+                        retained.close()
                 project.close()
     except PoolError as error:
         raise GovernanceError("governance-unauthorized") from error
@@ -937,9 +1091,10 @@ def _load_envelope(
         digest = payload.pop("payload_digest")
         if not hmac.compare_digest(digest, _digest_value(payload)):
             raise ValueError("payload digest")
-        expected = hmac.new(
-            pool._read_witness_key(lease), raw, hashlib.sha256
-        ).hexdigest().encode("ascii") + b"\n"
+        with pool._open_witness_key(lease) as key:
+            expected = hmac.new(
+                key, raw, hashlib.sha256
+            ).hexdigest().encode("ascii") + b"\n"
         if not hmac.compare_digest(supplied, expected):
             raise ValueError("authentication")
         authority_expected = {

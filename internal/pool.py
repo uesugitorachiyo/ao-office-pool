@@ -46,20 +46,28 @@ class InjectedCrash(RuntimeError):
     pass
 
 
-@dataclass(frozen=True, eq=False)
+_LEASE_SENTINEL = object()
+
+
+@dataclass(frozen=True, eq=False, init=False)
 class AuthorityLease:
     authority_path: Path
     authority_bytes: bytes
     authority: dict
 
+    def __init__(self, authority_path, authority_bytes, authority, sentinel=None):
+        if sentinel is not _LEASE_SENTINEL:
+            raise PoolError("unauthorized")
+        object.__setattr__(self, "authority_path", authority_path)
+        object.__setattr__(self, "authority_bytes", authority_bytes)
+        object.__setattr__(self, "authority", authority)
 
-def _lease_registry():
+
+def _lease_capabilities():
     active = {}
 
-    def activate(root: Path, path: Path, raw: bytes, authority: dict):
-        lease = AuthorityLease(path, raw, authority)
+    def register(root: Path, lease: AuthorityLease) -> None:
         active[id(lease)] = (lease, root)
-        return lease
 
     def require(root: Path, lease: AuthorityLease) -> None:
         entry = active.get(id(lease))
@@ -71,10 +79,10 @@ def _lease_registry():
         if entry is not None and entry[0] is lease:
             del active[id(lease)]
 
-    return activate, require, retire
+    return register, require, retire
 
 
-_activate_lease, _require_lease, _retire_lease = _lease_registry()
+_register_lease, _require_lease, _retire_lease = _lease_capabilities()
 
 
 def _digest(value: str) -> str:
@@ -194,7 +202,8 @@ class Pool:
         except OSError as error:
             raise PoolError("recovery-required") from error
         try:
-            os.fchmod(descriptor, 0o600)
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
             os.write(descriptor, b"1\n")
             os.fsync(descriptor)
         except BaseException:
@@ -202,13 +211,24 @@ class Pool:
             path.unlink(missing_ok=True)
             raise
         os.close(descriptor)
+        if os.name != "nt":
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
         return True
 
-    def _read_witness_key(self, lease: AuthorityLease | None = None) -> bytes:
-        if lease is not None:
-            self._require_authority_lease(lease)
+    @contextmanager
+    def _open_witness_key(self, lease: AuthorityLease):
+        self._require_authority_lease(lease)
+        descriptor = None
         try:
-            information = self._witness_key_path.stat(follow_symlinks=False)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self._witness_key_path, flags)
+            information = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(information.st_mode)
                 or information.st_nlink != 1
@@ -222,18 +242,82 @@ class Pool:
                 require_within(
                     open_identity(self._witness_key_path), open_identity(self.root)
                 )
-            value = self._witness_key_path.read_bytes()
+            value = os.read(descriptor, 33)
         except (OSError, ValueError) as error:
             raise PoolError("recovery-required") from error
         if len(value) != 32:
             raise PoolError("recovery-required")
-        return value
+        try:
+            yield value
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _validate_witness_key(self) -> None:
+        descriptor = None
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self._witness_key_path, flags)
+            information = os.fstat(descriptor)
+            value = os.read(descriptor, 33)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_nlink != 1
+                or (os.name != "nt" and stat.S_IMODE(information.st_mode) != 0o600)
+                or len(value) != 32
+            ):
+                raise ValueError("unsafe witness key")
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def _checkpoint(self, name: str) -> None:
         if self.crash_after == name:
             if self.abrupt_crash:
                 os._exit(97)
             raise InjectedCrash(name)
+
+    def _create_witness_key(self) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self._witness_key_path, flags, 0o600)
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            os.write(descriptor, secrets.token_bytes(32))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _migrate_governance_storage(self) -> None:
+        runtime_names = {path.name for path in self._runtime.iterdir()}
+        legacy = {
+            "receipts", "pointers", "transactions", "recovery",
+            "generations.json", "recovery-authority.json",
+        }
+        if runtime_names not in (legacy, legacy | {"governance"}):
+            raise PoolError("recovery-required")
+        if self._governance_state.exists():
+            if (
+                not self._governance_state.is_dir()
+                or {path.name for path in self._governance_state.iterdir()}
+                != {"consumed", "revoked"}
+            ):
+                raise PoolError("recovery-required")
+        else:
+            self._governance_state.mkdir()
+            (self._governance_state / "consumed").mkdir()
+            (self._governance_state / "revoked").mkdir()
+        if self._witness_key_path.exists() or self._witness_key_path.is_symlink():
+            self._validate_witness_key()
+        else:
+            self._create_witness_key()
+            self._validate_witness_key()
 
     def _office(self, office_id: str) -> Path:
         if office_id not in OFFICE_IDS:
@@ -273,6 +357,7 @@ class Pool:
         with self._locked(allow_missing=True):
             pool_path = self.root / "pool.json"
             if pool_path.exists():
+                self._migrate_governance_storage()
                 self._validate_protected_paths()
                 self._ensure_initialized()
                 return
@@ -287,17 +372,8 @@ class Pool:
             operator = self.root / "operator-secrets"
             operator.mkdir(exist_ok=True)
             if not self._witness_key_path.exists():
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                descriptor = os.open(self._witness_key_path, flags, 0o600)
-                try:
-                    os.fchmod(descriptor, 0o600)
-                    os.write(descriptor, secrets.token_bytes(32))
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-            self._read_witness_key()
+                self._create_witness_key()
+            self._validate_witness_key()
             authority_digests = {}
             generations = {office_id: 0 for office_id in OFFICE_IDS}
             if self._generations_path.exists():
@@ -430,7 +506,7 @@ class Pool:
         }
         if value != expected:
             raise PoolError("recovery-required")
-        self._read_witness_key()
+        self._validate_witness_key()
         self._generation_registry()
         self._validate_runtime_members()
         return value
@@ -850,7 +926,8 @@ class Pool:
             if self._unknown_paths(authority["office_id"]):
                 self._mark_recovery(authority["office_id"], state, "unknown-residue")
                 raise PoolError("recovery-required")
-            lease = _activate_lease(self.root, path, raw, authority)
+            lease = AuthorityLease(path, raw, authority, _LEASE_SENTINEL)
+            _register_lease(self.root, lease)
             try:
                 yield lease
             finally:

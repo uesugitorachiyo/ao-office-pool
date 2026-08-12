@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -10,6 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from unittest import mock
 
+import internal.pool as pool_module
 from internal.pool import AuthorityLease, Pool, PoolError
 
 
@@ -149,14 +151,60 @@ class PoolTests(unittest.TestCase):
                 key_path.chmod(original_mode)
 
     def test_constructed_or_expired_authority_lease_is_not_a_capability(self):
+        self.assertFalse(hasattr(pool_module, "_activate_lease"))
         authority = self.pool.claim("holder-capability", "task-capability", self.project, "pinned")
         with self.pool.authority_lease(authority) as active:
-            forged = AuthorityLease(active.authority_path, active.authority_bytes, active.authority)
             with self.assertRaises(PoolError):
-                self.pool._require_authority_lease(forged)
+                AuthorityLease(active.authority_path, active.authority_bytes, active.authority)
             self.pool._require_authority_lease(active)
         with self.assertRaises(PoolError):
             self.pool._require_authority_lease(active)
+
+    def test_legacy_pool_migrates_governance_storage_once_without_rotation(self):
+        key = self.root / "operator-secrets/governance-witness.key"
+        governance_state = self.root / "runtime/governance"
+        shutil.rmtree(governance_state)
+        key.unlink()
+        self.pool.initialize()
+        created = key.read_bytes()
+        self.assertEqual(len(created), 32)
+        self.assertEqual(
+            {path.name for path in governance_state.iterdir()}, {"consumed", "revoked"}
+        )
+        self.pool.initialize()
+        self.assertEqual(key.read_bytes(), created)
+
+    def test_legacy_migration_never_hides_a_corrupt_existing_key(self):
+        shutil.rmtree(self.root / "runtime/governance")
+        key = self.root / "operator-secrets/governance-witness.key"
+        key.write_bytes(b"corrupt")
+        with self.assertRaises(PoolError) as raised:
+            self.pool.initialize()
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(key.read_bytes(), b"corrupt")
+
+    def test_windows_key_creation_does_not_call_posix_fchmod(self):
+        with (
+            mock.patch("internal.pool.os.name", "nt"),
+            mock.patch("internal.pool.os.open", return_value=19),
+            mock.patch("internal.pool.os.write", return_value=32),
+            mock.patch("internal.pool.os.fsync"),
+            mock.patch("internal.pool.os.close"),
+            mock.patch("internal.pool.os.fchmod") as fchmod,
+        ):
+            self.pool._create_witness_key()
+        fchmod.assert_not_called()
+
+    def test_authoritative_marker_fsyncs_file_and_parent_directory(self):
+        authority = self.pool.claim("marker-holder", "marker-task", self.project, "pinned")
+        with self.pool.authority_lease(authority) as lease:
+            with mock.patch("internal.pool.os.fsync", wraps=os.fsync) as fsync:
+                self.assertTrue(
+                    self.pool._create_governance_marker(
+                        lease, "consumed", "witness-" + "a" * 32, "b" * 64
+                    )
+                )
+        self.assertGreaterEqual(fsync.call_count, 2)
 
     def test_invalid_witness_key_requires_recovery(self):
         key_path = self.root / "operator-secrets" / "governance-witness.key"

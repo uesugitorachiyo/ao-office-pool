@@ -1127,6 +1127,7 @@ def _darwin_spawn_suspended(
     project_descriptor: int,
     executable: _VerifiedExecutable,
     environment: dict[str, str] | None = None,
+    retained_descriptors: tuple[int, ...] = (),
 ) -> _DarwinChild:
     if environment is None:
         environment = dict(os.environ)
@@ -1170,6 +1171,13 @@ def _darwin_spawn_suspended(
             _darwin_call(
                 system.posix_spawn_file_actions_addclose,
                 ctypes.byref(actions),
+                descriptor,
+            )
+        for descriptor in retained_descriptors:
+            _darwin_call(
+                system.posix_spawn_file_actions_adddup2,
+                ctypes.byref(actions),
+                descriptor,
                 descriptor,
             )
         _darwin_call(system.posix_spawnattr_init, ctypes.byref(attributes))
@@ -1353,13 +1361,14 @@ def _run_darwin(
     executable: _VerifiedExecutable,
     timeout_seconds: int = 30,
     environment: dict[str, str] | None = None,
+    retained_descriptors: tuple[int, ...] = (),
 ) -> bytes:
     descriptor = project.descriptors[0]
     child = (
         _darwin_spawn_suspended(arguments, descriptor, executable)
-        if environment is None
+        if environment is None and not retained_descriptors
         else _darwin_spawn_suspended(
-            arguments, descriptor, executable, environment
+            arguments, descriptor, executable, environment, retained_descriptors
         )
     )
     stdout = None
@@ -1424,6 +1433,7 @@ def _run_output(
     *,
     timeout_seconds: int = 30,
     environment: dict[str, str] | None = None,
+    retained_descriptors: tuple[int, ...] = (),
 ) -> bytes:
     launch_path = executable.launch_path
     if isinstance(project, _PrivateDirectory):
@@ -1442,6 +1452,7 @@ def _run_output(
             executable,
             timeout_seconds=timeout_seconds,
             environment=environment,
+            retained_descriptors=retained_descriptors,
         )
     options = {}
     if os.name != "nt":
@@ -1451,7 +1462,7 @@ def _run_output(
             if source.st_dev != current.st_dev or source.st_ino != current.st_ino:
                 raise MissionBridgeError("mission-launch-failed")
         options["pass_fds"] = tuple(
-            dict.fromkeys((*executable.descriptors, *private_descriptors))
+            dict.fromkeys((*executable.descriptors, *private_descriptors, *retained_descriptors))
         )
     else:
         options["creationflags"] = 0x00000004

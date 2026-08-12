@@ -1,4 +1,5 @@
 import dataclasses
+import contextlib
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ from internal.governance_witness import (
     issue_witness,
     revoke_witness,
 )
-from internal.pool import AuthorityLease, Pool
+from internal.pool import AuthorityLease, Pool, PoolError
 
 
 FAKE_PRODUCER = r'''
@@ -376,12 +377,11 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     def test_arbitrary_envelope_sealer_and_forged_lease_are_rejected(self):
         self.assertFalse(hasattr(governance, "_seal"))
+        self.assertFalse(hasattr(governance, "_issue_authenticated_record"))
         envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
         with self.pool.authority_lease(self.claim_path) as real:
-            forged = AuthorityLease(real.authority_path, real.authority_bytes, real.authority)
-            self._assert_code(
-                "governance-unauthorized", lambda: _consume_witness(forged, envelope)
-            )
+            with self.assertRaises(PoolError):
+                AuthorityLease(real.authority_path, real.authority_bytes, real.authority)
 
     def test_blueprint_authorization_is_created_by_the_pinned_producer(self):
         forged = self.blueprint / "build-authorization.json"
@@ -767,6 +767,51 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertNotIn(str(self.forge), (self.project / "producer-commands").read_text())
         self.assertTrue(envelope.is_file())
 
+    def test_staged_candidate_a_b_a_swap_fails_closed(self):
+        run_producer = governance._run_producer
+
+        def swap_staged(name, component, artifact, project, *rest):
+            result = run_producer(name, component, artifact, project, *rest)
+            if name == "ao-forge":
+                original = artifact.private.path
+                parked = original.with_name(original.name + ".parked")
+                original.rename(parked)
+                original.write_bytes(b"replacement")
+                original.unlink()
+                parked.rename(original)
+            return result
+
+        with mock.patch.object(governance, "_run_producer", side_effect=swap_staged):
+            self._assert_code(
+                "governance-artifact-changed",
+                lambda: issue_witness(
+                    self.claim_path, self.task_text, self.valid_artifacts()
+                ),
+            )
+
+    def test_blueprint_output_path_swap_fails_closed(self):
+        run_producer = governance._run_producer
+
+        def swap_output(name, component, artifact, project, *rest):
+            result = run_producer(name, component, artifact, project, *rest)
+            if name == "ao-blueprint":
+                output = rest[1]
+                original = output.private.path
+                parked = original.with_name(original.name + ".parked")
+                original.rename(parked)
+                original.write_bytes(b"replacement")
+                original.unlink()
+                parked.rename(original)
+            return result
+
+        with mock.patch.object(governance, "_run_producer", side_effect=swap_output):
+            self._assert_code(
+                "governance-artifact-changed",
+                lambda: issue_witness(
+                    self.claim_path, self.task_text, self.valid_artifacts()
+                ),
+            )
+
     def test_project_marker_deletion_does_not_restore_authority(self):
         consumed = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
         governed = self._consume(consumed)
@@ -821,6 +866,26 @@ class GovernanceWitnessTests(unittest.TestCase):
         self._mode("large-authorization")
         self._assert_code(
             "governance-producer-readback",
+            lambda: issue_witness(self.claim_path, self.task_text, self.valid_artifacts()),
+        )
+
+    def test_oversized_blueprint_aggregate_and_workflow_fail_bounded(self):
+        first = self.blueprint / "first.bin"
+        second = self.blueprint / "second.bin"
+        with first.open("wb") as stream:
+            stream.truncate(governance._MAX_ARTIFACT // 2 + 1)
+        with second.open("wb") as stream:
+            stream.truncate(governance._MAX_ARTIFACT // 2 + 1)
+        self._assert_code(
+            "governance-artifact-unsafe",
+            lambda: issue_witness(self.claim_path, self.task_text, self.valid_artifacts()),
+        )
+        first.unlink()
+        second.unlink()
+        with self.workflow.open("wb") as stream:
+            stream.truncate(governance._MAX_ARTIFACT + 1)
+        self._assert_code(
+            "governance-workflow-mismatch",
             lambda: issue_witness(self.claim_path, self.task_text, self.valid_artifacts()),
         )
 
@@ -885,6 +950,29 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertNotIn(b"pack-inspection", published)
         self.assertNotIn(b"goal_run", published)
         self.assertNotIn(b"policy_explanations", published)
+
+    def test_witness_hmac_uses_the_retained_key_descriptor_during_path_swap(self):
+        key_path = self.pool_root / "operator-secrets/governance-witness.key"
+        original_open = Pool._open_witness_key
+
+        @contextlib.contextmanager
+        def swap_after_open(pool, lease):
+            with original_open(pool, lease) as key:
+                parked = key_path.with_name("parked-witness.key")
+                key_path.rename(parked)
+                key_path.write_bytes(b"x" * 32)
+                try:
+                    yield key
+                finally:
+                    key_path.unlink()
+                    parked.rename(key_path)
+
+        with mock.patch.object(Pool, "_open_witness_key", swap_after_open):
+            envelope = issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            )
+        governed = self._consume(envelope)
+        governed.target.close()
 
 
 if __name__ == "__main__":
