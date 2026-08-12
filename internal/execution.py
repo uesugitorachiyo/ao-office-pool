@@ -29,6 +29,7 @@ from internal.pool import Pool, PoolError
 
 
 MAX_WORKFLOW = 64 * 1024 * 1024
+MAX_EXECUTION_IDS = 128
 EXECUTION_SCHEMA = Path(__file__).parents[1] / "schemas/execution-record.schema.json"
 
 
@@ -413,6 +414,108 @@ def _artifact_digest(governed: GovernedExecution, name: str) -> str | None:
     return artifact["artifact_sha256"] if artifact is not None else None
 
 
+def _create_record_descriptor(record) -> int:
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        from internal.windows_identity import (
+            _BY_HANDLE_FILE_INFORMATION,
+            _FILE_ATTRIBUTE_DIRECTORY,
+            _FILE_ATTRIBUTE_REPARSE_POINT,
+            _FILE_SHARE_READ,
+            _INVALID_HANDLE_VALUE,
+            _final_path,
+            _kernel32,
+            _native_path,
+        )
+        from internal.windows_paths import canonical_windows_path
+
+        if not record.directory.handles:
+            raise ValueError("retained record directory handle required")
+        library = _kernel32()
+        parent_handle = record.directory.handles[-1]
+        retained_parent = _final_path(library, parent_handle)
+        handle = library.CreateFileW(
+            _native_path(canonical_windows_path(str(record.path))),
+            0x80000000 | 0x40000000,
+            _FILE_SHARE_READ,
+            None,
+            1,
+            0x00200000,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            code = ctypes.get_last_error()
+            if code in {80, 183}:
+                raise FileExistsError(code, "execution record already exists")
+            raise ctypes.WinError(code)
+        try:
+            information = _BY_HANDLE_FILE_INFORMATION()
+            if not library.GetFileInformationByHandle(
+                handle, ctypes.byref(information)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            created_path = _final_path(library, handle)
+            if (
+                information.file_attributes
+                & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT)
+                or information.number_of_links != 1
+                or created_path.parent != retained_parent
+                or _final_path(library, parent_handle) != retained_parent
+            ):
+                raise ValueError("unsafe created execution record")
+            descriptor = msvcrt.open_osfhandle(
+                handle, os.O_RDWR | getattr(os, "O_BINARY", 0)
+            )
+            handle = None
+            return descriptor
+        finally:
+            if handle is not None:
+                library.CloseHandle(handle)
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(
+        record.name,
+        flags,
+        0o600,
+        dir_fd=record.directory.directory_descriptor,
+    )
+
+
+def _record_identity(information, expected_size: int | None = None) -> tuple:
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or information.st_nlink != 1
+        or (expected_size is not None and information.st_size != expected_size)
+    ):
+        raise ValueError("unsafe execution record identity")
+    return (
+        information.st_dev,
+        information.st_ino,
+        information.st_mode,
+        information.st_nlink,
+        information.st_size,
+        information.st_mtime_ns,
+        information.st_ctime_ns,
+    )
+
+
+def _record_path_identity(record, expected_size: int) -> tuple | None:
+    if os.name == "nt":
+        # The created handle denies write and delete sharing until verification
+        # completes, while every ancestor directory handle denies delete sharing.
+        return None
+    information = os.stat(
+        record.name,
+        dir_fd=record.directory.directory_descriptor,
+        follow_symlinks=False,
+    )
+    return _record_identity(information, expected_size)
+
+
 def _write_record(
     project,
     authority: dict,
@@ -456,6 +559,7 @@ def _write_record(
         "failure_code": failure_code,
     }
     record = None
+    descriptor = None
     try:
         candidate = {
             **value,
@@ -463,7 +567,7 @@ def _write_record(
             "record_digest": "0" * 64,
         }
         _validate_schema(candidate, EXECUTION_SCHEMA)
-        while True:
+        for _attempt in range(MAX_EXECUTION_IDS):
             value["execution_id"] = "execution-" + uuid.uuid4().hex
             value["record_digest"] = _digest(
                 {
@@ -479,47 +583,37 @@ def _write_record(
                 (".ao", "evidence", "office-pool"),
                 value["execution_id"] + ".json",
             )
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            if hasattr(os, "O_BINARY"):
-                flags |= os.O_BINARY
             try:
-                if record.directory.directory_descriptor is None:
-                    descriptor = os.open(record.path, flags, 0o600)
-                else:
-                    descriptor = os.open(
-                        record.name,
-                        flags,
-                        0o600,
-                        dir_fd=record.directory.directory_descriptor,
-                    )
+                descriptor = _create_record_descriptor(record)
             except FileExistsError:
                 record.close()
                 record = None
                 continue
-            try:
-                view = memoryview(expected)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError("execution record write made no progress")
-                    view = view[written:]
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+            created = _record_identity(os.fstat(descriptor))
+            view = memoryview(expected)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("execution record write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
             if record.directory.directory_descriptor is not None:
                 os.fsync(record.directory.directory_descriptor)
             break
+        else:
+            raise ExecutionError("recovery-required")
 
-        with _open_retained_file(record) as descriptor:
-            chunks = []
-            while True:
-                chunk = os.read(descriptor, 64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        raw = b"".join(chunks)
+        before = _record_identity(os.fstat(descriptor), len(expected))
+        if created[:4] != before[:4]:
+            raise ValueError("created execution record identity changed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, len(expected) + 1)
+        after = _record_identity(os.fstat(descriptor), len(expected))
+        if before != after:
+            raise ValueError("execution record changed during readback")
+        path_identity = _record_path_identity(record, len(expected))
+        if path_identity is not None and path_identity != after:
+            raise ValueError("execution record path identity changed")
         readback = json.loads(raw)
         _validate_schema(readback, EXECUTION_SCHEMA)
         digest_value = {
@@ -548,6 +642,8 @@ def _write_record(
             "recovery-required", None if record is None else record.path
         ) from error
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         if record is not None:
             record.close()
 

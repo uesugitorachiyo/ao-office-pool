@@ -11,7 +11,7 @@ import time
 import types
 import unittest
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 import internal.execution as execution_module
@@ -199,19 +199,20 @@ class ExecutionTests(unittest.TestCase):
         return self.project / ".ao" / "evidence" / "office-pool"
 
     @contextmanager
-    def _mutated_record_readback(self, mutate):
-        real_open = mission_bridge._open_retained_file
+    def _during_record_readback(self, mutate):
+        before = set(self._execution_records.glob("execution-*.json"))
+        real_read = os.read
+        mutated = False
 
-        @contextmanager
-        def mutate_then_open(private):
-            if private.name.startswith("execution-"):
-                private.path.write_bytes(mutate(private.path.read_bytes()))
-            with real_open(private) as descriptor:
-                yield descriptor
+        def mutate_then_read(descriptor, amount):
+            nonlocal mutated
+            created = set(self._execution_records.glob("execution-*.json")) - before
+            if created and not mutated:
+                mutated = True
+                mutate(next(iter(created)), descriptor, amount)
+            return real_read(descriptor, amount)
 
-        with mock.patch.object(
-            execution_module, "_open_retained_file", mutate_then_open
-        ):
+        with mock.patch.object(execution_module.os, "read", mutate_then_read):
             yield
 
     def test_executes_only_envelope_bound_objects_and_relative_target(self):
@@ -651,33 +652,54 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b"preserve-me")
         self.assertEqual(result.record.name, "execution-" + "b" * 32 + ".json")
 
+    def test_execution_id_collision_exhaustion_is_bounded_and_preserves_sentinel(self):
+        # MUTATION: an unbounded collision retry can hold the authority lease forever.
+        self._execution_records.mkdir(parents=True, exist_ok=True)
+        sentinel = self._execution_records / ("execution-" + "a" * 32 + ".json")
+        sentinel.write_bytes(b"preserve-me")
+        fixed = types.SimpleNamespace(hex="a" * 32)
+        with (
+            mock.patch.object(
+                execution_module.uuid, "uuid4", side_effect=[fixed] * 130
+            ) as ids,
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertIsNone(raised.exception.record)
+        self.assertEqual(ids.call_count, 129)
+        self.assertEqual(sentinel.read_bytes(), b"preserve-me")
+
     def test_record_readback_mutation_preserves_written_evidence(self):
         # MUTATION: returning without exact readback accepts noncanonical changed bytes.
-        def add_whitespace(raw: bytes) -> bytes:
-            return raw[:-1] + b" \n"
+        def add_whitespace(record, _descriptor, _amount):
+            with record.open("ab") as stream:
+                stream.write(b" ")
 
         with (
-            self._mutated_record_readback(add_whitespace),
+            self._during_record_readback(add_whitespace),
             self.assertRaises(ExecutionError) as raised,
         ):
             execute(self.claim_path, self.envelope)
         self.assertEqual(raised.exception.code, "recovery-required")
         self.assertIsNotNone(raised.exception.record)
         self.assertEqual(
-            raised.exception.record.read_bytes()[-2:], b" \n"
+            raised.exception.record.read_bytes()[-2:], b"\n "
         )
 
     def test_record_digest_mismatch_preserves_written_evidence(self):
         # MUTATION: schema-only readback accepts a syntactically valid false record digest.
-        def replace_digest(raw: bytes) -> bytes:
-            value = json.loads(raw)
+        def replace_digest(record, _descriptor, _amount):
+            value = json.loads(record.read_bytes())
             value["record_digest"] = "0" * 64
-            return (
-                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode()
+            record.write_bytes(
+                (
+                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode()
+            )
 
         with (
-            self._mutated_record_readback(replace_digest),
+            self._during_record_readback(replace_digest),
             self.assertRaises(ExecutionError) as raised,
         ):
             execute(self.claim_path, self.envelope)
@@ -685,6 +707,70 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsNotNone(raised.exception.record)
         preserved = json.loads(raised.exception.record.read_bytes())
         self.assertEqual(preserved["record_digest"], "0" * 64)
+
+    @unittest.skipIf(os.name == "nt", "POSIX retained-descriptor mutation assertion")
+    def test_record_rename_recreate_is_rejected_without_touching_replacement(self):
+        # MUTATION: verifying only the open inode accepts a substituted record pathname.
+        parked = self._execution_records / "parked-created-record.json"
+
+        def replace_path(record, _descriptor, _amount):
+            os.replace(record, parked)
+            record.write_bytes(b"replacement-sentinel")
+
+        with (
+            self._during_record_readback(replace_path),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(raised.exception.record.read_bytes(), b"replacement-sentinel")
+        self.assertTrue(parked.read_bytes().startswith(b'{"ao2_sha256"'))
+
+    @unittest.skipIf(os.name == "nt", "POSIX retained-descriptor mutation assertion")
+    def test_record_delete_recreate_is_rejected_without_touching_replacement(self):
+        # MUTATION: reopening the pathname reads attacker replacement instead of created bytes.
+        preserved = self._execution_records / "preserved-created-record.json"
+
+        def replace_path(record, descriptor, _amount):
+            preserved.write_bytes(os.pread(descriptor, record.stat().st_size, 0))
+            record.unlink()
+            record.write_bytes(b"replacement-sentinel")
+
+        with (
+            self._during_record_readback(replace_path),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(raised.exception.record.read_bytes(), b"replacement-sentinel")
+        self.assertTrue(preserved.read_bytes().startswith(b'{"ao2_sha256"'))
+
+    @unittest.skipIf(os.name == "nt", "POSIX hard-link mutation assertion")
+    def test_record_hardlink_during_readback_is_rejected_and_bytes_preserved(self):
+        # MUTATION: omitting stable single-link fstats accepts aliased execution evidence.
+        alias = self._execution_records / "aliased-created-record.json"
+
+        def add_alias(record, _descriptor, _amount):
+            os.link(record, alias)
+
+        with (
+            self._during_record_readback(add_alias),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(raised.exception.record.read_bytes(), alias.read_bytes())
+
+    def test_record_readback_is_bounded_to_expected_bytes_plus_one(self):
+        # MUTATION: EOF accumulation permits unbounded memory use after an oversized append.
+        requested = []
+
+        def capture_bound(record, _descriptor, amount):
+            requested.append((amount, record.stat().st_size + 1))
+
+        with self._during_record_readback(capture_bound):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(requested, [(requested[0][1], requested[0][1])])
 
     def test_runtime_tampering_fails_before_launch(self):
         # MUTATION: trusting only the envelope AO2 name accepts changed runtime bytes.
@@ -701,6 +787,70 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotEqual(first.record, second.record)
         self.assertTrue(first.record.is_file())
         self.assertTrue(second.record.is_file())
+
+
+class WindowsRecordCreationTests(unittest.TestCase):
+    def _create_record(self, created_parent):
+        parent = PureWindowsPath("C:/project/.ao/evidence/office-pool")
+        record_name = "execution-" + "a" * 32 + ".json"
+        record = types.SimpleNamespace(
+            path=Path(str(parent / record_name)),
+            directory=types.SimpleNamespace(handles=(11, 22)),
+        )
+        calls = []
+
+        class FakeLibrary:
+            def CreateFileW(self, *arguments):
+                calls.append(arguments)
+                return 33
+
+            def GetFileInformationByHandle(self, _handle, pointer):
+                pointer._obj.file_attributes = 0
+                pointer._obj.number_of_links = 1
+                return 1
+
+            def CloseHandle(self, _handle):
+                return 1
+
+        library = FakeLibrary()
+
+        def final_path(_library, handle):
+            if handle == 22:
+                return parent
+            self.assertEqual(handle, 33)
+            return created_parent / record_name
+
+        # Use the real information structure but fake native calls and fd conversion.
+        import internal.windows_identity as windows_identity
+
+        fake_msvcrt = types.SimpleNamespace(
+            open_osfhandle=mock.Mock(return_value=44), O_RDWR=2, O_BINARY=0
+        )
+
+        with (
+            mock.patch.object(execution_module.os, "name", "nt"),
+            mock.patch.object(windows_identity, "_kernel32", return_value=library),
+            mock.patch.object(windows_identity, "_final_path", side_effect=final_path),
+            mock.patch.object(windows_identity, "_native_path", return_value="native"),
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+        ):
+            descriptor = execution_module._create_record_descriptor(record)
+        return descriptor, calls
+
+    def test_windows_create_is_bound_to_retained_parent_before_write(self):
+        # MUTATION: pathname creation with write/delete sharing can redirect or replace.
+        parent = PureWindowsPath("C:/project/.ao/evidence/office-pool")
+        descriptor, calls = self._create_record(parent)
+        self.assertEqual(descriptor, 44)
+        self.assertEqual(calls[0][1], 0x80000000 | 0x40000000)
+        self.assertEqual(calls[0][2], 1)
+        self.assertEqual(calls[0][4], 1)
+
+    def test_windows_create_rejects_redirected_parent_before_write(self):
+        # MUTATION: absolute creation without final-parent comparison accepts redirection.
+        redirected = PureWindowsPath("C:/recreated/.ao/evidence/office-pool")
+        with self.assertRaises(ValueError):
+            self._create_record(redirected)
 
 
 @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
