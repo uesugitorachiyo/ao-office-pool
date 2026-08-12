@@ -414,12 +414,30 @@ class Pool:
     def _unknown_paths(self, office_id: str) -> list[Path]:
         office = self._office(office_id)
         paths = list((office / "work").iterdir())
-        paths.extend(
-            path
-            for path in office.iterdir()
-            if path.name not in {"office-state.json", "work", "history"}
-        )
+        for path in office.iterdir():
+            if path.name in {"office-state.json", "work", "history"}:
+                continue
+            if path.name != "runtime" or not self._valid_office_runtime(path):
+                paths.append(path)
         return sorted(paths, key=lambda path: path.name)
+
+    def _valid_office_runtime(self, runtime: Path) -> bool:
+        executable = "ao2.exe" if os.name == "nt" else "ao2"
+        version = runtime / "versions" / self.runtime_version
+        expected = {runtime, runtime / "versions", version, version / executable}
+        try:
+            valid = (
+                all(path.is_dir() for path in expected - {version / executable})
+                and (version / executable).is_file()
+                and set(runtime.rglob("*")) == expected - {runtime}
+            )
+            if valid and os.name == "nt":
+                root_identity = open_identity(runtime)
+                for path in expected:
+                    require_within(open_identity(path), root_identity)
+            return valid
+        except OSError:
+            return False
 
     def _mark_recovery(self, office_id: str, state: dict, reason: str) -> None:
         value = dict(state)
