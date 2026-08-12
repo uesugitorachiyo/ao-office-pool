@@ -6,6 +6,7 @@ import time
 import unittest
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 from internal.pool import Pool, PoolError
 
@@ -342,6 +343,66 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "recovery-required")
         self.assertEqual(self._snapshot(), before)
         self.assertEqual(outside.read_bytes(), b"outside-lock")
+
+    def test_lock_swap_between_preflight_and_open_never_touches_target(self):
+        # MUTATION: pathname validation before open leaves a swap race at the lock syscall.
+        root = self.base / "lock-open-race"
+        pool = Pool(root)
+        pool.initialize()
+        lock = root / ".pool.lock"
+        outside = self.base / "outside-race.lock"
+        outside.write_bytes(b"outside-race-original")
+        before = {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file() and path != lock
+        }
+        swapped = False
+        if os.name == "nt":
+            from internal import windows_identity
+
+            real_kernel32 = windows_identity._kernel32
+            library = real_kernel32()
+
+            class SwapLibrary:
+                def __getattr__(self, name):
+                    return getattr(library, name)
+
+                def CreateFileW(self, *arguments):
+                    nonlocal swapped
+                    if not swapped:
+                        swapped = True
+                        lock.unlink()
+                        lock.symlink_to(outside)
+                    return library.CreateFileW(*arguments)
+
+            patcher = mock.patch(
+                "internal.windows_identity._kernel32", return_value=SwapLibrary()
+            )
+        else:
+            real_open = os.open
+
+            def swap_then_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if Path(path) == lock and not swapped:
+                    swapped = True
+                    lock.unlink()
+                    lock.symlink_to(outside)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            patcher = mock.patch("internal.transactions.os.open", side_effect=swap_then_open)
+        with patcher:
+            with self.assertRaises(PoolError) as raised:
+                pool.claim("holder", "task", self.project, "pinned")
+        self.assertTrue(swapped)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(outside.read_bytes(), b"outside-race-original")
+        after = {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file() and path != lock
+        }
+        self.assertEqual(after, before)
 
     def test_claim_hides_owner_key(self):
         # MUTATION: returning protected holder material alongside the authority path.

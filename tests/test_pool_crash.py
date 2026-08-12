@@ -140,6 +140,85 @@ class PoolCrashTests(unittest.TestCase):
         self.assertEqual(authority.read_bytes(), b"foreign\x00bytes")
         self.assertEqual(Pool(root).public_status()["offices"][0]["status"], "recovery-required")
 
+    def test_journal_quarantine_preserves_existing_recovery_marker(self):
+        # MUTATION: quarantine overwrites a marker whose bytes have unknown semantics.
+        root, _ = self._pool("existing-recovery-marker")
+        with self.assertRaises(InjectedCrash):
+            Pool(root, crash_after="claim:journal-prepared").claim(
+                "holder", "task", self.project, "pinned"
+            )
+        journal = next((root / "runtime" / "transactions").iterdir())
+        value = json.loads(journal.read_text())
+        value["phase"] = "impossible"
+        journal.write_text(json.dumps(value), encoding="utf-8")
+        marker = root / "runtime" / "recovery" / "O1.json"
+        original = b"future-marker\x00bytes"
+        marker.write_bytes(original)
+
+        with self.assertRaises(PoolError) as raised:
+            Pool(root).claim("next", "next-task", self.project, "pinned")
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(marker.read_bytes(), original)
+        self.assertTrue(journal.exists())
+
+    def test_unexpected_transaction_members_stop_before_reuse(self):
+        # MUTATION: globbing only JSON journals ignores foreign protected bytes.
+        for relative, directory in (("future.bin", False), ("nested", True)):
+            with self.subTest(relative=relative):
+                root, _ = self._pool(f"unexpected-transaction-{relative.replace('.', '-')}")
+                unexpected = root / "runtime" / "transactions" / relative
+                if directory:
+                    unexpected.mkdir()
+                    payload = unexpected / "payload.bin"
+                else:
+                    payload = unexpected
+                payload.write_bytes(b"unknown-transaction\x00bytes")
+                before = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+
+                with self.assertRaises(PoolError) as raised:
+                    Pool(root).claim("holder", "task", self.project, "pinned")
+                self.assertEqual(raised.exception.code, "recovery-required")
+                after = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+                self.assertEqual(after, before)
+
+    def test_every_unexpected_runtime_member_stops_before_reuse(self):
+        # MUTATION: checking only transactions leaves other protected registries open.
+        relatives = (
+            "future.bin",
+            "receipts/future.bin",
+            "pointers/future.bin",
+            "transactions/future.bin",
+            "recovery/future.bin",
+        )
+        for number, relative in enumerate(relatives):
+            with self.subTest(relative=relative):
+                root, _ = self._pool(f"unexpected-runtime-{number}")
+                unexpected = root / "runtime" / relative
+                unexpected.write_bytes(b"unknown-runtime\x00bytes")
+                before = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+
+                with self.assertRaises(PoolError) as raised:
+                    Pool(root).claim("holder", "task", self.project, "pinned")
+                self.assertEqual(raised.exception.code, "recovery-required")
+                after = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+                self.assertEqual(after, before)
+
     def test_untrusted_journal_paths_stop_before_mutation(self):
         # MUTATION: replaying unvalidated journal member paths deletes an unrelated file.
         root, _ = self._pool("journal-path")
@@ -261,6 +340,63 @@ class PoolCrashTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "recovery-required")
                 self.assertEqual(journal.read_bytes(), original)
 
+    def test_committed_phase_requires_fully_durable_post_state(self):
+        # MUTATION: phase alone rolls an authentic but incomplete transition forward.
+        cases = []
+
+        claim_root, _ = self._pool("phase-prefix-claim")
+        with self.assertRaises(InjectedCrash):
+            Pool(claim_root, crash_after="claim:journal-prepared").claim(
+                "holder", "task", self.project, "pinned"
+            )
+        cases.append(claim_root)
+
+        release_root, release_pool = self._pool("phase-prefix-release")
+        authority = release_pool.claim("holder", "task", self.project, "pinned")
+        with self.assertRaises(InjectedCrash):
+            Pool(release_root, crash_after="release:journal-prepared").release(authority)
+        cases.append(release_root)
+
+        recover_root, recover_pool = self._pool("phase-prefix-recover")
+        recovery_authority = recover_pool.claim("holder", "task", self.project, "pinned")
+        (recover_root / "offices" / "O1" / "work" / "partial.bin").write_bytes(
+            b"partial"
+        )
+        with self.assertRaises(PoolError):
+            recover_pool.release(recovery_authority)
+        with self.assertRaises(InjectedCrash):
+            Pool(recover_root, crash_after="recover:journal-prepared").recover(
+                recover_root / "operator-secrets" / "recovery-key-O1", "O1", 1
+            )
+        cases.append(recover_root)
+
+        for root in cases:
+            with self.subTest(kind=root.name):
+                journal = next((root / "runtime" / "transactions").iterdir())
+                value = json.loads(journal.read_text())
+                value["phase"] = "committed"
+                journal.write_text(json.dumps(value), encoding="utf-8")
+                original = journal.read_bytes()
+                before = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+
+                with self.assertRaises(PoolError) as raised:
+                    Pool(root).claim("next", "next-task", self.project, "pinned")
+                self.assertEqual(raised.exception.code, "recovery-required")
+                self.assertEqual(journal.read_bytes(), original)
+                after = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+                marker_name = f"runtime/recovery/{value['office_id']}.json"
+                after.pop(marker_name, None)
+                before.pop(marker_name, None)
+                self.assertEqual(after, before)
+
     def test_generation_registry_survives_unknown_state(self):
         # MUTATION: corrupt state resets generation to zero and reuses generation one.
         root, pool = self._pool("generation-registry")
@@ -381,6 +517,30 @@ class PoolCrashTests(unittest.TestCase):
                     self.assertTrue(authority.exists())
                     self.assertEqual(len(list((root / "runtime" / "pointers").iterdir())), 1)
 
+    def test_interrupted_release_retries_directly_with_original_receipt_path(self):
+        # MUTATION: retry requires a receipt already deleted by the interrupted release.
+        stages = (
+            "release:journal-prepared",
+            "release:authority",
+            "release:pointer",
+            "release:office",
+            "release:journal-committed",
+        )
+        for stage in stages:
+            with self.subTest(stage=stage):
+                root, pool = self._pool(f"direct-{stage.replace(':', '-')}")
+                authority = pool.claim("holder", "task", self.project, "pinned")
+                self._abrupt(_crash_release, str(root), str(authority), stage)
+
+                Pool(root).release(authority)
+
+                self.assertEqual(
+                    Pool(root).public_status()["offices"][0],
+                    {"office_id": "O1", "status": "free", "generation": 1},
+                )
+                self.assertFalse(authority.exists())
+                self.assertEqual(list((root / "runtime" / "transactions").iterdir()), [])
+
     def test_recovery_transitions_preserve_every_unknown_byte(self):
         # MUTATION: interrupted recovery deletes residue instead of preserving it.
         stages = (
@@ -416,6 +576,37 @@ class PoolCrashTests(unittest.TestCase):
                 copies = [path.read_bytes() for path in root.rglob("partial.bin")]
                 self.assertEqual(copies, [payload])
                 self.assertEqual(hashlib.sha256(copies[0]).hexdigest(), hashlib.sha256(payload).hexdigest())
+
+    def test_interrupted_recovery_retries_directly_with_exact_key(self):
+        # MUTATION: retry rejects the free post-state before replaying its pending journal.
+        stages = (
+            "recover:journal-prepared",
+            "recover:authority",
+            "recover:pointer",
+            "recover:office",
+            "recover:journal-committed",
+        )
+        for stage in stages:
+            with self.subTest(stage=stage):
+                root, pool = self._pool(f"direct-{stage.replace(':', '-')}")
+                authority = pool.claim("holder", "task", self.project, "pinned")
+                (root / "offices" / "O1" / "work" / "partial.bin").write_bytes(
+                    b"direct-recovery"
+                )
+                with self.assertRaises(PoolError):
+                    pool.release(authority)
+                key = root / "operator-secrets" / "recovery-key-O1"
+                self._abrupt(_crash_recover, str(root), stage, 1)
+
+                Pool(root).recover(key, "O1", 1)
+
+                self.assertEqual(
+                    Pool(root).public_status()["offices"][0],
+                    {"office_id": "O1", "status": "free", "generation": 1},
+                )
+                self.assertEqual(list((root / "runtime" / "transactions").iterdir()), [])
+                preserved = list((root / "offices" / "O1" / "history").rglob("partial.bin"))
+                self.assertEqual([path.read_bytes() for path in preserved], [b"direct-recovery"])
 
 
 if __name__ == "__main__":
