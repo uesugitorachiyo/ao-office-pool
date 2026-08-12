@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -19,6 +20,7 @@ from internal.conversation_lifecycle import (
 )
 from internal.pool import Pool
 from internal.mission_bridge import start_or_resume
+from tests.test_mission_bridge import DARWIN_FAKE
 
 
 MISSION_FAKE = r'''#!/usr/bin/env python3
@@ -56,6 +58,15 @@ class ConversationLifecycleTests(unittest.TestCase):
             import shutil
 
             shutil.copy2(supplied_fake, self.executable)
+        elif sys.platform == "darwin":
+            self.executable = self.base / "ao-mission"
+            source = self.base / "fake-mission.c"
+            source.write_text(DARWIN_FAKE, encoding="utf-8")
+            subprocess.run(
+                ["clang", "-Wno-deprecated-declarations", str(source), "-o", str(self.executable)],
+                check=True,
+                capture_output=True,
+            )
         else:
             self.executable = self.base / "ao-mission"
             self.executable.write_text(MISSION_FAKE, encoding="utf-8")
@@ -106,6 +117,17 @@ class ConversationLifecycleTests(unittest.TestCase):
                 raise
             return None
         self._link_directory(directory, outside)
+        return parked
+
+    def _replace_project_root(self):
+        parked = self.project.with_name("project-authorized")
+        try:
+            os.replace(self.project, parked)
+        except OSError:
+            if os.name != "nt":
+                raise
+            return None
+        self.project.mkdir()
         return parked
 
     def _state(self, mode="conversation"):
@@ -258,6 +280,29 @@ class ConversationLifecycleTests(unittest.TestCase):
             self.assertEqual(result.action, "cancel")
         if os.name != "nt":
             self.assertIsNotNone(parked[0])
+
+    def test_checkpoint_uses_receipt_bound_retained_project_root(self):
+        # MUTATION: lifecycle reopens the project path after receipt identity validation.
+        _, state = self._state()
+        real_private_file = conversation_lifecycle._private_file
+        parked = []
+
+        def swap_before_descendant_open(project, directories, name):
+            if not parked:
+                parked.append(self._replace_project_root())
+            return real_private_file(project, directories, name)
+
+        with mock.patch.object(
+            conversation_lifecycle, "_private_file", swap_before_descendant_open
+        ):
+            try:
+                transition(self._event("cancel", state), state)
+            except ConversationError:
+                pass
+        if parked[0] is None:
+            self.assertEqual(os.name, "nt")
+        else:
+            self.assertEqual(list(self.project.iterdir()), [])
 
     def test_cancel_checkpoints_before_release(self):
         # MUTATION: releasing first loses the final restart checkpoint on failure.

@@ -5,6 +5,7 @@ import os
 import stat
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -53,6 +54,113 @@ print(json.dumps({
 }))
 '''
 
+DARWIN_FAKE = r'''
+#include <CommonCrypto/CommonDigest.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef PAYLOAD
+#define PAYLOAD "benign"
+#endif
+
+static int write_bytes(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    size_t size = strlen(value), offset = 0;
+    while (offset < size) {
+        ssize_t count = write(fd, value + offset, size - offset);
+        if (count <= 0) { close(fd); return -1; }
+        offset += (size_t)count;
+    }
+    return close(fd);
+}
+
+static int read_bytes(const char *path, char *value, size_t capacity) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    ssize_t count = read(fd, value, capacity - 1);
+    close(fd);
+    if (count < 0) return -1;
+    value[count] = '\0';
+    return 0;
+}
+
+static void digest(const char *value, char output[72]) {
+    unsigned char raw[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(value, (CC_LONG)strlen(value), raw);
+    strcpy(output, "sha256:");
+    for (int index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
+        sprintf(output + 7 + index * 2, "%02x", raw[index]);
+    }
+}
+
+int main(int argc, char **argv) {
+    const char *mode = getenv("AO_TEST_FAKE_MODE");
+    if (mode && strcmp(mode, "slow-large") == 0) {
+        char block[1000]; memset(block, 'x', sizeof(block));
+        for (int index = 0; index < 70; index++) write(STDOUT_FILENO, block, sizeof(block));
+        struct timespec delay = {10, 0}; nanosleep(&delay, NULL); return 0;
+    }
+    if (mode && strcmp(mode, "large") == 0) {
+        char block[1000]; memset(block, 'x', sizeof(block));
+        for (int index = 0; index < 70; index++) write(STDOUT_FILENO, block, sizeof(block));
+        return 0;
+    }
+    const char *home = NULL;
+    for (int index = 1; index + 1 < argc; index++) {
+        if (strcmp(argv[index], "--home") == 0) home = argv[index + 1];
+    }
+    if (!home) return 64;
+    char path[PATH_MAX], cwd[PATH_MAX], objective[128], mission[64];
+    snprintf(path, sizeof(path), "%s/payload-marker", home);
+    if (write_bytes(path, PAYLOAD "\n") != 0) return 65;
+    snprintf(path, sizeof(path), "%s/fake-cwd", home);
+    if (!getcwd(cwd, sizeof(cwd)) || write_bytes(path, cwd) != 0) return 66;
+    snprintf(path, sizeof(path), "%s/fake-arguments.jsonl", home);
+    int log = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (log < 0) return 67;
+    write(log, "[", 1);
+    for (int index = 1; index < argc; index++) {
+        dprintf(log, "%s\"%s\"", index == 1 ? "" : ",", argv[index]);
+    }
+    write(log, "]\n", 2); close(log);
+    strcpy(mission, "mission-0123456789abcdef");
+    bool inspect = false;
+    for (int index = 1; index < argc; index++) {
+        if (strcmp(argv[index], "inspect") == 0) inspect = true;
+        if (strcmp(argv[index], "--mission") == 0 && index + 1 < argc) {
+            snprintf(mission, sizeof(mission), "%s", argv[index + 1]);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/objective-digest", home);
+    if (inspect) {
+        if (read_bytes(path, objective, sizeof(objective)) != 0) return 68;
+        if (mode && strcmp(mode, "inspect-mismatch") == 0) {
+            strcpy(mission, "mission-fedcba9876543210");
+        }
+    } else {
+        digest(argv[argc - 1], objective);
+        if (write_bytes(path, objective) != 0) return 69;
+    }
+    if (strcmp(PAYLOAD, "malicious") == 0) strcpy(mission, "mission-fedcba9876543210");
+    if (mode && strcmp(mode, "invalid-id") == 0) strcpy(mission, "mission-not-valid");
+    const char *escalation =
+        mode && strcmp(mode, "escalation") == 0 ? ",\"executes_work\":true" : "";
+    dprintf(STDOUT_FILENO,
+        "{\"mission_id\":\"%s\",\"objective_digest\":\"%s\","
+        "\"status\":\"active\",\"current_route\":\"ao-blueprint\"%s}\n",
+        mission, objective, escalation);
+    return 0;
+}
+'''
+
 
 class MissionBridgeTests(unittest.TestCase):
     def setUp(self):
@@ -73,6 +181,28 @@ class MissionBridgeTests(unittest.TestCase):
         if os.name == "nt" and supplied_fake:
             self.executable = self.base / "ao-mission.exe"
             shutil.copy2(supplied_fake, self.executable)
+        elif sys.platform == "darwin":
+            self.executable = self.base / "ao-mission"
+            source = self.base / "fake-mission.c"
+            source.write_text(DARWIN_FAKE, encoding="utf-8")
+            subprocess.run(
+                ["clang", "-Wno-deprecated-declarations", str(source), "-o", str(self.executable)],
+                check=True,
+                capture_output=True,
+            )
+            self.malicious_executable = self.base / "malicious-mission"
+            subprocess.run(
+                [
+                    "clang",
+                    "-Wno-deprecated-declarations",
+                    '-DPAYLOAD="malicious"',
+                    str(source),
+                    "-o",
+                    str(self.malicious_executable),
+                ],
+                check=True,
+                capture_output=True,
+            )
         else:
             self.executable = self.base / "ao-mission"
             self.executable.write_text(FAKE, encoding="utf-8")
@@ -111,6 +241,11 @@ class MissionBridgeTests(unittest.TestCase):
         replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
         os.replace(replacement, self.executable)
 
+    def _replace_verified_copy(self, verified):
+        replacement = verified.path.with_name("replacement-verified-copy")
+        shutil.copy2(self.malicious_executable, replacement)
+        os.replace(replacement, verified.path)
+
     def _link_directory(self, link, target):
         if os.name == "nt":
             subprocess.run(
@@ -130,6 +265,17 @@ class MissionBridgeTests(unittest.TestCase):
                 raise
             return None
         self._link_directory(directory, outside)
+        return parked
+
+    def _replace_project_root(self):
+        parked = self.project.with_name("project-authorized")
+        try:
+            os.replace(self.project, parked)
+        except OSError:
+            if os.name != "nt":
+                raise
+            return None
+        self.project.mkdir()
         return parked
 
     def test_starts_verified_mission_with_argument_array_and_project_owned_state(self):
@@ -152,7 +298,11 @@ class MissionBridgeTests(unittest.TestCase):
             .splitlines()[0]
         )
         self.assertEqual(arguments[0], "--home")
-        expected_home = str(self.project / ".ao/mission")
+        expected_home = (
+            ".ao/mission"
+            if sys.platform == "darwin"
+            else str(self.project / ".ao/mission")
+        )
         if os.name == "nt":
             self.assertEqual(
                 canonical_windows_path(arguments[1]),
@@ -206,6 +356,28 @@ class MissionBridgeTests(unittest.TestCase):
         if os.name != "nt":
             self.assertIsNotNone(parked[0])
 
+    def test_receipt_bound_project_root_is_retained_before_descendant_open(self):
+        # MUTATION: receipt validation releases the root before private storage reopens it.
+        real_private_directory = mission_bridge._private_directory
+        parked = []
+
+        def swap_before_descendant_open(project, *parts):
+            if not parked:
+                parked.append(self._replace_project_root())
+            return real_private_directory(project, *parts)
+
+        with mock.patch.object(
+            mission_bridge, "_private_directory", swap_before_descendant_open
+        ):
+            try:
+                start_or_resume(self.claim_path, self.task_text)
+            except MissionBridgeError:
+                pass
+        if parked[0] is None:
+            self.assertEqual(os.name, "nt")
+        else:
+            self.assertEqual(list(self.project.iterdir()), [])
+
     def test_mission_home_retains_validated_directory_through_launch(self):
         # MUTATION: passing the checked Mission home pathname follows a swap at launch.
         outside = self.base / "outside-home"
@@ -241,13 +413,27 @@ class MissionBridgeTests(unittest.TestCase):
             if os.name == "nt":
                 with self.assertRaises(OSError):
                     self._replace_executable(malicious)
+            elif sys.platform == "darwin":
+                source_replacement = self.executable.with_name("source-replacement")
+                shutil.copy2(self.malicious_executable, source_replacement)
+                os.replace(source_replacement, self.executable)
             else:
                 self._replace_executable(malicious)
-            value = mission_bridge._run(
-                ["--home", str(self.project / ".ao/mission"), "start", self.task_text],
-                self.project,
-                verified,
-            )
+            if sys.platform == "darwin":
+                with mission_bridge._private_directory(
+                    self.project, ".ao", "mission"
+                ) as retained:
+                    value = mission_bridge._run(
+                        ["--home", ".ao/mission", "start", self.task_text],
+                        retained,
+                        verified,
+                    )
+            else:
+                value = mission_bridge._run(
+                    ["--home", str(self.project / ".ao/mission"), "start", self.task_text],
+                    self.project,
+                    verified,
+                )
         self.assertEqual(value["mission_id"], "mission-0123456789abcdef")
 
     @unittest.skipIf(os.name == "nt", "descriptor execution is POSIX-specific")
@@ -272,6 +458,73 @@ class MissionBridgeTests(unittest.TestCase):
                 self.assertEqual(error.code, "mission-launch-failed")
             else:
                 self.assertEqual(value["mission_id"], "mission-0123456789abcdef")
+
+    @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
+    def test_darwin_pre_spawn_entry_replacement_never_resumes(self):
+        # MUTATION: pathname-spawning without loaded-vnode proof runs substituted bytes.
+        real_spawn = mission_bridge._darwin_spawn_suspended
+
+        def replace_before_spawn(arguments, project_descriptor, executable):
+            self._replace_verified_copy(executable)
+            return real_spawn(arguments, project_descriptor, executable)
+
+        with mock.patch.object(
+            mission_bridge,
+            "_darwin_spawn_suspended",
+            replace_before_spawn,
+        ):
+            with self.assertRaises(MissionBridgeError) as raised:
+                start_or_resume(self.claim_path, self.task_text)
+        self.assertEqual(raised.exception.code, "mission-launch-failed")
+        self.assertFalse((self.project / ".ao/mission/payload-marker").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
+    def test_darwin_post_spawn_entry_replacement_runs_loaded_verified_vnode(self):
+        # MUTATION: rechecking the pathname instead of the loaded vnode rejects or runs wrong bytes.
+        real_verify = mission_bridge._darwin_verify_suspended
+        swapped = []
+
+        def replace_after_spawn(pid, project_descriptor, executable):
+            if not swapped:
+                self._replace_verified_copy(executable)
+                swapped.append(True)
+            return real_verify(pid, project_descriptor, executable)
+
+        with mock.patch.object(
+            mission_bridge,
+            "_darwin_verify_suspended",
+            replace_after_spawn,
+        ):
+            readback = start_or_resume(self.claim_path, self.task_text)
+        self.assertEqual(readback.mission_id, "mission-0123456789abcdef")
+        self.assertEqual(
+            (self.project / ".ao/mission/payload-marker").read_text(),
+            "benign\n",
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
+    def test_darwin_suspended_child_retains_project_cwd_and_relative_home(self):
+        # MUTATION: pathname cwd/home follows a replacement project root after spawn.
+        real_verify = mission_bridge._darwin_verify_suspended
+        parked = []
+
+        def replace_project_after_spawn(pid, project_descriptor, executable):
+            if not parked:
+                parked.append(self._replace_project_root())
+            return real_verify(pid, project_descriptor, executable)
+
+        with mock.patch.object(
+            mission_bridge,
+            "_darwin_verify_suspended",
+            replace_project_after_spawn,
+        ):
+            readback = start_or_resume(self.claim_path, self.task_text)
+        self.assertEqual(readback.mission_id, "mission-0123456789abcdef")
+        self.assertEqual(list(self.project.iterdir()), [])
+        self.assertEqual(
+            (parked[0] / ".ao/mission/payload-marker").read_text(),
+            "benign\n",
+        )
 
     def test_same_receipt_and_objective_resume_exact_mission(self):
         # MUTATION: always starting creates duplicate Mission records for one task.
@@ -339,7 +592,7 @@ class MissionBridgeTests(unittest.TestCase):
         ):
             with self.subTest(code=code):
                 mode = "escalation" if code.endswith("escalation") else "large"
-                if os.name != "nt":
+                if os.name != "nt" and sys.platform != "darwin":
                     self.executable.write_text(body, encoding="utf-8")
                     self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
                     digest = hashlib.sha256(self.executable.read_bytes()).hexdigest()
@@ -353,7 +606,7 @@ class MissionBridgeTests(unittest.TestCase):
 
     def test_terminates_oversized_output_while_process_is_running(self):
         # MUTATION: checking temporary-file size after exit waits for an abusive child.
-        if os.name != "nt":
+        if os.name != "nt" and sys.platform != "darwin":
             self.executable.write_text(FAKE, encoding="utf-8")
             self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
             value = json.loads(self.lock.read_text(encoding="utf-8"))

@@ -4,10 +4,13 @@ import hmac
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -75,6 +78,10 @@ class _PrivateDirectory:
     project_path: Path
     descriptors: tuple[int, ...] = ()
     handles: tuple[object, ...] = ()
+    borrowed_root: bool = False
+
+    def joinpath(self, *parts: str) -> Path:
+        return self.project_path.joinpath(*parts)
 
     @property
     def directory_descriptor(self) -> int | None:
@@ -112,7 +119,8 @@ class _PrivateDirectory:
                 _validate_private_path(path, self.project_path, directory=True)
 
     def close(self) -> None:
-        for descriptor in reversed(self.descriptors):
+        descriptors = self.descriptors[1:] if self.borrowed_root else self.descriptors
+        for descriptor in reversed(descriptors):
             try:
                 os.close(descriptor)
             except OSError:
@@ -121,7 +129,8 @@ class _PrivateDirectory:
             from internal.windows_identity import _kernel32
 
             library = _kernel32()
-            for handle in reversed(self.handles):
+            handles = self.handles[1:] if self.borrowed_root else self.handles
+            for handle in reversed(handles):
                 library.CloseHandle(handle)
 
     def __enter__(self):
@@ -145,6 +154,86 @@ class _PrivateFile:
 
     def __exit__(self, *_):
         self.close()
+
+
+@dataclass(frozen=True)
+class _DarwinChild:
+    pid: int
+    stdout_descriptor: int
+    stderr_descriptor: int
+
+
+class _DarwinRegionInfo(ctypes.Structure):
+    _fields_ = (
+        ("protection", ctypes.c_uint32),
+        ("max_protection", ctypes.c_uint32),
+        ("inheritance", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("offset", ctypes.c_uint64),
+        ("behavior", ctypes.c_uint32),
+        ("user_wired_count", ctypes.c_uint32),
+        ("user_tag", ctypes.c_uint32),
+        ("pages_resident", ctypes.c_uint32),
+        ("pages_shared_now_private", ctypes.c_uint32),
+        ("pages_swapped_out", ctypes.c_uint32),
+        ("pages_dirtied", ctypes.c_uint32),
+        ("ref_count", ctypes.c_uint32),
+        ("shadow_depth", ctypes.c_uint32),
+        ("share_mode", ctypes.c_uint32),
+        ("private_pages_resident", ctypes.c_uint32),
+        ("shared_pages_resident", ctypes.c_uint32),
+        ("object_id", ctypes.c_uint32),
+        ("depth", ctypes.c_uint32),
+        ("address", ctypes.c_uint64),
+        ("size", ctypes.c_uint64),
+    )
+
+
+class _DarwinVinfoStat(ctypes.Structure):
+    _fields_ = (
+        ("device", ctypes.c_uint32),
+        ("mode", ctypes.c_uint16),
+        ("link_count", ctypes.c_uint16),
+        ("inode", ctypes.c_uint64),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("atime", ctypes.c_int64),
+        ("atime_nsec", ctypes.c_int64),
+        ("mtime", ctypes.c_int64),
+        ("mtime_nsec", ctypes.c_int64),
+        ("ctime", ctypes.c_int64),
+        ("ctime_nsec", ctypes.c_int64),
+        ("birthtime", ctypes.c_int64),
+        ("birthtime_nsec", ctypes.c_int64),
+        ("file_size", ctypes.c_int64),
+        ("blocks", ctypes.c_int64),
+        ("block_size", ctypes.c_int32),
+        ("stat_flags", ctypes.c_uint32),
+        ("generation", ctypes.c_uint32),
+        ("rdev", ctypes.c_uint32),
+        ("spare", ctypes.c_int64 * 2),
+    )
+
+
+class _DarwinVnodeInfo(ctypes.Structure):
+    _fields_ = (
+        ("stat", _DarwinVinfoStat),
+        ("kind", ctypes.c_int32),
+        ("padding", ctypes.c_int32),
+        ("fsid", ctypes.c_int32 * 2),
+    )
+
+
+class _DarwinVnodePath(ctypes.Structure):
+    _fields_ = (("info", _DarwinVnodeInfo), ("path", ctypes.c_char * 1024))
+
+
+class _DarwinRegionPath(ctypes.Structure):
+    _fields_ = (("region", _DarwinRegionInfo), ("vnode", _DarwinVnodePath))
+
+
+class _DarwinVnodePaths(ctypes.Structure):
+    _fields_ = (("current", _DarwinVnodePath), ("root", _DarwinVnodePath))
 
 
 def _digest(value: bytes) -> str:
@@ -205,7 +294,7 @@ def _validate_schema(value: object, schema_path: Path) -> dict:
     return value
 
 
-def _authority(receipt: Path, objective: str) -> tuple[dict, bytes, Path]:
+def _authority(receipt: Path, objective: str) -> tuple[dict, bytes, _PrivateDirectory]:
     if not isinstance(receipt, Path) or not isinstance(objective, str) or not objective:
         raise MissionBridgeError("invalid-request")
     try:
@@ -213,7 +302,7 @@ def _authority(receipt: Path, objective: str) -> tuple[dict, bytes, Path]:
         pool.resume(receipt)
         raw = receipt.read_bytes()
         authority = json.loads(raw)
-        project = Path(authority["project_path"])
+        project = _receipt_project_root(authority)
     except (
         OSError,
         IndexError,
@@ -225,8 +314,68 @@ def _authority(receipt: Path, objective: str) -> tuple[dict, bytes, Path]:
     ) as error:
         raise MissionBridgeError("unauthorized") from error
     if authority.get("task_digest") != _digest(objective.encode("utf-8")):
+        project.close()
         raise MissionBridgeError("task-mismatch")
     return authority, raw, project
+
+
+def _receipt_project_root(authority: dict) -> _PrivateDirectory:
+    project = Path(authority["project_path"])
+    descriptors = []
+    handles = []
+    try:
+        if os.name == "nt":
+            from internal.windows_identity import (
+                _FILE_ID_INFO,
+                _FILE_ID_INFO_CLASS,
+                _kernel32,
+            )
+
+            handle = _open_windows_directory(project)
+            handles.append(handle)
+            identity = _FILE_ID_INFO()
+            library = _kernel32()
+            if not library.GetFileInformationByHandleEx(
+                handle,
+                _FILE_ID_INFO_CLASS,
+                ctypes.byref(identity),
+                ctypes.sizeof(identity),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if (
+                identity.volume_serial_number != authority["project_volume"]
+                or bytes(identity.file_id.identifier).hex()
+                != authority["project_file_id"]
+            ):
+                raise ValueError("project identity mismatch")
+            return _PrivateDirectory(project, project, handles=tuple(handles))
+
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(project, flags)
+        descriptors.append(descriptor)
+        information = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(information.st_mode)
+            or information.st_dev != authority["project_volume"]
+            or str(information.st_ino) != authority["project_file_id"]
+        ):
+            raise ValueError("project identity mismatch")
+        return _PrivateDirectory(project, project, descriptors=tuple(descriptors))
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if handles:
+            from internal.windows_identity import _kernel32
+
+            library = _kernel32()
+            for handle in reversed(handles):
+                library.CloseHandle(handle)
+        raise MissionBridgeError("unauthorized") from error
 
 
 def _project_identity(project: Path):
@@ -311,11 +460,16 @@ def _open_windows_directory(path: Path):
     return handle
 
 
-def _private_directory(project: Path, *parts: str) -> _PrivateDirectory:
+def _private_directory(
+    project: Path | _PrivateDirectory, *parts: str
+) -> _PrivateDirectory:
     descriptors = []
     handles = []
     try:
-        _project_identity(project)
+        retained_root = isinstance(project, _PrivateDirectory)
+        project_path = project.project_path if retained_root else project
+        if not retained_root:
+            _project_identity(project_path)
         for part in parts:
             if (
                 not isinstance(part, str)
@@ -325,9 +479,14 @@ def _private_directory(project: Path, *parts: str) -> _PrivateDirectory:
                 or "\\" in part
             ):
                 raise ValueError("unsafe private segment")
-        current = project
+        current = project_path
         if os.name == "nt":
-            handles.append(_open_windows_directory(current))
+            if retained_root:
+                if not project.handles:
+                    raise ValueError("missing retained project root")
+                handles.append(project.handles[0])
+            else:
+                handles.append(_open_windows_directory(current))
             for part in parts:
                 current = current / part
                 try:
@@ -335,13 +494,24 @@ def _private_directory(project: Path, *parts: str) -> _PrivateDirectory:
                 except FileExistsError:
                     pass
                 handles.append(_open_windows_directory(current))
-            return _PrivateDirectory(current, project, handles=tuple(handles))
+            return _PrivateDirectory(
+                current,
+                project_path,
+                handles=tuple(handles),
+                borrowed_root=retained_root,
+            )
 
         flags = os.O_RDONLY | os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(project, flags)
-        descriptors.append(descriptor)
+        if retained_root:
+            if not project.descriptors:
+                raise ValueError("missing retained project root")
+            descriptor = project.descriptors[0]
+            descriptors.append(descriptor)
+        else:
+            descriptor = os.open(project_path, flags)
+            descriptors.append(descriptor)
         information = os.fstat(descriptor)
         if not stat.S_ISDIR(information.st_mode):
             raise ValueError("unsafe project")
@@ -357,9 +527,15 @@ def _private_directory(project: Path, *parts: str) -> _PrivateDirectory:
                 raise ValueError("unsafe private directory")
             descriptor = child
             current = current / part
-        return _PrivateDirectory(current, project, descriptors=tuple(descriptors))
+        return _PrivateDirectory(
+            current,
+            project_path,
+            descriptors=tuple(descriptors),
+            borrowed_root=retained_root,
+        )
     except (OSError, TypeError, ValueError) as error:
-        for descriptor in reversed(descriptors):
+        owned_descriptors = descriptors[1:] if retained_root else descriptors
+        for descriptor in reversed(owned_descriptors):
             try:
                 os.close(descriptor)
             except OSError:
@@ -368,13 +544,14 @@ def _private_directory(project: Path, *parts: str) -> _PrivateDirectory:
             from internal.windows_identity import _kernel32
 
             library = _kernel32()
-            for handle in reversed(handles):
+            owned_handles = handles[1:] if retained_root else handles
+            for handle in reversed(owned_handles):
                 library.CloseHandle(handle)
         raise MissionBridgeError("mission-storage-unsafe") from error
 
 
 def _private_file(
-    project: Path, directories: tuple[str, ...], name: str
+    project: Path | _PrivateDirectory, directories: tuple[str, ...], name: str
 ) -> _PrivateFile:
     if not isinstance(name, str) or not name or "/" in name or "\\" in name:
         raise MissionBridgeError("mission-storage-unsafe")
@@ -675,6 +852,332 @@ def _open_verified_executable():
             temporary.cleanup()
 
 
+def _darwin_libraries():
+    system = ctypes.CDLL(None, use_errno=True)
+    process = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    system.posix_spawn_file_actions_init.argtypes = (ctypes.POINTER(ctypes.c_void_p),)
+    system.posix_spawn_file_actions_init.restype = ctypes.c_int
+    system.posix_spawn_file_actions_destroy.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    system.posix_spawn_file_actions_destroy.restype = ctypes.c_int
+    system.posix_spawn_file_actions_addopen.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_uint16,
+    )
+    system.posix_spawn_file_actions_addopen.restype = ctypes.c_int
+    system.posix_spawn_file_actions_adddup2.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+        ctypes.c_int,
+    )
+    system.posix_spawn_file_actions_adddup2.restype = ctypes.c_int
+    system.posix_spawn_file_actions_addclose.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+    )
+    system.posix_spawn_file_actions_addclose.restype = ctypes.c_int
+    system.posix_spawn_file_actions_addfchdir_np.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+    )
+    system.posix_spawn_file_actions_addfchdir_np.restype = ctypes.c_int
+    system.posix_spawnattr_init.argtypes = (ctypes.POINTER(ctypes.c_void_p),)
+    system.posix_spawnattr_init.restype = ctypes.c_int
+    system.posix_spawnattr_destroy.argtypes = (ctypes.POINTER(ctypes.c_void_p),)
+    system.posix_spawnattr_destroy.restype = ctypes.c_int
+    system.posix_spawnattr_setflags.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_short,
+    )
+    system.posix_spawnattr_setflags.restype = ctypes.c_int
+    system.posix_spawn.argtypes = (
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_char_p),
+    )
+    system.posix_spawn.restype = ctypes.c_int
+    process.proc_pidpath.argtypes = (
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    process.proc_pidpath.restype = ctypes.c_int
+    process.proc_pidinfo.argtypes = (
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    process.proc_pidinfo.restype = ctypes.c_int
+    return system, process
+
+
+def _darwin_call(function, *arguments) -> None:
+    result = function(*arguments)
+    if result:
+        raise OSError(result, os.strerror(result))
+
+
+def _darwin_spawn_suspended(
+    arguments: list[str], project_descriptor: int, executable: _VerifiedExecutable
+) -> _DarwinChild:
+    system, _ = _darwin_libraries()
+    actions = ctypes.c_void_p()
+    attributes = ctypes.c_void_p()
+    actions_ready = False
+    attributes_ready = False
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    try:
+        _darwin_call(system.posix_spawn_file_actions_init, ctypes.byref(actions))
+        actions_ready = True
+        _darwin_call(
+            system.posix_spawn_file_actions_addfchdir_np,
+            ctypes.byref(actions),
+            project_descriptor,
+        )
+        _darwin_call(
+            system.posix_spawn_file_actions_addopen,
+            ctypes.byref(actions),
+            0,
+            b"/dev/null",
+            os.O_RDONLY,
+            0,
+        )
+        for descriptor in (stdout_read, stderr_read):
+            _darwin_call(
+                system.posix_spawn_file_actions_addclose,
+                ctypes.byref(actions),
+                descriptor,
+            )
+        for source, target in ((stdout_write, 1), (stderr_write, 2)):
+            _darwin_call(
+                system.posix_spawn_file_actions_adddup2,
+                ctypes.byref(actions),
+                source,
+                target,
+            )
+        for descriptor in (stdout_write, stderr_write):
+            _darwin_call(
+                system.posix_spawn_file_actions_addclose,
+                ctypes.byref(actions),
+                descriptor,
+            )
+        _darwin_call(system.posix_spawnattr_init, ctypes.byref(attributes))
+        attributes_ready = True
+        _darwin_call(
+            system.posix_spawnattr_setflags,
+            ctypes.byref(attributes),
+            0x0080,
+        )
+        raw_arguments = [os.fsencode(executable.path), *(os.fsencode(x) for x in arguments)]
+        argv = (ctypes.c_char_p * (len(raw_arguments) + 1))(*raw_arguments, None)
+        raw_environment = [
+            os.fsencode(f"{name}={value}") for name, value in os.environ.items()
+        ]
+        environment = (ctypes.c_char_p * (len(raw_environment) + 1))(
+            *raw_environment, None
+        )
+        pid = ctypes.c_int()
+        _darwin_call(
+            system.posix_spawn,
+            ctypes.byref(pid),
+            os.fsencode(executable.path),
+            ctypes.byref(actions),
+            ctypes.byref(attributes),
+            argv,
+            environment,
+        )
+        os.close(stdout_write)
+        stdout_write = None
+        os.close(stderr_write)
+        stderr_write = None
+        return _DarwinChild(pid.value, stdout_read, stderr_read)
+    except (OSError, TypeError, ValueError) as error:
+        for descriptor in (stdout_read, stdout_write, stderr_read, stderr_write):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        raise MissionBridgeError("mission-launch-failed") from error
+    finally:
+        if attributes_ready:
+            system.posix_spawnattr_destroy(ctypes.byref(attributes))
+        if actions_ready:
+            system.posix_spawn_file_actions_destroy(ctypes.byref(actions))
+
+
+def _darwin_vnode_matches(value: _DarwinVinfoStat, descriptor: int) -> bool:
+    information = os.fstat(descriptor)
+    return value.device == information.st_dev and value.inode == information.st_ino
+
+
+def _darwin_verify_suspended(
+    pid: int, project_descriptor: int, executable: _VerifiedExecutable
+) -> None:
+    _, process = _darwin_libraries()
+    process_path_buffer = ctypes.create_string_buffer(4096)
+    path_size = process.proc_pidpath(pid, process_path_buffer, len(process_path_buffer))
+    if path_size <= 0:
+        raise MissionBridgeError("mission-launch-failed")
+    process_path = process_path_buffer.value
+    matching_regions = []
+    address = 0
+    while True:
+        region = _DarwinRegionPath()
+        size = process.proc_pidinfo(
+            pid,
+            8,
+            address,
+            ctypes.byref(region),
+            ctypes.sizeof(region),
+        )
+        if size <= 0:
+            break
+        if size != ctypes.sizeof(region):
+            raise MissionBridgeError("mission-launch-failed")
+        next_address = region.region.address + region.region.size
+        if next_address <= address:
+            raise MissionBridgeError("mission-launch-failed")
+        address = next_address
+        region_path = bytes(region.vnode.path).split(b"\0", 1)[0]
+        if region.region.protection & 0x4 and region_path == process_path:
+            matching_regions.append(region.vnode.info.stat)
+    if len(matching_regions) != 1 or not _darwin_vnode_matches(
+        matching_regions[0], executable.descriptors[-1]
+    ):
+        raise MissionBridgeError("mission-launch-failed")
+    paths = _DarwinVnodePaths()
+    size = process.proc_pidinfo(
+        pid,
+        9,
+        0,
+        ctypes.byref(paths),
+        ctypes.sizeof(paths),
+    )
+    if size != ctypes.sizeof(paths) or not _darwin_vnode_matches(
+        paths.current.info.stat, project_descriptor
+    ):
+        raise MissionBridgeError("mission-launch-failed")
+
+
+def _darwin_wait_stopped(pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
+        if waited == pid:
+            if os.WIFSTOPPED(status):
+                return
+            raise MissionBridgeError("mission-launch-failed")
+        time.sleep(0.01)
+    raise MissionBridgeError("mission-launch-failed")
+
+
+def _darwin_kill_wait(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _read_bounded_streams(
+    streams: tuple[object, object], kill, wait
+) -> tuple[bytes, bytes]:
+    buffers = [bytearray(), bytearray()]
+    lock = threading.Lock()
+    too_large = threading.Event()
+
+    def drain(index: int, stream) -> None:
+        while True:
+            chunk = getattr(stream, "read1", stream.read)(8192)
+            if not chunk:
+                return
+            with lock:
+                aggregate = len(buffers[0]) + len(buffers[1]) + len(chunk)
+                if len(buffers[index]) + len(chunk) > MAX_OUTPUT or aggregate > MAX_OUTPUT:
+                    too_large.set()
+                    kill()
+                    return
+                buffers[index].extend(chunk)
+
+    readers = [
+        threading.Thread(target=drain, args=(index, stream), daemon=True)
+        for index, stream in enumerate(streams)
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        return_code = wait()
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+        for stream in streams:
+            stream.close()
+    if too_large.is_set():
+        raise MissionBridgeError("mission-output-too-large")
+    if return_code:
+        raise MissionBridgeError("mission-launch-failed")
+    return bytes(buffers[0]), bytes(buffers[1])
+
+
+def _run_darwin(
+    arguments: list[str], project: _PrivateDirectory, executable: _VerifiedExecutable
+) -> bytes:
+    descriptor = project.descriptors[0]
+    child = _darwin_spawn_suspended(arguments, descriptor, executable)
+    streams = (
+        os.fdopen(child.stdout_descriptor, "rb", buffering=0),
+        os.fdopen(child.stderr_descriptor, "rb", buffering=0),
+    )
+    try:
+        _darwin_wait_stopped(child.pid)
+        _darwin_verify_suspended(child.pid, descriptor, executable)
+        os.kill(child.pid, signal.SIGCONT)
+    except (MissionBridgeError, OSError) as error:
+        _darwin_kill_wait(child.pid)
+        for stream in streams:
+            stream.close()
+        if isinstance(error, MissionBridgeError):
+            raise
+        raise MissionBridgeError("mission-launch-failed") from error
+
+    deadline = time.monotonic() + 30
+
+    def kill() -> None:
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def wait() -> int:
+        while True:
+            waited, status = os.waitpid(child.pid, os.WNOHANG)
+            if waited == child.pid:
+                if os.WIFEXITED(status):
+                    return os.WEXITSTATUS(status)
+                return 128 + os.WTERMSIG(status) if os.WIFSIGNALED(status) else 1
+            if time.monotonic() >= deadline:
+                kill()
+                os.waitpid(child.pid, 0)
+                raise MissionBridgeError("mission-launch-failed")
+            time.sleep(0.01)
+
+    return _read_bounded_streams(streams, kill, wait)[0]
+
+
 def _run(
     arguments: list[str],
     project: Path | _PrivateDirectory,
@@ -688,6 +1191,11 @@ def _run(
     else:
         cwd = project
         private_descriptors = ()
+    if sys.platform == "darwin":
+        if not isinstance(project, _PrivateDirectory) or not project.descriptors:
+            raise MissionBridgeError("mission-launch-failed")
+        raw_output = _run_darwin(arguments, project, executable)
+        return _validated_readback(raw_output)
     options = {}
     if os.name != "nt":
         if not launch_path.startswith("/proc/self/fd/"):
@@ -709,46 +1217,26 @@ def _run(
         )
     except OSError as error:
         raise MissionBridgeError("mission-launch-failed") from error
-    buffers = [bytearray(), bytearray()]
-    lock = threading.Lock()
-    too_large = threading.Event()
+    deadline = time.monotonic() + 30
 
-    def drain(index: int, stream) -> None:
-        while True:
-            chunk = stream.read1(8192)
-            if not chunk:
-                return
-            with lock:
-                aggregate = len(buffers[0]) + len(buffers[1]) + len(chunk)
-                if len(buffers[index]) + len(chunk) > MAX_OUTPUT or aggregate > MAX_OUTPUT:
-                    too_large.set()
-                    process.kill()
-                    return
-                buffers[index].extend(chunk)
+    def wait() -> int:
+        remaining = deadline - time.monotonic()
+        try:
+            return process.wait(timeout=max(remaining, 0))
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait()
+            raise MissionBridgeError("mission-launch-failed") from error
 
-    readers = [
-        threading.Thread(target=drain, args=(0, process.stdout), daemon=True),
-        threading.Thread(target=drain, args=(1, process.stderr), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
+    raw_output, _ = _read_bounded_streams(
+        (process.stdout, process.stderr), process.kill, wait
+    )
+    return _validated_readback(raw_output)
+
+
+def _validated_readback(raw_output: bytes) -> dict:
     try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired as error:
-        process.kill()
-        process.wait()
-        raise MissionBridgeError("mission-launch-failed") from error
-    finally:
-        for reader in readers:
-            reader.join(timeout=5)
-        process.stdout.close()
-        process.stderr.close()
-    if too_large.is_set():
-        raise MissionBridgeError("mission-output-too-large")
-    if process.returncode:
-        raise MissionBridgeError("mission-launch-failed")
-    try:
-        value = json.loads(bytes(buffers[0]))
+        value = json.loads(raw_output)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise MissionBridgeError("invalid-mission-readback") from error
     if not isinstance(value, dict):
@@ -773,7 +1261,10 @@ def _run(
 
 
 def _record_paths(
-    authority: dict, authority_raw: bytes, project: Path, objective: str
+    authority: dict,
+    authority_raw: bytes,
+    project: Path | _PrivateDirectory,
+    objective: str,
 ) -> tuple[_PrivateFile, _PrivateFile]:
     identity = _canonical_bytes(
         {
@@ -808,7 +1299,7 @@ def _expected_record(authority: dict, authority_raw: bytes, readback: dict) -> d
 def _load_record(
     authority: dict,
     authority_raw: bytes,
-    project: Path,
+    project: Path | _PrivateDirectory,
     objective: str,
     record: _PrivateFile | None = None,
 ) -> tuple[dict, _PrivateFile]:
@@ -838,19 +1329,27 @@ def _load_record(
             record.close()
 
 
-def _load_authenticated_record(receipt: Path, objective: str) -> tuple[dict, dict, bytes, Path]:
+def _load_authenticated_record(
+    receipt: Path, objective: str
+) -> tuple[dict, dict, bytes, Path]:
     authority, authority_raw, project = _authority(receipt, objective)
-    wrapper, _ = _load_record(authority, authority_raw, project, objective)
-    return wrapper, authority, authority_raw, project
+    try:
+        wrapper, _ = _load_record(authority, authority_raw, project, objective)
+        return wrapper, authority, authority_raw, project.project_path
+    finally:
+        project.close()
 
 
 def start_or_resume(receipt: Path, objective: str) -> MissionReadback:
     authority, authority_raw, project = _authority(receipt, objective)
-    with _open_verified_executable() as executable, _private_directory(
+    with project, _open_verified_executable() as executable, _private_directory(
         project, ".ao", "mission"
-    ) as mission_home, _record_paths(
-        authority, authority_raw, project, objective
-    )[0] as record:
+    ) as mission_home, _record_paths(authority, authority_raw, project, objective)[
+        0
+    ] as record:
+        mission_home_argument = (
+            ".ao/mission" if sys.platform == "darwin" else mission_home.launch_path
+        )
         seal = _private_sibling(record, ".hmac")
         record_exists = _private_exists(record)
         seal_exists = _private_exists(seal)
@@ -864,7 +1363,7 @@ def start_or_resume(receipt: Path, objective: str) -> MissionReadback:
             readback = _run(
                 [
                     "--home",
-                    mission_home.launch_path,
+                    mission_home_argument,
                     "mission",
                     "inspect",
                     "--mission",
@@ -878,7 +1377,7 @@ def start_or_resume(receipt: Path, objective: str) -> MissionReadback:
                 raise MissionBridgeError("mission-record-mismatch")
         else:
             readback = _run(
-                ["--home", mission_home.launch_path, "start", objective],
+                ["--home", mission_home_argument, "start", objective],
                 mission_home,
                 executable,
             )
