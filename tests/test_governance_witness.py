@@ -6,6 +6,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +22,7 @@ from internal.governance_witness import (
     issue_witness,
     revoke_witness,
 )
-from internal.pool import Pool
+from internal.pool import AuthorityLease, Pool
 
 
 FAKE_PRODUCER = r'''
@@ -41,7 +43,19 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) fprintf(log, "|%s", argv[i]);
   fputc('\n', log);
   fclose(log);
-  const char *mode = getenv("AO_TEST_PRODUCER_MODE");
+  char mode_buffer[64] = {0};
+  FILE *mode_file = fopen("producer-mode", "rb");
+  if (mode_file) { fscanf(mode_file, "%63s", mode_buffer); fclose(mode_file); }
+  const char *mode = mode_buffer[0] ? mode_buffer : NULL;
+  FILE *environment = fopen("producer-environment", "ab");
+  if (environment) {
+    fprintf(environment, "DYLD=%s LD=%s PYTHON=%s TEST=%s\n",
+      getenv("DYLD_INSERT_LIBRARIES") ? "set" : "unset",
+      getenv("LD_PRELOAD") ? "set" : "unset",
+      getenv("PYTHONPATH") ? "set" : "unset",
+      getenv("AO_TEST_PRODUCER_MODE") ? "set" : "unset");
+    fclose(environment);
+  }
   if (mode && strcmp(mode, "non-object") == 0) {
     puts("[]");
     return 0;
@@ -58,7 +72,7 @@ int main(int argc, char **argv) {
     usleep(50000);
     return 9;
   }
-  if (mode && strcmp(mode, "descendant") == 0) {
+  if (mode && (strcmp(mode, "descendant") == 0 || strcmp(mode, "success-descendant") == 0)) {
     pid_t child = fork();
     if (child < 0) return 71;
     if (child == 0) {
@@ -67,18 +81,29 @@ int main(int argc, char **argv) {
       close(1); close(2); sleep(30); return 0;
     }
     usleep(50000);
+    if (strcmp(mode, "success-descendant") == 0) mode = NULL;
+    else {
     char output[70000]; memset(output, 'x', sizeof(output));
     fwrite(output, 1, sizeof(output), stdout); fflush(stdout); sleep(30);
     return 0;
+    }
   }
-  if (argc > 2 && strcmp(argv[1], "pack") == 0) {
-    puts("{\"schema\":\"ao.blueprint.pack-inspection.v0.1\",\"status\":\"ready\",\"project_id\":\"project\",\"artifact_count\":1,\"artifacts\":[\"build-authorization.json\"]}");
+  if (argc > 2 && strcmp(argv[1], "authorize") == 0) {
+    const char *out = NULL;
+    for (int i = 2; i + 1 < argc; i++) if (strcmp(argv[i], "--out") == 0) out = argv[i + 1];
+    if (!out) return 64;
+    FILE *authorization = fopen(out, "wb");
+    if (!authorization) return 65;
+    if (mode && strcmp(mode, "large-authorization") == 0) {
+      for (int i = 0; i < 70000; i++) fputc('x', authorization);
+    } else {
+      fputs("{\"schema\":\"ao.blueprint.build-authorization.v0.1\",\"project_id\":\"project\",\"status\":\"ready\",\"score\":100,\"approved_by_user\":true,\"blocking_assumptions\":[],\"production_readiness_exit_condition\":\"bounded\",\"next_allowed_action\":\"ao-forge\"}\n", authorization);
+    }
+    fclose(authorization);
     return 0;
   }
   if (argc > 2 && strcmp(argv[1], "workgraph") == 0) {
-    puts("ready=1");
-    puts("blocked=0");
-    puts("completed=0");
+    puts("status=valid");
     return 0;
   }
   if (argc > 2 && strcmp(argv[1], "goal") == 0) {
@@ -86,6 +111,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc > 1 && strcmp(argv[1], "verify") == 0) {
+    int ledger = 0, evidence = 0;
+    for (int i = 2; i < argc; i++) {
+      if (strcmp(argv[i], "--ledger") == 0 && i + 1 < argc) ledger = 1;
+      if (strcmp(argv[i], "--evidence") == 0 && i + 1 < argc) evidence = 1;
+    }
+    if (!ledger || !evidence) return 64;
     puts("{\"schema_version\":\"covenant.verify-result.v1\",\"verified\":true,\"run_id\":\"run-0123456789abcdef\",\"event_count\":1,\"artifact_count\":0,\"input_snapshot_count\":0,\"failure_count\":0,\"failures\":[],\"policy_explanations\":[],\"ledger_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"last_event_hash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}");
     return 0;
   }
@@ -157,7 +188,8 @@ class GovernanceWitnessTests(unittest.TestCase):
         self._write_artifacts()
 
     def tearDown(self):
-        os.environ.pop("AO_TEST_PRODUCER_MODE", None)
+        for name in ("AO_TEST_PRODUCER_MODE", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "PYTHONPATH"):
+            os.environ.pop(name, None)
         self.configuration.stop()
         self.temporary_directory.cleanup()
 
@@ -208,21 +240,7 @@ class GovernanceWitnessTests(unittest.TestCase):
     def _write_artifacts(self):
         self.blueprint = self._root("ao-blueprint") / "pack"
         self.blueprint.mkdir()
-        self.blueprint.joinpath("build-authorization.json").write_text(
-            json.dumps(
-                {
-                    "schema": "ao.blueprint.build-authorization.v0.1",
-                    "project_id": "project",
-                    "status": "ready",
-                    "score": 100,
-                    "approved_by_user": True,
-                    "blocking_assumptions": [],
-                    "production_readiness_exit_condition": "bounded",
-                    "next_allowed_action": "ao-forge",
-                }
-            ),
-            encoding="utf-8",
-        )
+        self.blueprint.joinpath("project-brief.md").write_text("# project\n")
         self.atlas = self._root("ao-atlas") / "workgraph.json"
         self.atlas.write_text(
             json.dumps(
@@ -269,6 +287,8 @@ class GovernanceWitnessTests(unittest.TestCase):
         )
         workflow_digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()
         self.covenant = self._root("ao-covenant") / "evidence.json"
+        self.covenant_ledger = self._root("ao-covenant") / "ledger.jsonl"
+        self.covenant_ledger.write_text('{"event":"authorized"}\n', encoding="utf-8")
         self.covenant.write_text(
             json.dumps(
                 {
@@ -287,12 +307,21 @@ class GovernanceWitnessTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        requirements_raw = governance.REQUIREMENTS_MANIFEST.read_bytes()
+        requirements_value = json.loads(requirements_raw)
+        bindings = {
+            row["id"]: row["test_id"]
+            for row in requirements_value["requirements"]
+            if row["id"].startswith("B")
+        }
         self.evidence_set = self._root("requirements") / "B01-B19.json"
         self.evidence_set.write_text(
             json.dumps(
                 {
-                    "requirements_sha256": "1" * 64,
-                    "test_bindings_sha256": "2" * 64,
+                    "requirements_sha256": hashlib.sha256(requirements_raw).hexdigest(),
+                    "test_bindings_sha256": hashlib.sha256(
+                        json.dumps(bindings, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
                     "requirement_ids": [f"B{number:02d}" for number in range(1, 20)],
                 }
             ),
@@ -304,6 +333,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.blueprint,
             self.atlas if atlas else None,
             self.forge,
+            self.covenant_ledger,
             self.covenant,
             self.workflow,
             self.project,
@@ -320,6 +350,9 @@ class GovernanceWitnessTests(unittest.TestCase):
             operation()
         self.assertEqual(raised.exception.code, code)
 
+    def _mode(self, value):
+        (self.project / "producer-mode").write_text(value, encoding="utf-8")
+
     def test_issues_closed_detached_authenticated_envelope_from_native_producers(self):
         envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
         value = json.loads(envelope.read_text(encoding="utf-8"))
@@ -334,11 +367,32 @@ class GovernanceWitnessTests(unittest.TestCase):
         )
         commands = (self.project / "producer-commands").read_text().splitlines()
         self.assertEqual(len(commands), 3)
-        self.assertIn("|pack|inspect|--pack|", commands[0])
-        self.assertTrue(commands[0].endswith("|--json"))
+        self.assertIn("|authorize|--pack|", commands[0])
+        self.assertIn("|--out|", commands[0])
         self.assertIn("|goal|validate|--goal-run|", commands[1])
-        self.assertIn("|verify|--evidence|", commands[2])
+        self.assertIn("|verify|--ledger|", commands[2])
+        self.assertIn("|--evidence|", commands[2])
         self.assertTrue(commands[2].endswith("|--json"))
+
+    def test_arbitrary_envelope_sealer_and_forged_lease_are_rejected(self):
+        self.assertFalse(hasattr(governance, "_seal"))
+        envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        with self.pool.authority_lease(self.claim_path) as real:
+            forged = AuthorityLease(real.authority_path, real.authority_bytes, real.authority)
+            self._assert_code(
+                "governance-unauthorized", lambda: _consume_witness(forged, envelope)
+            )
+
+    def test_blueprint_authorization_is_created_by_the_pinned_producer(self):
+        forged = self.blueprint / "build-authorization.json"
+        forged.write_text('{"next_allowed_action":"blocked"}', encoding="utf-8")
+        envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        value = json.loads(envelope.read_text())
+        self.assertEqual(value["route"]["route"], "ao-forge")
+        self.assertNotEqual(
+            value["producer_artifacts"]["ao-blueprint"]["artifact_sha256"],
+            hashlib.sha256(forged.read_bytes()).hexdigest(),
+        )
 
     def test_issue_witness_accepts_the_specified_objective_keyword(self):
         arguments = dict(
@@ -433,27 +487,21 @@ class GovernanceWitnessTests(unittest.TestCase):
             "governance-envelope-revoked", lambda: self._consume(envelope)
         )
 
-    def test_fixed_route_requires_or_rejects_atlas_exactly(self):
+    def test_non_executable_atlas_route_cannot_mint_authority(self):
         self._write_mission("ao-atlas")
-        authorization = self.blueprint / "build-authorization.json"
-        value = json.loads(authorization.read_text())
-        value["next_allowed_action"] = "ao-atlas"
-        authorization.write_text(json.dumps(value), encoding="utf-8")
         self._assert_code(
-            "governance-atlas-required",
+            "governance-route-not-executable",
             lambda: issue_witness(
                 self.claim_path, self.task_text, self.valid_artifacts(atlas=False)
             ),
         )
-        envelope = issue_witness(
-            self.claim_path, self.task_text, self.valid_artifacts(atlas=True)
-        )
-        self.assertIsNotNone(
-            json.loads(envelope.read_text())["producer_artifacts"]["ao-atlas"]
+        self._assert_code(
+            "governance-route-not-executable",
+            lambda: issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts(atlas=True)
+            ),
         )
         self._write_mission("ao-forge")
-        value["next_allowed_action"] = "ao-forge"
-        authorization.write_text(json.dumps(value), encoding="utf-8")
         self._assert_code(
             "governance-atlas-unexpected",
             lambda: issue_witness(
@@ -461,28 +509,14 @@ class GovernanceWitnessTests(unittest.TestCase):
             ),
         )
 
-    def test_present_atlas_cross_references_must_match_exactly(self):
-        self._write_mission("ao-atlas")
-        authorization = self.blueprint / "build-authorization.json"
-        authorization_value = json.loads(authorization.read_text())
-        authorization_value["next_allowed_action"] = "ao-atlas"
-        authorization.write_text(json.dumps(authorization_value), encoding="utf-8")
-        original = self.atlas.read_bytes()
-        for field in ("mission_id", "objective_digest"):
-            for replacement in (None, ""):
-                value = json.loads(original)
-                value[field] = replacement
-                self.atlas.write_text(json.dumps(value), encoding="utf-8")
-                with self.subTest(field=field, replacement=replacement):
-                    self._assert_code(
-                        "governance-relationship-mismatch",
-                        lambda: issue_witness(
-                            self.claim_path,
-                            self.task_text,
-                            self.valid_artifacts(atlas=True),
-                        ),
-                    )
-        self.atlas.write_bytes(original)
+    def test_atlas_native_readback_is_exact_status_valid(self):
+        self.assertEqual(
+            governance._readback("ao-atlas", b"status=valid\n"),
+            {"status": "valid"},
+        )
+        for raw in (b"ready=1\nblocked=0\ncompleted=0\n", b"status=invalid\n"):
+            with self.assertRaises(GovernanceError):
+                governance._readback("ao-atlas", raw)
 
     def test_component_name_commit_version_asset_and_digest_are_enforced(self):
         mutations = (
@@ -519,7 +553,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             ("failure", "governance-producer-failed"),
             ("non-object", "governance-producer-readback"),
         ):
-            os.environ["AO_TEST_PRODUCER_MODE"] = mode
+            self._mode(mode)
             with self.subTest(mode=mode):
                 self._assert_code(
                     code,
@@ -530,7 +564,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_producer_failure_kills_descendant_process_tree(self):
-        os.environ["AO_TEST_PRODUCER_MODE"] = "descendant"
+        self._mode("descendant")
         child = None
         try:
             self._assert_code(
@@ -551,7 +585,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_nonzero_producer_exit_kills_descendant_process_tree(self):
-        os.environ["AO_TEST_PRODUCER_MODE"] = "error-descendant"
+        self._mode("error-descendant")
         child = None
         try:
             self._assert_code(
@@ -577,6 +611,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.blueprint,
             None,
             outside,
+            self.covenant_ledger,
             self.covenant,
             self.workflow,
             self.project,
@@ -641,8 +676,10 @@ class GovernanceWitnessTests(unittest.TestCase):
         mutations = (
             lambda value: value["requirement_ids"].pop(),
             lambda value: value["requirement_ids"].append("B20"),
+            lambda value: value["requirement_ids"].append("B19"),
             lambda value: value.update(extra=True),
-            lambda value: value.update(requirements_sha256="bad"),
+            lambda value: value.update(requirements_sha256="0" * 64),
+            lambda value: value.update(test_bindings_sha256="0" * 64),
         )
         for mutate in mutations:
             value = json.loads(json.dumps(original))
@@ -656,18 +693,24 @@ class GovernanceWitnessTests(unittest.TestCase):
                     ),
                 )
         self.evidence_set.write_text(json.dumps(original), encoding="utf-8")
+        reordered = json.loads(json.dumps(original))
+        reordered["requirement_ids"].reverse()
+        self.evidence_set.write_text(json.dumps(reordered), encoding="utf-8")
+        self.assertTrue(
+            issue_witness(self.claim_path, self.task_text, self.valid_artifacts()).is_file()
+        )
+        self.evidence_set.write_text(json.dumps(original), encoding="utf-8")
 
     def test_all_producer_artifacts_are_rechecked_after_validation(self):
-        authorization = self.blueprint / "build-authorization.json"
-        original = authorization.read_bytes()
+        original = self.forge.read_bytes()
         run_producer = governance._run_producer
 
         def mutate_after_last_producer(name, *arguments):
             result = run_producer(name, *arguments)
             if name == "ao-covenant":
                 value = json.loads(original)
-                value["production_readiness_exit_condition"] = "changed"
-                authorization.write_text(json.dumps(value), encoding="utf-8")
+                value["next_task"] = "changed"
+                self.forge.write_text(json.dumps(value), encoding="utf-8")
             return result
 
         try:
@@ -681,7 +724,7 @@ class GovernanceWitnessTests(unittest.TestCase):
                     ),
                 )
         finally:
-            authorization.write_bytes(original)
+            self.forge.write_bytes(original)
 
     def test_failed_create_only_write_removes_partial_new_file(self):
         project = mission_bridge._receipt_project_root(self.authority)
@@ -708,6 +751,89 @@ class GovernanceWitnessTests(unittest.TestCase):
         finally:
             candidate.close()
             project.close()
+
+    def test_producer_uses_retained_staged_bytes_across_a_b_a_swap(self):
+        original = self.forge.read_bytes()
+        replacement = json.dumps({"schema_version": "ao.forge.goal-run.v0.1"}).encode()
+        run_output = mission_bridge._run_output
+
+        def swap_during_launch(*arguments, **keywords):
+            self.forge.write_bytes(replacement)
+            self.forge.write_bytes(original)
+            return run_output(*arguments, **keywords)
+
+        with mock.patch.object(mission_bridge, "_run_output", side_effect=swap_during_launch):
+            envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        self.assertNotIn(str(self.forge), (self.project / "producer-commands").read_text())
+        self.assertTrue(envelope.is_file())
+
+    def test_project_marker_deletion_does_not_restore_authority(self):
+        consumed = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        governed = self._consume(consumed)
+        governed.target.close()
+        consumed.with_suffix(".consumed").unlink()
+        self._assert_code("governance-envelope-consumed", lambda: self._consume(consumed))
+
+        revoked = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        revoke_witness(self.claim_path, revoked)
+        revoked.with_suffix(".revoked").unlink()
+        self._assert_code("governance-envelope-revoked", lambda: self._consume(revoked))
+
+    def test_producer_environment_strips_injection_variables(self):
+        os.environ.update(
+            DYLD_INSERT_LIBRARIES="malicious",
+            LD_PRELOAD="malicious",
+            PYTHONPATH="malicious",
+            AO_TEST_PRODUCER_MODE="failure",
+        )
+        issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        lines = (self.project / "producer-environment").read_text().splitlines()
+        self.assertEqual(set(lines), {"DYLD=unset LD=unset PYTHON=unset TEST=unset"})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
+    def test_successful_producer_kills_descendant_process_tree(self):
+        self._mode("success-descendant")
+        child = None
+        try:
+            issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+            child = int((self.project / "producer-child-pid").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+        finally:
+            if child is not None:
+                try:
+                    os.kill(child, 9)
+                except ProcessLookupError:
+                    pass
+
+    def test_oversized_inputs_and_producer_output_fail_bounded(self):
+        oversized = self._root("ao-forge") / "oversized.json"
+        with oversized.open("wb") as stream:
+            stream.truncate(governance._MAX_ARTIFACT + 1)
+        self._assert_code(
+            "governance-artifact-unsafe",
+            lambda: issue_witness(
+                self.claim_path,
+                self.task_text,
+                dataclasses.replace(self.valid_artifacts(), forge_goal_run=oversized),
+            ),
+        )
+        self._mode("large-authorization")
+        self._assert_code(
+            "governance-producer-readback",
+            lambda: issue_witness(self.claim_path, self.task_text, self.valid_artifacts()),
+        )
+
+    def test_governed_execution_authenticated_mappings_are_immutable(self):
+        envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        governed = self._consume(envelope)
+        try:
+            with self.assertRaises(TypeError):
+                governed.ao2["sha256"] = "0" * 64
+            with self.assertRaises(TypeError):
+                governed.producer_artifacts["ao-forge"]["asset"] = "forged"
+        finally:
+            governed.target.close()
 
     def test_workflow_copy_is_exact_digest_named_and_create_only(self):
         digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()

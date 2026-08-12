@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -45,11 +46,35 @@ class InjectedCrash(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class AuthorityLease:
     authority_path: Path
     authority_bytes: bytes
     authority: dict
+
+
+def _lease_registry():
+    active = {}
+
+    def activate(root: Path, path: Path, raw: bytes, authority: dict):
+        lease = AuthorityLease(path, raw, authority)
+        active[id(lease)] = (lease, root)
+        return lease
+
+    def require(root: Path, lease: AuthorityLease) -> None:
+        entry = active.get(id(lease))
+        if entry is None or entry[0] is not lease or entry[1] != root:
+            raise PoolError("unauthorized")
+
+    def retire(lease: AuthorityLease) -> None:
+        entry = active.get(id(lease))
+        if entry is not None and entry[0] is lease:
+            del active[id(lease)]
+
+    return activate, require, retire
+
+
+_activate_lease, _require_lease, _retire_lease = _lease_registry()
 
 
 def _digest(value: str) -> str:
@@ -116,10 +141,89 @@ class Pool:
     def _witness_key_path(self) -> Path:
         return self.root / "operator-secrets" / "governance-witness.key"
 
-    def _read_witness_key(self) -> bytes:
+    @property
+    def _governance_state(self) -> Path:
+        return self._runtime / "governance"
+
+    def _require_authority_lease(self, lease: AuthorityLease) -> None:
+        _require_lease(self.root, lease)
+
+    def _governance_marker_path(
+        self, lease: AuthorityLease, kind: str, witness_id: str, authority_digest: str
+    ) -> Path:
+        self._require_authority_lease(lease)
+        if kind not in {"consumed", "revoked"}:
+            raise PoolError("unauthorized")
+        if (
+            len(authority_digest) != 64
+            or any(character not in "0123456789abcdef" for character in authority_digest)
+            or not witness_id.startswith("witness-")
+            or len(witness_id) != 40
+            or any(character not in "0123456789abcdef" for character in witness_id[8:])
+        ):
+            raise PoolError("unauthorized")
+        return self._governance_state / kind / f"{authority_digest}-{witness_id}"
+
+    def _governance_marker_exists(
+        self, lease: AuthorityLease, kind: str, witness_id: str, authority_digest: str
+    ) -> bool:
+        path = self._governance_marker_path(
+            lease, kind, witness_id, authority_digest
+        )
         try:
-            value = self._witness_key_path.read_bytes()
+            information = path.stat(follow_symlinks=False)
+            return stat.S_ISREG(information.st_mode) and information.st_nlink == 1
+        except FileNotFoundError:
+            return False
         except OSError as error:
+            raise PoolError("recovery-required") from error
+
+    def _create_governance_marker(
+        self, lease: AuthorityLease, kind: str, witness_id: str, authority_digest: str
+    ) -> bool:
+        path = self._governance_marker_path(
+            lease, kind, witness_id, authority_digest
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            return False
+        except OSError as error:
+            raise PoolError("recovery-required") from error
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, b"1\n")
+            os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            path.unlink(missing_ok=True)
+            raise
+        os.close(descriptor)
+        return True
+
+    def _read_witness_key(self, lease: AuthorityLease | None = None) -> bytes:
+        if lease is not None:
+            self._require_authority_lease(lease)
+        try:
+            information = self._witness_key_path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_nlink != 1
+                or (os.name != "nt" and stat.S_IMODE(information.st_mode) != 0o600)
+            ):
+                raise ValueError("unsafe witness key")
+            self._witness_key_path.resolve(strict=True).relative_to(
+                self.root.resolve(strict=True)
+            )
+            if os.name == "nt":
+                require_within(
+                    open_identity(self._witness_key_path), open_identity(self.root)
+                )
+            value = self._witness_key_path.read_bytes()
+        except (OSError, ValueError) as error:
             raise PoolError("recovery-required") from error
         if len(value) != 32:
             raise PoolError("recovery-required")
@@ -177,10 +281,22 @@ class Pool:
             self._pointers.mkdir(exist_ok=True)
             self._journals.mkdir(exist_ok=True)
             (self._runtime / "recovery").mkdir(exist_ok=True)
+            self._governance_state.mkdir(exist_ok=True)
+            (self._governance_state / "consumed").mkdir(exist_ok=True)
+            (self._governance_state / "revoked").mkdir(exist_ok=True)
             operator = self.root / "operator-secrets"
             operator.mkdir(exist_ok=True)
             if not self._witness_key_path.exists():
-                atomic_write_bytes(self._witness_key_path, secrets.token_bytes(32))
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(self._witness_key_path, flags, 0o600)
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    os.write(descriptor, secrets.token_bytes(32))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
             self._read_witness_key()
             authority_digests = {}
             generations = {office_id: 0 for office_id in OFFICE_IDS}
@@ -334,6 +450,7 @@ class Pool:
             "pointers",
             "transactions",
             "recovery",
+            "governance",
             "generations.json",
             "recovery-authority.json",
         }
@@ -346,12 +463,32 @@ class Pool:
             self._runtime / "recovery": lambda name: name in {
                 f"{office_id}.json" for office_id in OFFICE_IDS
             },
+            self._governance_state / "consumed": self._valid_governance_marker,
+            self._governance_state / "revoked": self._valid_governance_marker,
         }
+        if (
+            not self._governance_state.is_dir()
+            or {path.name for path in self._governance_state.iterdir()}
+            != {"consumed", "revoked"}
+        ):
+            raise PoolError("recovery-required")
         for directory, accepted in rules.items():
             if not directory.is_dir() or any(
                 not path.is_file() or not accepted(path.name) for path in directory.iterdir()
             ):
                 raise PoolError("recovery-required")
+
+    @staticmethod
+    def _valid_governance_marker(name: str) -> bool:
+        authority, separator, witness = name.partition("-")
+        return (
+            bool(separator)
+            and len(authority) == 64
+            and all(character in "0123456789abcdef" for character in authority)
+            and witness.startswith("witness-")
+            and len(witness) == 40
+            and all(character in "0123456789abcdef" for character in witness[8:])
+        )
 
     def _generation_registry(self) -> dict:
         try:
@@ -713,7 +850,11 @@ class Pool:
             if self._unknown_paths(authority["office_id"]):
                 self._mark_recovery(authority["office_id"], state, "unknown-residue")
                 raise PoolError("recovery-required")
-            yield AuthorityLease(path, raw, authority)
+            lease = _activate_lease(self.root, path, raw, authority)
+            try:
+                yield lease
+            finally:
+                _retire_lease(lease)
 
     def release(self, receipt_path) -> None:
         with self._locked():

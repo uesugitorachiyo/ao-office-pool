@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 from internal.mission_bridge import (
     MissionBridgeError,
@@ -33,12 +34,13 @@ from internal.pool import AuthorityLease, Pool, PoolError
 COMPONENT_LOCK = Path(__file__).parents[1] / "manifests/components.lock.json"
 BIN_DIR = Path(__file__).parents[1] / ".local/bin"
 ENVELOPE_SCHEMA = Path(__file__).parents[1] / "schemas/governance-envelope.schema.json"
+REQUIREMENTS_MANIFEST = Path(__file__).parents[1] / "manifests/requirements.json"
 _PRIVATE_PARTS = (".ao", "governance", "office-pool")
 _PRODUCERS = {
-    "ao-blueprint": ("pack", "inspect", "--pack", "{artifact}", "--json"),
+    "ao-blueprint": ("authorize", "--pack", "{artifact}", "--out", "{output}"),
     "ao-atlas": ("workgraph", "validate", "--workgraph", "{artifact}"),
     "ao-forge": ("goal", "validate", "--goal-run", "{artifact}", "--json"),
-    "ao-covenant": ("verify", "--evidence", "{artifact}", "--json"),
+    "ao-covenant": ("verify", "--ledger", "{ledger}", "--evidence", "{artifact}", "--json"),
 }
 _PINNED = {
     "ao-blueprint": ("a581a22af7d06483287a1b7590709e4c4d3739b8", "ao-blueprint"),
@@ -72,6 +74,7 @@ class GovernanceArtifacts:
     blueprint_pack: Path
     atlas_workgraph: Path | None
     forge_goal_run: Path
+    covenant_ledger: Path
     covenant_evidence: Path
     workflow: Path
     target: Path
@@ -86,9 +89,9 @@ class GovernedExecution:
     target: _PrivateDirectory
     workflow_digest: str
     run_id: str
-    producer_artifacts: dict
+    producer_artifacts: MappingProxyType
     requirements_evidence_digest: str
-    ao2: dict
+    ao2: MappingProxyType
     request_digest: str
 
 
@@ -119,6 +122,14 @@ def _digest_value(value: object) -> str:
     return _digest_bytes(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     )
+
+
+def _freeze(value):
+    if isinstance(value, dict):
+        return MappingProxyType({name: _freeze(member) for name, member in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(member) for member in value)
+    return value
 
 
 def _pool(receipt: Path) -> Pool:
@@ -187,10 +198,7 @@ def _read_file(
         candidate = _private_file(project, tuple(parts[:-1]), parts[-1])
         if not _private_exists(candidate):
             raise ValueError("missing artifact")
-        value = _read_private_bytes(candidate)
-        if len(value) > _MAX_ARTIFACT:
-            raise ValueError("artifact too large")
-        return value
+        return _read_private_bytes(candidate, _MAX_ARTIFACT)
     except (OSError, TypeError, ValueError, MissionBridgeError) as error:
         raise GovernanceError(code) from error
     finally:
@@ -250,24 +258,19 @@ def _json_artifact(
 def _readback(name: str, raw: bytes) -> dict:
     try:
         if name == "ao-atlas":
-            value = {}
-            for line in raw.decode("utf-8").splitlines():
-                key, separator, member = line.partition("=")
-                if not separator or key not in {"ready", "blocked", "completed"}:
-                    raise ValueError("invalid Atlas readback")
-                value[key] = int(member)
-            if set(value) != {"ready", "blocked", "completed"}:
-                raise ValueError("incomplete Atlas readback")
-            return value
+            if raw != b"status=valid\n":
+                raise ValueError("invalid Atlas readback")
+            return {"status": "valid"}
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise ValueError("object required")
         if name == "ao-blueprint" and (
-            value.get("schema") != "ao.blueprint.pack-inspection.v0.1"
+            value.get("schema") != "ao.blueprint.build-authorization.v0.1"
             or value.get("status") != "ready"
-            or type(value.get("artifact_count")) is not int
-            or not isinstance(value.get("artifacts"), list)
+            or value.get("approved_by_user") is not True
+            or value.get("blocking_assumptions") not in (None, [])
             or not isinstance(value.get("project_id"), str)
+            or not isinstance(value.get("next_allowed_action"), str)
         ):
             raise ValueError("invalid Blueprint readback")
         if name == "ao-forge" and (
@@ -294,17 +297,32 @@ def _run_producer(
     component: dict,
     artifact: Path,
     project: _PrivateDirectory,
+    ledger: Path | None = None,
+    output = None,
 ) -> dict:
     arguments = [
-        str(artifact) if member == "{artifact}" else member
+        str(artifact)
+        if member == "{artifact}"
+        else str(ledger)
+        if member == "{ledger}"
+        else str(output.path)
+        if member == "{output}"
+        else member
         for member in _PRODUCERS[name]
     ]
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    if os.environ.get("TMPDIR"):
+        environment["TMPDIR"] = os.environ["TMPDIR"]
     try:
         with _open_verified_file(
             BIN_DIR / component["asset"], component["sha256"]
         ) as executable:
             raw = _run_output(
-                arguments, project, executable, timeout_seconds=10
+                arguments,
+                project,
+                executable,
+                timeout_seconds=10,
+                environment=environment,
             )
     except MissionBridgeError as error:
         code = (
@@ -313,6 +331,14 @@ def _run_producer(
             else "governance-producer-failed"
         )
         raise GovernanceError(code) from error
+    if name == "ao-blueprint":
+        try:
+            if not _private_exists(output):
+                raise ValueError("authorization missing")
+            authorization = _read_private_bytes(output, _MAX_ENVELOPE)
+        except (OSError, ValueError, MissionBridgeError) as error:
+            raise GovernanceError("governance-producer-readback") from error
+        return _readback(name, authorization)
     return _readback(name, raw)
 
 
@@ -437,10 +463,34 @@ def _requirements(project: _PrivateDirectory, path: Path) -> tuple[dict, str]:
         != {"requirements_sha256", "test_bindings_sha256", "requirement_ids"}
         or not _DIGEST.fullmatch(value.get("requirements_sha256", ""))
         or not _DIGEST.fullmatch(value.get("test_bindings_sha256", ""))
-        or value.get("requirement_ids")
-        != [f"B{number:02d}" for number in range(1, 20)]
+        or not isinstance(value.get("requirement_ids"), list)
+        or len(value["requirement_ids"]) != len(set(value["requirement_ids"]))
+        or set(value["requirement_ids"])
+        != {f"B{number:02d}" for number in range(1, 20)}
     ):
         raise GovernanceError("governance-requirements-mismatch")
+    try:
+        raw_manifest = REQUIREMENTS_MANIFEST.read_bytes()
+        if len(raw_manifest) > _MAX_ARTIFACT:
+            raise ValueError("requirements manifest too large")
+        manifest = json.loads(raw_manifest)
+        bindings = {
+            row["id"]: row["test_id"]
+            for row in manifest["requirements"]
+            if row["id"].startswith("B")
+        }
+        if (
+            set(bindings) != {f"B{number:02d}" for number in range(1, 20)}
+            or not hmac.compare_digest(
+                value["requirements_sha256"], _digest_bytes(raw_manifest)
+            )
+            or not hmac.compare_digest(
+                value["test_bindings_sha256"], _digest_value(bindings)
+            )
+        ):
+            raise ValueError("requirements binding mismatch")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise GovernanceError("governance-requirements-mismatch") from error
     return value, _digest_value(value)
 
 
@@ -496,6 +546,66 @@ def _unlink_private(path) -> None:
         os.fsync(descriptor)
 
 
+def _stage_file(
+    project: _PrivateDirectory, path: Path, root: tuple[str, ...], label: str
+) -> tuple[Path, str]:
+    raw = _read_file(project, path, root)
+    digest = _digest_bytes(raw)
+    staged = _private_file(
+        project, (*_PRIVATE_PARTS, "producer-input"), f"{label}-{digest}"
+    )
+    try:
+        try:
+            _create_private(staged, raw)
+        except FileExistsError:
+            if _read_private_bytes(staged, _MAX_ARTIFACT) != raw:
+                raise GovernanceError("governance-artifact-changed")
+        if _read_private_bytes(staged, _MAX_ARTIFACT) != raw:
+            raise GovernanceError("governance-artifact-changed")
+        return staged.path, digest
+    finally:
+        staged.close()
+
+
+def _stage_directory(
+    project: _PrivateDirectory, path: Path, root: tuple[str, ...]
+) -> tuple[Path, str]:
+    digest = _directory_digest(project, path, root)
+    destination_parts = (*_PRIVATE_PARTS, "producer-input", f"blueprint-{digest}")
+    destination = _private_directory(project, *destination_parts)
+    try:
+        for directory, names, filenames in os.walk(path, followlinks=False):
+            current = Path(directory)
+            relative_directory = current.relative_to(path).parts
+            for name in names:
+                _private_directory(
+                    project, *destination_parts, *relative_directory, name
+                ).close()
+            for name in filenames:
+                source = current / name
+                raw = _read_file(project, source, root)
+                retained = _private_file(
+                    project,
+                    (*destination_parts, *relative_directory),
+                    name,
+                )
+                try:
+                    try:
+                        _create_private(retained, raw)
+                    except FileExistsError:
+                        if _read_private_bytes(retained, _MAX_ARTIFACT) != raw:
+                            raise GovernanceError("governance-artifact-changed")
+                finally:
+                    retained.close()
+        if not hmac.compare_digest(
+            _directory_digest(project, destination.path, _PRIVATE_PARTS), digest
+        ):
+            raise GovernanceError("governance-artifact-changed")
+        return destination.path, digest
+    finally:
+        destination.close()
+
+
 def _stage_workflow(project: _PrivateDirectory, path: Path) -> str:
     raw = _read_file(
         project, path, None, code="governance-workflow-mismatch"
@@ -529,9 +639,13 @@ def _producer_record(component: dict, command: tuple[str, ...], digest: str) -> 
     }
 
 
-def _seal(
-    pool: Pool, project: _PrivateDirectory, envelope: dict
+def _issue_authenticated_record(
+    pool: Pool,
+    lease: AuthorityLease,
+    project: _PrivateDirectory,
+    envelope: dict,
 ) -> Path:
+    pool._require_authority_lease(lease)
     envelope["payload_digest"] = _digest_value(
         {name: value for name, value in envelope.items() if name != "payload_digest"}
     )
@@ -547,7 +661,7 @@ def _seal(
         )
         raw = _canonical_bytes(envelope)
         tag = hmac.new(
-            pool._read_witness_key(), raw, hashlib.sha256
+            pool._read_witness_key(lease), raw, hashlib.sha256
         ).hexdigest().encode("ascii") + b"\n"
         record = _private_file(project, _PRIVATE_PARTS, identifier + ".json")
         seal = _private_file(project, _PRIVATE_PARTS, identifier + ".hmac")
@@ -599,6 +713,8 @@ def issue_witness(
             project = _receipt_project_root(lease.authority)
             try:
                 mission, route = _mission_route(lease, project, objective)
+                if route.execution_candidate is not True:
+                    raise GovernanceError("governance-route-not-executable")
                 if route.atlas_required and artifacts.atlas_workgraph is None:
                     raise GovernanceError("governance-atlas-required")
                 if not route.atlas_required and artifacts.atlas_workgraph is not None:
@@ -608,43 +724,73 @@ def issue_witness(
                 target = _target(project, artifacts.target, lease.authority)
                 native = {}
                 artifact_digests = {}
-                blueprint_auth = artifacts.blueprint_pack / "build-authorization.json"
-                native["ao-blueprint"], _ = _json_artifact(
-                    project, blueprint_auth, _ROOTS["ao-blueprint"]
-                )
-                artifact_digests["ao-blueprint"] = _directory_digest(
+                staged_blueprint, blueprint_pack_digest = _stage_directory(
                     project, artifacts.blueprint_pack, _ROOTS["ao-blueprint"]
                 )
-                paths = {
+                source_paths = {
                     "ao-blueprint": artifacts.blueprint_pack,
                     "ao-atlas": artifacts.atlas_workgraph,
                     "ao-forge": artifacts.forge_goal_run,
                     "ao-covenant": artifacts.covenant_evidence,
                 }
+                staged_paths = {"ao-blueprint": staged_blueprint}
                 for name in ("ao-atlas", "ao-forge", "ao-covenant"):
-                    path = paths[name]
+                    path = source_paths[name]
                     if path is None:
+                        staged_paths[name] = None
                         continue
-                    native[name], artifact_digests[name] = _json_artifact(
-                        project, path, _ROOTS[name]
+                    staged_paths[name], artifact_digests[name] = _stage_file(
+                        project, path, _ROOTS[name], name
                     )
+                    native[name], _ = _json_artifact(
+                        project, staged_paths[name], _PRIVATE_PARTS
+                    )
+                staged_ledger, ledger_digest = _stage_file(
+                    project,
+                    artifacts.covenant_ledger,
+                    _ROOTS["ao-covenant"],
+                    "ao-covenant-ledger",
+                )
+                del ledger_digest
+                authorization = _private_file(
+                    project,
+                    (*_PRIVATE_PARTS, "producer-output"),
+                    f"blueprint-{uuid.uuid4().hex}.json",
+                )
                 readbacks = {}
-                for name, command in _PRODUCERS.items():
-                    path = paths[name]
+                try:
+                    readbacks["ao-blueprint"] = _run_producer(
+                        "ao-blueprint",
+                        components["ao-blueprint"],
+                        staged_blueprint,
+                        project,
+                        None,
+                        authorization,
+                    )
+                    authorization_raw = _read_private_bytes(
+                        authorization, _MAX_ENVELOPE
+                    )
+                    artifact_digests["ao-blueprint"] = _digest_bytes(
+                        authorization_raw
+                    )
+                    native["ao-blueprint"] = readbacks["ao-blueprint"]
+                finally:
+                    authorization.close()
+                for name in ("ao-atlas", "ao-forge", "ao-covenant"):
+                    path = staged_paths[name]
                     if path is None:
                         continue
                     readbacks[name] = _run_producer(
-                        name, components[name], path, project
+                        name,
+                        components[name],
+                        path,
+                        project,
+                        staged_ledger if name == "ao-covenant" else None,
                     )
-                    if name == "ao-blueprint":
-                        confirmed = _directory_digest(
-                            project, path, _ROOTS[name]
-                        )
-                    else:
-                        _, confirmed = _json_artifact(
-                            project, path, _ROOTS[name]
-                        )
-                    if confirmed != artifact_digests[name]:
+                    _, confirmed = _json_artifact(
+                        project, path, _PRIVATE_PARTS
+                    )
+                    if not hmac.compare_digest(confirmed, artifact_digests[name]):
                         raise GovernanceError("governance-artifact-changed")
                 requirements, requirements_digest = _requirements(
                     project, artifacts.evidence_set
@@ -668,14 +814,16 @@ def issue_witness(
                     ao2,
                     objective,
                 )
-                for name, path in paths.items():
+                for name, path in source_paths.items():
                     if path is None:
                         continue
                     if name == "ao-blueprint":
                         confirmed = _directory_digest(project, path, _ROOTS[name])
+                        expected = blueprint_pack_digest
                     else:
                         _, confirmed = _json_artifact(project, path, _ROOTS[name])
-                    if not hmac.compare_digest(confirmed, artifact_digests[name]):
+                        expected = artifact_digests[name]
+                    if not hmac.compare_digest(confirmed, expected):
                         raise GovernanceError("governance-artifact-changed")
                 _, confirmed_requirements = _requirements(
                     project, artifacts.evidence_set
@@ -689,7 +837,7 @@ def issue_witness(
                         _producer_record(
                             components[name], _PRODUCERS[name], artifact_digests[name]
                         )
-                        if paths[name] is not None
+                        if staged_paths[name] is not None
                         else None
                     )
                     for name in _PRODUCERS
@@ -743,7 +891,7 @@ def issue_witness(
                     "expires_at": _time(created + timedelta(seconds=lifetime_seconds)),
                     "payload_digest": "0" * 64,
                 }
-                return _seal(pool, project, envelope)
+                return _issue_authenticated_record(pool, lease, project, envelope)
             finally:
                 project.close()
     except PoolError as error:
@@ -760,6 +908,11 @@ def _load_envelope(
 ) -> tuple[dict, _PrivateDirectory]:
     if type(lease) is not AuthorityLease or not isinstance(envelope_path, Path):
         raise GovernanceError("governance-invalid-request")
+    pool = _pool(lease.authority_path)
+    try:
+        pool._require_authority_lease(lease)
+    except PoolError as error:
+        raise GovernanceError("governance-unauthorized") from error
     project = _receipt_project_root(lease.authority)
     record = seal = None
     try:
@@ -772,10 +925,8 @@ def _load_envelope(
             raise GovernanceError("governance-envelope-mismatch")
         record = _private_file(project, _PRIVATE_PARTS, name)
         seal = _private_file(project, _PRIVATE_PARTS, envelope_path.stem + ".hmac")
-        raw = _read_private_bytes(record)
-        supplied = _read_private_bytes(seal)
-        if len(raw) > _MAX_ENVELOPE:
-            raise ValueError("envelope too large")
+        raw = _read_private_bytes(record, _MAX_ENVELOPE)
+        supplied = _read_private_bytes(seal, 65)
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise ValueError("envelope object required")
@@ -786,9 +937,8 @@ def _load_envelope(
         digest = payload.pop("payload_digest")
         if not hmac.compare_digest(digest, _digest_value(payload)):
             raise ValueError("payload digest")
-        pool = _pool(lease.authority_path)
         expected = hmac.new(
-            pool._read_witness_key(), raw, hashlib.sha256
+            pool._read_witness_key(lease), raw, hashlib.sha256
         ).hexdigest().encode("ascii") + b"\n"
         if not hmac.compare_digest(supplied, expected):
             raise ValueError("authentication")
@@ -803,7 +953,6 @@ def _load_envelope(
         }
         if any(value.get(name) != expected for name, expected in authority_expected.items()):
             raise ValueError("authority mismatch")
-        pool = _pool(lease.authority_path)
         if value["runtime_version"] != pool.runtime_version:
             raise ValueError("runtime mismatch")
         mission, route = _mission_route(lease, project, None)
@@ -821,6 +970,8 @@ def _load_envelope(
         }
         if value["mission"] != mission_record or value["route"] != route_record:
             raise ValueError("route mismatch")
+        if route.execution_candidate is not True:
+            raise ValueError("route is not executable")
         if value["route"]["atlas_required"] != (
             value["producer_artifacts"]["ao-atlas"] is not None
         ):
@@ -861,7 +1012,7 @@ def _load_envelope(
         )
         try:
             if not hmac.compare_digest(
-                _digest_bytes(_read_private_bytes(workflow)),
+                _digest_bytes(_read_private_bytes(workflow, _MAX_ARTIFACT)),
                 value["workflow_digest"],
             ):
                 raise ValueError("workflow mismatch")
@@ -926,6 +1077,18 @@ def revoke_witness(receipt: Path, envelope: Path) -> None:
                     }
                 )
                 try:
+                    if not pool._create_governance_marker(
+                        lease,
+                        "revoked",
+                        value["witness_id"],
+                        value["authority_digest"],
+                    ) and not pool._governance_marker_exists(
+                        lease,
+                        "revoked",
+                        value["witness_id"],
+                        value["authority_digest"],
+                    ):
+                        raise GovernanceError("governance-envelope-mismatch")
                     _create_private(marker, data)
                 except FileExistsError:
                     if _read_private_bytes(marker) != data:
@@ -941,12 +1104,17 @@ def _consume_witness(
     lease: AuthorityLease, envelope_path: Path
 ) -> GovernedExecution:
     value, project = _load_envelope(lease, envelope_path)
+    pool = _pool(lease.authority_path)
     revoked = _marker(project, value["witness_id"], ".revoked")
     consumed = _marker(project, value["witness_id"], ".consumed")
     try:
-        if _private_exists(revoked):
+        if pool._governance_marker_exists(
+            lease, "revoked", value["witness_id"], value["authority_digest"]
+        ) or _private_exists(revoked):
             raise GovernanceError("governance-envelope-revoked")
-        if _private_exists(consumed):
+        if pool._governance_marker_exists(
+            lease, "consumed", value["witness_id"], value["authority_digest"]
+        ) or _private_exists(consumed):
             raise GovernanceError("governance-envelope-consumed")
         now = _now()
         if (
@@ -961,6 +1129,10 @@ def _consume_witness(
                 "authority_digest": value["authority_digest"],
             }
         )
+        if not pool._create_governance_marker(
+            lease, "consumed", value["witness_id"], value["authority_digest"]
+        ):
+            raise GovernanceError("governance-envelope-consumed")
         try:
             _create_private(consumed, marker)
         except FileExistsError as error:
@@ -971,9 +1143,9 @@ def _consume_witness(
             project,
             value["workflow_digest"],
             value["run_id"],
-            value["producer_artifacts"],
+            _freeze(value["producer_artifacts"]),
             value["requirements_evidence_digest"],
-            value["ao2"],
+            _freeze(value["ao2"]),
             value["request_digest"],
         )
     except BaseException:

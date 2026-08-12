@@ -697,7 +697,25 @@ def _write_private_bytes(path: _PrivateFile, data: bytes) -> None:
             pass
 
 
-def _read_private_bytes(path: _PrivateFile) -> bytes:
+def _read_private_bytes(path: _PrivateFile, limit: int | None = None) -> bytes:
+    if limit is not None and (type(limit) is not int or limit < 0):
+        raise ValueError("invalid read limit")
+
+    def read_chunks(opened: int) -> bytes:
+        chunks = []
+        size = 0
+        while True:
+            amount = 64 * 1024 if limit is None else min(64 * 1024, limit + 1 - size)
+            if amount <= 0:
+                raise ValueError("private file too large")
+            chunk = os.read(opened, amount)
+            if not chunk:
+                return b"".join(chunks)
+            size += len(chunk)
+            if limit is not None and size > limit:
+                raise ValueError("private file too large")
+            chunks.append(chunk)
+
     descriptor = path.directory.directory_descriptor
     if descriptor is None:
         if os.name != "nt":
@@ -743,12 +761,7 @@ def _read_private_bytes(path: _PrivateFile) -> bytes:
             opened = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
             handle = None
             try:
-                chunks = []
-                while True:
-                    chunk = os.read(opened, 64 * 1024)
-                    if not chunk:
-                        return b"".join(chunks)
-                    chunks.append(chunk)
+                return read_chunks(opened)
             finally:
                 os.close(opened)
         finally:
@@ -762,12 +775,7 @@ def _read_private_bytes(path: _PrivateFile) -> bytes:
         information = os.fstat(opened)
         if not stat.S_ISREG(information.st_mode) or information.st_nlink != 1:
             raise ValueError("unsafe private file")
-        chunks = []
-        while True:
-            chunk = os.read(opened, 64 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
+        return read_chunks(opened)
     finally:
         os.close(opened)
 
@@ -1115,8 +1123,13 @@ def _darwin_call(function, *arguments) -> None:
 
 
 def _darwin_spawn_suspended(
-    arguments: list[str], project_descriptor: int, executable: _VerifiedExecutable
+    arguments: list[str],
+    project_descriptor: int,
+    executable: _VerifiedExecutable,
+    environment: dict[str, str] | None = None,
 ) -> _DarwinChild:
+    if environment is None:
+        environment = dict(os.environ)
     system, _ = _darwin_libraries()
     actions = ctypes.c_void_p()
     attributes = ctypes.c_void_p()
@@ -1174,7 +1187,7 @@ def _darwin_spawn_suspended(
         raw_arguments = [os.fsencode(executable.path), *(os.fsencode(x) for x in arguments)]
         argv = (ctypes.c_char_p * (len(raw_arguments) + 1))(*raw_arguments, None)
         raw_environment = [
-            os.fsencode(f"{name}={value}") for name, value in os.environ.items()
+            os.fsencode(f"{name}={value}") for name, value in environment.items()
         ]
         environment = (ctypes.c_char_p * (len(raw_environment) + 1))(
             *raw_environment, None
@@ -1320,6 +1333,7 @@ def _read_bounded_streams(
         reader.start()
     try:
         return_code = wait()
+        kill()
     finally:
         for reader in readers:
             reader.join(timeout=5)
@@ -1338,9 +1352,16 @@ def _run_darwin(
     project: _PrivateDirectory,
     executable: _VerifiedExecutable,
     timeout_seconds: int = 30,
+    environment: dict[str, str] | None = None,
 ) -> bytes:
     descriptor = project.descriptors[0]
-    child = _darwin_spawn_suspended(arguments, descriptor, executable)
+    child = (
+        _darwin_spawn_suspended(arguments, descriptor, executable)
+        if environment is None
+        else _darwin_spawn_suspended(
+            arguments, descriptor, executable, environment
+        )
+    )
     stdout = None
     stderr = None
     try:
@@ -1402,6 +1423,7 @@ def _run_output(
     executable: _VerifiedExecutable,
     *,
     timeout_seconds: int = 30,
+    environment: dict[str, str] | None = None,
 ) -> bytes:
     launch_path = executable.launch_path
     if isinstance(project, _PrivateDirectory):
@@ -1415,7 +1437,11 @@ def _run_output(
         if not isinstance(project, _PrivateDirectory) or not project.descriptors:
             raise MissionBridgeError("mission-launch-failed")
         return _run_darwin(
-            arguments, project, executable, timeout_seconds=timeout_seconds
+            arguments,
+            project,
+            executable,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
         )
     options = {}
     if os.name != "nt":
@@ -1436,6 +1462,7 @@ def _run_output(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=environment,
             start_new_session=os.name != "nt",
             **options,
         )
@@ -1470,8 +1497,6 @@ def _run_output(
         remaining = deadline - time.monotonic()
         try:
             return_code = process.wait(timeout=max(remaining, 0))
-            if job is not None:
-                job.close()
             return return_code
         except subprocess.TimeoutExpired as error:
             kill()

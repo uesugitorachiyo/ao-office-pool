@@ -5,11 +5,12 @@ import tempfile
 import threading
 import time
 import unittest
+import stat
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from internal.pool import Pool, PoolError
+from internal.pool import AuthorityLease, Pool, PoolError
 
 
 def _claim_worker(arguments):
@@ -124,6 +125,38 @@ class PoolTests(unittest.TestCase):
         encoded = json.dumps(self.pool.public_status(), sort_keys=True)
         self.assertNotIn(original.hex(), encoded)
         self.assertNotIn(key_path.name, encoded)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+
+    def test_witness_key_rejects_hard_links_and_permissive_mode(self):
+        key_path = self.root / "operator-secrets" / "governance-witness.key"
+        original_mode = stat.S_IMODE(key_path.stat().st_mode)
+        linked = self.base / "linked-witness-key"
+        os.link(key_path, linked)
+        try:
+            with self.assertRaises(PoolError) as raised:
+                self.pool.public_status()
+            self.assertEqual(raised.exception.code, "recovery-required")
+        finally:
+            linked.unlink()
+        if os.name != "nt":
+            key_path.chmod(0o644)
+            try:
+                with self.assertRaises(PoolError) as raised:
+                    self.pool.public_status()
+                self.assertEqual(raised.exception.code, "recovery-required")
+            finally:
+                key_path.chmod(original_mode)
+
+    def test_constructed_or_expired_authority_lease_is_not_a_capability(self):
+        authority = self.pool.claim("holder-capability", "task-capability", self.project, "pinned")
+        with self.pool.authority_lease(authority) as active:
+            forged = AuthorityLease(active.authority_path, active.authority_bytes, active.authority)
+            with self.assertRaises(PoolError):
+                self.pool._require_authority_lease(forged)
+            self.pool._require_authority_lease(active)
+        with self.assertRaises(PoolError):
+            self.pool._require_authority_lease(active)
 
     def test_invalid_witness_key_requires_recovery(self):
         key_path = self.root / "operator-secrets" / "governance-witness.key"
