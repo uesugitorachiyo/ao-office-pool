@@ -491,6 +491,7 @@ class Pool:
             self._ensure_initialized()
             self._reconcile()
             states = {office_id: self._read_state(office_id) for office_id in OFFICE_IDS}
+            self._validate_registry_ownership(states)
             if any(
                 state.get("holder_digest") == holder and state["status"] != "free"
                 for state in states.values()
@@ -822,6 +823,8 @@ class Pool:
             for source, destination, kind in moves:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source, destination)
+                if kind == "state":
+                    self._checkpoint("recover:state")
                 if kind == "authority":
                     self._checkpoint("recover:authority")
                 elif kind == "pointer":
@@ -1038,13 +1041,14 @@ class Pool:
 
     def _validate_journal_prefix(self, journal: dict) -> None:
         office_id = journal["office_id"]
-        try:
-            state = self._read_state_file(self._state_path(office_id))
-        except (OSError, ValueError, json.JSONDecodeError):
-            raise PoolError("recovery-required") from None
         before = journal["before_state"]
         after = journal["after_state"]
         committed = journal["phase"] == "committed"
+        if journal["kind"] != "recover" or not before.get("corrupt_state"):
+            try:
+                state = self._read_state_file(self._state_path(office_id))
+            except (OSError, ValueError, json.JSONDecodeError):
+                raise PoolError("recovery-required") from None
         if journal["kind"] == "claim":
             authority = self._authorities / journal["authority_name"]
             pointer = self._pointers / journal["pointer_name"]
@@ -1090,14 +1094,45 @@ class Pool:
             fully_durable = current == (self._state_key(after), False, False)
         else:
             moves = [
-                (Path(item["source"]), Path(item["destination"]))
+                (Path(item["source"]), Path(item["destination"]), item["kind"])
                 for item in journal["moves"]
             ]
             moved = []
-            for source, destination in moves:
-                if source.exists() == destination.exists():
+            corrupt_before = before.get("corrupt_state") is True
+            state_path = self._state_path(office_id)
+            state_stage = None
+            for source, destination, kind in moves:
+                source_present = source.exists()
+                destination_present = destination.exists()
+                replacement_state = (
+                    corrupt_before
+                    and kind == "state"
+                    and source == state_path
+                    and destination_present
+                    and source_present
+                    and self._file_matches(
+                        source,
+                        (
+                            json.dumps(after, sort_keys=True, separators=(",", ":"))
+                            + "\n"
+                        ).encode("utf-8"),
+                    )
+                )
+                if source_present == destination_present and not replacement_state:
                     raise PoolError("recovery-required")
-                moved.append(destination.exists())
+                moved.append(destination_present)
+                if corrupt_before and kind == "state":
+                    if replacement_state:
+                        state_stage = "after"
+                    elif destination_present:
+                        state_stage = "missing"
+                    else:
+                        try:
+                            self._read_state_file(source)
+                        except (OSError, ValueError, json.JSONDecodeError):
+                            state_stage = "before"
+                        else:
+                            raise PoolError("recovery-required")
             if moved != sorted(moved, reverse=True):
                 raise PoolError("recovery-required")
             evidence = Path(journal["archive"]) / "recovery.json"
@@ -1108,15 +1143,23 @@ class Pool:
             evidence_present = self._file_matches(evidence, expected_evidence)
             marker_present = self._marker_path(office_id).exists()
             all_moved = all(moved)
-            if state not in (before, after):
-                raise PoolError("recovery-required")
+            if corrupt_before:
+                if state_stage not in {"before", "missing", "after"}:
+                    raise PoolError("recovery-required")
+                state_is_after = state_stage == "after"
+            else:
+                if state not in (before, after):
+                    raise PoolError("recovery-required")
+                state_is_after = state == after
             if evidence_present and not all_moved:
                 raise PoolError("recovery-required")
-            if state == after and not evidence_present:
+            if state_is_after and not evidence_present:
                 raise PoolError("recovery-required")
             prefixes = {True}
             current = True
-            fully_durable = all_moved and evidence_present and state == after and not marker_present
+            fully_durable = (
+                all_moved and evidence_present and state_is_after and not marker_present
+            )
         if (committed and not fully_durable) or (not committed and current not in prefixes):
             raise PoolError("recovery-required")
 
@@ -1250,6 +1293,23 @@ class Pool:
         ):
             raise PoolError("recovery-required")
 
+    def _validate_registry_ownership(self, states: dict[str, dict]) -> None:
+        authorities = {
+            state["authority_name"]
+            for state in states.values()
+            if state.get("status") != "free" and "authority_name" in state
+        }
+        pointers = {
+            f"{state['holder_digest']}.json"
+            for state in states.values()
+            if state.get("status") != "free" and "holder_digest" in state
+        }
+        if (
+            {path.name for path in self._authorities.iterdir()} != authorities
+            or {path.name for path in self._pointers.iterdir()} != pointers
+        ):
+            raise PoolError("recovery-required")
+
     def _reconcile_claim(self, journal: dict, committed: bool) -> None:
         office_id = journal["office_id"]
         authority = self._authorities / journal["authority_name"]
@@ -1325,7 +1385,19 @@ class Pool:
         if committed:
             for source, destination in moves:
                 if source.exists() and destination.exists():
-                    self._quarantine_journal(journal, "recovery-move-collision")
+                    if source != self._state_path(journal["office_id"]) or not self._file_matches(
+                        source,
+                        (
+                            json.dumps(
+                                journal["after_state"],
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        ).encode("utf-8"),
+                    ):
+                        self._quarantine_journal(journal, "recovery-move-collision")
+                    continue
                 if source.exists():
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(source, destination)

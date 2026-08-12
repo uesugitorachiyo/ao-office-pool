@@ -219,6 +219,34 @@ class PoolCrashTests(unittest.TestCase):
                 }
                 self.assertEqual(after, before)
 
+    def test_exact_shaped_orphan_receipts_and_pointers_stop_before_reuse(self):
+        # MUTATION: filename-only checks accept unowned protected registry bytes.
+        relatives = (
+            f"receipts/{'a' * 64}.receipt.json",
+            f"pointers/{'b' * 64}.json",
+        )
+        for number, relative in enumerate(relatives):
+            with self.subTest(relative=relative):
+                root, pool = self._pool(f"orphan-runtime-{number}")
+                orphan = root / "runtime" / relative
+                orphan.write_bytes(b"exact-shaped-orphan\x00bytes")
+                before = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+
+                with self.assertRaises(PoolError) as raised:
+                    pool.claim("holder", "task", self.project, "pinned")
+
+                self.assertEqual(raised.exception.code, "recovery-required")
+                after = {
+                    path.relative_to(root).as_posix(): path.read_bytes()
+                    for path in root.rglob("*")
+                    if path.is_file() and path.name != ".pool.lock"
+                }
+                self.assertEqual(after, before)
+
     def test_untrusted_journal_paths_stop_before_mutation(self):
         # MUTATION: replaying unvalidated journal member paths deletes an unrelated file.
         root, _ = self._pool("journal-path")
@@ -576,6 +604,52 @@ class PoolCrashTests(unittest.TestCase):
                 copies = [path.read_bytes() for path in root.rglob("partial.bin")]
                 self.assertEqual(copies, [payload])
                 self.assertEqual(hashlib.sha256(copies[0]).hexdigest(), hashlib.sha256(payload).hexdigest())
+
+    def test_corrupt_state_recovery_reconciles_every_durable_prefix(self):
+        # MUTATION: parsing opaque state before its preserved move blocks reconciliation.
+        stages = (
+            "recover:journal-prepared",
+            "recover:state",
+            "recover:office",
+            "recover:journal-committed",
+        )
+        original = b"corrupt-office-state\x00bytes"
+        for stage in stages:
+            with self.subTest(stage=stage):
+                root, _ = self._pool(f"corrupt-{stage.replace(':', '-')}")
+                state_path = root / "offices" / "O1" / "office-state.json"
+                state_path.write_bytes(original)
+                self._abrupt(_crash_recover, str(root), stage, 0)
+                journal_path = next((root / "runtime" / "transactions").iterdir())
+                journal = json.loads(journal_path.read_text())
+                state_move = next(item for item in journal["moves"] if item["kind"] == "state")
+                archived_state = Path(state_move["destination"])
+
+                if stage == "recover:journal-prepared":
+                    self.assertEqual(state_path.read_bytes(), original)
+                    self.assertFalse(archived_state.exists())
+                elif stage == "recover:state":
+                    self.assertFalse(state_path.exists())
+                    self.assertEqual(archived_state.read_bytes(), original)
+                else:
+                    self.assertEqual(json.loads(state_path.read_text()), journal["after_state"])
+                    self.assertEqual(archived_state.read_bytes(), original)
+
+                Pool(root).recover(
+                    root / "operator-secrets" / "recovery-key-O1", "O1", 0
+                )
+
+                self.assertEqual(
+                    Pool(root).public_status()["offices"][0],
+                    {"office_id": "O1", "status": "free", "generation": 0},
+                )
+                self.assertEqual(list((root / "runtime" / "transactions").iterdir()), [])
+                preserved = list(
+                    (root / "offices" / "O1" / "history").rglob(
+                        "unknown-office-state.json"
+                    )
+                )
+                self.assertEqual([path.read_bytes() for path in preserved], [original])
 
     def test_interrupted_recovery_retries_directly_with_exact_key(self):
         # MUTATION: retry rejects the free post-state before replaying its pending journal.
