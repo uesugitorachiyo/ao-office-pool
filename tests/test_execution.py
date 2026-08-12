@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -200,7 +201,8 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(arguments[0], "run")
         self.assertEqual(arguments[2:], ["--target", ".", "--run-id", self.harness.run_id])
         if os.name == "nt":
-            self.assertEqual(Path(arguments[1]).name, self.harness.workflow_digest if hasattr(self.harness, "workflow_digest") else hashlib.sha256(self.harness.workflow.read_bytes()).hexdigest())
+            digest = hashlib.sha256(self.harness.workflow.read_bytes()).hexdigest()
+            self.assertRegex(Path(arguments[1]).name, rf"^{digest}-[0-9a-f]{{32}}$")
         else:
             self.assertTrue(
                 arguments[1].startswith(
@@ -363,6 +365,122 @@ class ExecutionTests(unittest.TestCase):
             (self.project / "ao2-workflow.txt").read_bytes(),
             self.harness.workflow.read_bytes(),
         )
+
+    def test_linux_requires_available_successful_workflow_sealing(self):
+        # MUTATION: missing or failed Linux seals fall back to the mutable disk snapshot.
+        raw = b"name: bounded\n"
+        digest = hashlib.sha256(raw).hexdigest()
+        fake_fcntl = types.SimpleNamespace(
+            F_ADD_SEALS=1,
+            F_GET_SEALS=2,
+            F_SEAL_WRITE=4,
+            F_SEAL_GROW=8,
+            F_SEAL_SHRINK=16,
+            F_SEAL_SEAL=32,
+            fcntl=mock.Mock(),
+        )
+        failing_fcntl = types.SimpleNamespace(
+            F_ADD_SEALS=1,
+            F_GET_SEALS=2,
+            F_SEAL_WRITE=4,
+            F_SEAL_GROW=8,
+            F_SEAL_SHRINK=16,
+            F_SEAL_SEAL=32,
+            fcntl=mock.Mock(side_effect=OSError("F_ADD_SEALS failed")),
+        )
+
+        def disk_descriptor(*_):
+            return os.open(
+                self.base / "fake-memfd",
+                os.O_RDWR | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+
+        cases = (
+            (types.SimpleNamespace(), mock.Mock(return_value=99)),
+            (fake_fcntl, mock.Mock(side_effect=OSError("memfd unavailable"))),
+            (failing_fcntl, mock.Mock(side_effect=disk_descriptor)),
+        )
+        for fcntl_module, memfd_create in cases:
+            with self.subTest(fcntl=bool(vars(fcntl_module))):
+                with (
+                    mock.patch.object(execution_module.sys, "platform", "linux"),
+                    mock.patch.object(
+                        execution_module.Path, "is_dir", return_value=True
+                    ),
+                    mock.patch.object(
+                        execution_module.os,
+                        "memfd_create",
+                        memfd_create,
+                        create=True,
+                    ),
+                    mock.patch.object(
+                        execution_module.os, "MFD_ALLOW_SEALING", 1, create=True
+                    ),
+                    mock.patch.object(
+                        execution_module.os, "MFD_CLOEXEC", 2, create=True
+                    ),
+                    mock.patch.dict(sys.modules, {"fcntl": fcntl_module}),
+                    self.assertRaises(ExecutionError) as raised,
+                ):
+                    execution_module._sealed_workflow_descriptor(raw, digest)
+                self.assertEqual(
+                    raised.exception.code, "workflow-identity-mismatch"
+                )
+
+    @unittest.skipIf(os.name == "nt", "descriptor hash mutation is POSIX-specific")
+    def test_workflow_identity_rejects_preheld_writer_mutation_during_hash(self):
+        # MUTATION: one pre-hash fstat accepts bytes changed through a pre-held writer.
+        raw = b"a" * 4096
+        path = self.base / "workflow-identity.yaml"
+        path.write_bytes(raw)
+        writable = os.open(path, os.O_RDWR)
+        readable = os.open(path, os.O_RDONLY)
+        os.chmod(path, 0o400)
+        self.addCleanup(os.close, writable)
+        self.addCleanup(os.close, readable)
+        real_read = os.read
+        real_pread = os.pread
+        mutated = False
+
+        def mutate_after_read(chunk):
+            nonlocal mutated
+            if chunk and not mutated:
+                mutated = True
+                os.pwrite(writable, b"b", 0)
+                os.fsync(writable)
+            return chunk
+
+        def injected_read(descriptor, amount):
+            return mutate_after_read(real_read(descriptor, amount))
+
+        def injected_pread(descriptor, amount, offset):
+            return mutate_after_read(real_pread(descriptor, amount, offset))
+
+        with (
+            mock.patch.object(execution_module.os, "read", injected_read),
+            mock.patch.object(execution_module.os, "pread", injected_pread),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execution_module._workflow_identity(
+                readable, hashlib.sha256(raw).hexdigest()
+            )
+        self.assertTrue(mutated)
+        self.assertEqual(raised.exception.code, "workflow-identity-mismatch")
+
+    def test_completed_and_failed_executions_remove_per_run_workflow_snapshots(self):
+        # MUTATION: closing retained handles without unlinking accumulates UUID snapshots.
+        staging = (
+            self.project / ".ao" / "governance" / "office-pool" / "staging"
+        )
+        execute(self.claim_path, self.envelope)
+        self.assertEqual(list(staging.iterdir()), [])
+        execute(self.claim_path, self._witness())
+        self.assertEqual(list(staging.iterdir()), [])
+        self._set_ao2_mode("wrong-types")
+        with self.assertRaises(ExecutionError):
+            execute(self.claim_path, self._witness())
+        self.assertEqual(list(staging.iterdir()), [])
 
     def test_ao2_environment_strips_ambient_injection_variables(self):
         # MUTATION: inheriting the parent environment exposes AO2 to config/code injection.

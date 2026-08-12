@@ -253,8 +253,9 @@ class _WindowsJob:
     def close(self) -> None:
         with self.lock:
             if self.handle is not None:
-                self.library.CloseHandle(self.handle)
+                handle = self.handle
                 self.handle = None
+                self.library.CloseHandle(handle)
 
 
 def _digest(value: bytes) -> str:
@@ -1184,8 +1185,14 @@ def _windows_job(process, library=None, native=None) -> _WindowsJob:
                 raise OSError("NtResumeProcess failed")
             return _WindowsJob(library, handle)
         except BaseException:
-            library.TerminateJobObject(handle, 1)
-            library.CloseHandle(handle)
+            try:
+                library.TerminateJobObject(handle, 1)
+            except BaseException:
+                pass
+            try:
+                library.CloseHandle(handle)
+            except BaseException:
+                pass
             raise
     except (AttributeError, OSError, TypeError, ValueError) as error:
         raise MissionBridgeError("mission-launch-failed") from error
@@ -1212,9 +1219,12 @@ def _darwin_spawn_suspended(
     actions_ready = False
     attributes_ready = False
     inherited = []
-    stdout_read, stdout_write = os.pipe()
-    stderr_read, stderr_write = os.pipe()
+    stdout_read = stdout_write = None
+    stderr_read = stderr_write = None
+    child_pid = 0
     try:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
         for descriptor in retained_descriptors:
             inherited.append((descriptor, os.get_inheritable(descriptor)))
             os.set_inheritable(descriptor, True)
@@ -1289,29 +1299,42 @@ def _darwin_spawn_suspended(
             argv,
             environment,
         )
+        child_pid = pid.value
         os.close(stdout_write)
         stdout_write = None
         os.close(stderr_write)
         stderr_write = None
         return _DarwinChild(pid.value, stdout_read, stderr_read)
-    except (OSError, TypeError, ValueError) as error:
+    except BaseException as error:
+        if child_pid:
+            _darwin_kill_wait(child_pid)
         for descriptor in (stdout_read, stdout_write, stderr_read, stderr_write):
             if descriptor is not None:
                 try:
                     os.close(descriptor)
-                except OSError:
+                except BaseException:
                     pass
-        raise MissionBridgeError("mission-launch-failed") from error
+        if isinstance(error, MissionBridgeError):
+            raise
+        if isinstance(error, Exception):
+            raise MissionBridgeError("mission-launch-failed") from error
+        raise
     finally:
         for descriptor, inheritable in inherited:
             try:
                 os.set_inheritable(descriptor, inheritable)
-            except OSError:
+            except BaseException:
                 pass
         if attributes_ready:
-            system.posix_spawnattr_destroy(ctypes.byref(attributes))
+            try:
+                system.posix_spawnattr_destroy(ctypes.byref(attributes))
+            except BaseException:
+                pass
         if actions_ready:
-            system.posix_spawn_file_actions_destroy(ctypes.byref(actions))
+            try:
+                system.posix_spawn_file_actions_destroy(ctypes.byref(actions))
+            except BaseException:
+                pass
 
 
 def _darwin_vnode_matches(value: _DarwinVinfoStat, descriptor: int) -> bool:
@@ -1386,14 +1409,14 @@ def _darwin_kill_wait(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    except PermissionError:
+    except BaseException:
         try:
             os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except BaseException:
             pass
     try:
         os.waitpid(pid, 0)
-    except ChildProcessError:
+    except BaseException:
         pass
 
 
@@ -1417,14 +1440,16 @@ def _read_bounded_streams(
                     return
                 buffers[index].extend(chunk)
 
-    readers = [
-        threading.Thread(target=drain, args=(index, stream), daemon=True)
-        for index, stream in enumerate(streams)
-    ]
-    for reader in readers:
-        reader.start()
+    readers = []
     failure = None
+    cleanup_error = None
     try:
+        for index, stream in enumerate(streams):
+            reader = threading.Thread(
+                target=drain, args=(index, stream), daemon=True
+            )
+            reader.start()
+            readers.append(reader)
         return_code = wait()
         kill()
     except BaseException as error:
@@ -1442,15 +1467,17 @@ def _read_bounded_streams(
         for reader in readers:
             try:
                 reader.join(timeout=5)
-            except BaseException:
-                if failure is None:
-                    raise
+            except BaseException as error:
+                if failure is None and cleanup_error is None:
+                    cleanup_error = error
         for stream in streams:
             try:
                 stream.close()
-            except BaseException:
-                if failure is None:
-                    raise
+            except BaseException as error:
+                if failure is None and cleanup_error is None:
+                    cleanup_error = error
+        if failure is None and cleanup_error is not None:
+            raise cleanup_error
     if too_large.is_set():
         raise MissionBridgeError(
             "mission-output-too-large", reason="output-too-large"
@@ -1496,7 +1523,7 @@ def _run_darwin(
         ):
             try:
                 stream.close() if stream is not None else os.close(raw_descriptor)
-            except OSError:
+            except BaseException:
                 pass
         if isinstance(error, MissionBridgeError):
             raise
@@ -1527,8 +1554,14 @@ def _run_darwin(
                     return os.WEXITSTATUS(status)
                 return 128 + os.WTERMSIG(status) if os.WIFSIGNALED(status) else 1
             if time.monotonic() >= deadline:
-                kill()
-                os.waitpid(child.pid, 0)
+                try:
+                    kill()
+                except BaseException:
+                    pass
+                try:
+                    os.waitpid(child.pid, 0)
+                except BaseException:
+                    pass
                 raise MissionBridgeError("mission-launch-failed", reason="timeout")
             time.sleep(0.01)
 
@@ -1596,13 +1629,20 @@ def _run_output(
     if os.name == "nt":
         try:
             job = _windows_job(process)
-        except MissionBridgeError:
+        except BaseException:
             try:
                 process.kill()
+            except BaseException:
+                pass
+            try:
                 process.wait()
-            finally:
-                process.stdout.close()
-                process.stderr.close()
+            except BaseException:
+                pass
+            for stream in (process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
             raise
     deadline = time.monotonic() + timeout_seconds
 
@@ -1613,9 +1653,22 @@ def _run_output(
                 return
             except ProcessLookupError:
                 return
-        if job is not None and job.terminate():
-            return
-        process.kill()
+            except BaseException:
+                pass
+        if job is not None:
+            try:
+                if job.terminate():
+                    return
+            except BaseException:
+                pass
+            try:
+                job.close()
+            except BaseException:
+                pass
+        try:
+            process.kill()
+        except BaseException:
+            pass
 
     def wait() -> int:
         remaining = deadline - time.monotonic()
@@ -1623,10 +1676,14 @@ def _run_output(
             return_code = process.wait(timeout=max(remaining, 0))
             return return_code
         except subprocess.TimeoutExpired as error:
-            kill()
-            process.wait()
-            if job is not None:
-                job.close()
+            try:
+                kill()
+            except BaseException:
+                pass
+            try:
+                process.wait()
+            except BaseException:
+                pass
             raise MissionBridgeError(
                 "mission-launch-failed", reason="timeout"
             ) from error
@@ -1638,7 +1695,10 @@ def _run_output(
         return raw_output
     finally:
         if job is not None:
-            job.close()
+            try:
+                job.close()
+            except BaseException:
+                pass
 
 
 def _run(

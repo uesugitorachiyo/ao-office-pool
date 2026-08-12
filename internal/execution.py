@@ -14,6 +14,7 @@ from internal.governance_witness import (
     GovernedExecution,
     _consume_witness,
     _create_private,
+    _unlink_private,
 )
 from internal.mission_bridge import (
     MissionBridgeError,
@@ -90,31 +91,61 @@ def _descriptor_bytes(descriptor: int) -> bytes:
             raise ExecutionError("workflow-identity-mismatch")
 
 
-def _workflow_identity(descriptor: int, digest: str) -> tuple[int, int, int, int]:
-    information = os.fstat(descriptor)
+def _workflow_identity(descriptor: int, digest: str) -> tuple[int, int, int, int, int]:
+    before = os.fstat(descriptor)
     if (
-        not stat.S_ISREG(information.st_mode)
-        or information.st_nlink != 1
-        or not hmac.compare_digest(_hash_descriptor(descriptor), digest)
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise ExecutionError("workflow-identity-mismatch")
+    if hasattr(os, "pread"):
+        calculated = hashlib.sha256()
+        offset = 0
+        while chunk := os.pread(descriptor, 64 * 1024, offset):
+            calculated.update(chunk)
+            offset += len(chunk)
+        calculated = calculated.hexdigest()
+    else:
+        calculated = _hash_descriptor(descriptor)
+    after = os.fstat(descriptor)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or not hmac.compare_digest(calculated, digest)
     ):
         raise ExecutionError("workflow-identity-mismatch")
     return (
-        information.st_dev,
-        information.st_ino,
-        information.st_ctime_ns,
-        information.st_size,
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
     )
 
 
 def _sealed_workflow_descriptor(raw: bytes, digest: str) -> int | None:
+    if not sys.platform.startswith("linux"):
+        return None
     if not (
-        sys.platform.startswith("linux")
-        and hasattr(os, "memfd_create")
+        hasattr(os, "memfd_create")
         and hasattr(os, "MFD_ALLOW_SEALING")
         and Path("/proc/self/fd").is_dir()
     ):
-        return None
-    import fcntl
+        raise ExecutionError("workflow-identity-mismatch")
+    try:
+        import fcntl
+    except ImportError as error:
+        raise ExecutionError("workflow-identity-mismatch") from error
 
     seal_names = (
         "F_ADD_SEALS",
@@ -125,18 +156,19 @@ def _sealed_workflow_descriptor(raw: bytes, digest: str) -> int | None:
         "F_SEAL_SEAL",
     )
     if not all(hasattr(fcntl, name) for name in seal_names):
-        return None
+        raise ExecutionError("workflow-identity-mismatch")
     required = (
         fcntl.F_SEAL_WRITE
         | fcntl.F_SEAL_GROW
         | fcntl.F_SEAL_SHRINK
         | fcntl.F_SEAL_SEAL
     )
-    descriptor = os.memfd_create(
-        "ao2-workflow", getattr(os, "MFD_CLOEXEC", 0) | os.MFD_ALLOW_SEALING
-    )
+    descriptor = None
     readonly = None
     try:
+        descriptor = os.memfd_create(
+            "ao2-workflow", getattr(os, "MFD_CLOEXEC", 0) | os.MFD_ALLOW_SEALING
+        )
         view = memoryview(raw)
         while view:
             written = os.write(descriptor, view)
@@ -159,13 +191,26 @@ def _sealed_workflow_descriptor(raw: bytes, digest: str) -> int | None:
             or not hmac.compare_digest(_hash_descriptor(readonly), digest)
         ):
             raise ExecutionError("workflow-identity-mismatch")
-        return readonly
+        retained_descriptor = readonly
+        readonly = None
+        return retained_descriptor
+    except ExecutionError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ExecutionError("workflow-identity-mismatch") from error
     except BaseException:
-        if readonly is not None:
-            os.close(readonly)
         raise
     finally:
-        os.close(descriptor)
+        if readonly is not None:
+            try:
+                os.close(readonly)
+            except BaseException:
+                pass
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
 
 
 @contextmanager
@@ -180,6 +225,7 @@ def _retained_workflow(governed: GovernedExecution):
         (".ao", "governance", "office-pool", "staging"),
         f"{governed.workflow_digest}-{uuid.uuid4().hex}",
     )
+    staged_created = False
     try:
         with _open_retained_file(source) as source_descriptor:
             raw = _descriptor_bytes(source_descriptor)
@@ -188,6 +234,7 @@ def _retained_workflow(governed: GovernedExecution):
             ):
                 raise ExecutionError("workflow-identity-mismatch")
             _create_private(staged, raw)
+            staged_created = True
             with _open_retained_file(staged) as created_descriptor:
                 if os.name != "nt":
                     os.fchmod(created_descriptor, 0o400)
@@ -243,8 +290,26 @@ def _retained_workflow(governed: GovernedExecution):
     except (MissionBridgeError, OSError, TypeError, ValueError) as error:
         raise ExecutionError("workflow-identity-mismatch") from error
     finally:
-        staged.close()
-        source.close()
+        failure = sys.exception()
+        cleanup_error = None
+        if staged_created:
+            try:
+                _unlink_private(staged)
+            except FileNotFoundError:
+                pass
+            except BaseException as error:
+                if failure is None:
+                    cleanup_error = error
+        for private in (staged, source):
+            try:
+                private.close()
+            except BaseException as error:
+                if failure is None and cleanup_error is None:
+                    cleanup_error = error
+        if failure is None and cleanup_error is not None:
+            if isinstance(cleanup_error, Exception):
+                raise ExecutionError("workflow-identity-mismatch") from cleanup_error
+            raise cleanup_error
 
 
 def _ao2_path(receipt: Path, authority: dict, governed: GovernedExecution) -> Path:

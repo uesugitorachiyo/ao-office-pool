@@ -2,6 +2,7 @@ import ctypes
 import errno
 import hashlib
 import hmac
+import io
 import json
 import os
 import signal
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -504,6 +506,164 @@ class MissionBridgeTests(unittest.TestCase):
         self.assertTrue(job.terminate())
         job.close()
         self.assertEqual(events[-2:], ["terminated", "closed"])
+
+    def test_windows_job_setup_baseexceptions_preserve_original_and_close_handle(self):
+        # MUTATION: a cleanup failure masks assignment/resume/constructor aborts and leaks the job.
+        class Function:
+            def __init__(self, operation):
+                self.operation = operation
+
+            def __call__(self, *arguments):
+                return self.operation(*arguments)
+
+        for fault in ("assign", "resume", "constructor"):
+            with self.subTest(fault=fault):
+                events = []
+
+                def assign(*_):
+                    events.append("assigned")
+                    if fault == "assign":
+                        raise KeyboardInterrupt("assign original")
+                    return 1
+
+                def resume(*_):
+                    events.append("resumed")
+                    if fault == "resume":
+                        raise KeyboardInterrupt("resume original")
+                    return 0
+
+                def terminate(*_):
+                    events.append("terminated")
+                    raise RuntimeError("secondary terminate failure")
+
+                kernel = types.SimpleNamespace(
+                    CreateJobObjectW=Function(lambda *_: 101),
+                    SetInformationJobObject=Function(lambda *_: 1),
+                    AssignProcessToJobObject=Function(assign),
+                    TerminateJobObject=Function(terminate),
+                    CloseHandle=Function(lambda *_: events.append("closed") or 1),
+                )
+                native = types.SimpleNamespace(NtResumeProcess=Function(resume))
+                constructor = (
+                    mock.patch.object(
+                        mission_bridge,
+                        "_WindowsJob",
+                        side_effect=KeyboardInterrupt("constructor original"),
+                    )
+                    if fault == "constructor"
+                    else nullcontext()
+                )
+                with constructor, self.assertRaisesRegex(
+                    KeyboardInterrupt, rf"{fault} original"
+                ):
+                    mission_bridge._windows_job(
+                        types.SimpleNamespace(_handle=202), kernel, native
+                    )
+                self.assertEqual(events[-2:], ["terminated", "closed"])
+
+    def test_darwin_waitpid_cleanup_failure_preserves_original_and_closes_streams(self):
+        # MUTATION: an unexpected cleanup waitpid error masks the pre-resume failure.
+        streams = (io.BytesIO(), io.BytesIO())
+        child = mission_bridge._DarwinChild(123, 10, 11)
+        project = types.SimpleNamespace(descriptors=(20,))
+        with (
+            mock.patch.object(
+                mission_bridge, "_darwin_spawn_suspended", return_value=child
+            ),
+            mock.patch.object(mission_bridge.os, "fdopen", side_effect=streams),
+            mock.patch.object(
+                mission_bridge,
+                "_darwin_wait_stopped",
+                side_effect=KeyboardInterrupt("pre-resume original"),
+            ),
+            mock.patch.object(mission_bridge.os, "killpg"),
+            mock.patch.object(
+                mission_bridge.os,
+                "waitpid",
+                side_effect=RuntimeError("secondary waitpid failure"),
+            ) as waitpid,
+            self.assertRaisesRegex(KeyboardInterrupt, "pre-resume original"),
+        ):
+            mission_bridge._run_darwin([], project, types.SimpleNamespace())
+        waitpid.assert_called_once_with(child.pid, 0)
+        self.assertTrue(all(stream.closed for stream in streams))
+
+    def test_windows_job_setup_abort_cleans_owned_process_resources(self):
+        # MUTATION: catching only MissionBridgeError skips process cleanup on BaseException.
+        events = []
+
+        class Process:
+            pid = 123
+            stdout = io.BytesIO()
+            stderr = io.BytesIO()
+
+            def kill(self):
+                events.append("killed")
+
+            def wait(self, **_):
+                events.append("waited")
+                return -9
+
+        process = Process()
+        executable = types.SimpleNamespace(launch_path="ao2.exe", descriptors=())
+        with (
+            mock.patch.object(mission_bridge.sys, "platform", "win32"),
+            mock.patch.object(mission_bridge.os, "name", "nt"),
+            mock.patch.object(mission_bridge.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                mission_bridge,
+                "_windows_job",
+                side_effect=KeyboardInterrupt("job setup original"),
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "job setup original"),
+        ):
+            mission_bridge._run_output([], self.project, executable)
+        self.assertEqual(events, ["killed", "waited"])
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_windows_wait_abort_is_not_masked_by_job_close_failure(self):
+        # MUTATION: final Job close replaces the initiating wait exception.
+        events = []
+
+        class Process:
+            pid = 123
+            stdout = io.BytesIO()
+            stderr = io.BytesIO()
+
+            def wait(self, **_):
+                events.append("waited")
+                if events.count("waited") == 1:
+                    raise KeyboardInterrupt("wait original")
+                return -9
+
+            def kill(self):
+                events.append("process-killed")
+
+        class Job:
+            def terminate(self):
+                events.append("job-terminated")
+                return True
+
+            def close(self):
+                events.append("job-closed")
+                raise RuntimeError("secondary close failure")
+
+        process = Process()
+        executable = types.SimpleNamespace(launch_path="ao2.exe", descriptors=())
+        with (
+            mock.patch.object(mission_bridge.sys, "platform", "win32"),
+            mock.patch.object(mission_bridge.os, "name", "nt"),
+            mock.patch.object(mission_bridge.subprocess, "Popen", return_value=process),
+            mock.patch.object(mission_bridge, "_windows_job", return_value=Job()),
+            self.assertRaisesRegex(KeyboardInterrupt, "wait original"),
+        ):
+            mission_bridge._run_output([], self.project, executable)
+        self.assertEqual(
+            events, ["waited", "job-terminated", "waited", "job-closed"]
+        )
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
 
     def test_starts_verified_mission_with_argument_array_and_project_owned_state(self):
         # MUTATION: shell=True would interpret the punctuation in the objective.
