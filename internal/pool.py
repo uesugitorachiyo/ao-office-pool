@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import secrets
-import shutil
 import uuid
 from pathlib import Path
 
@@ -67,12 +66,14 @@ class Pool:
         *,
         runtime_version: str = "unactivated",
         crash_after: str | None = None,
+        abrupt_crash: bool = False,
     ):
         if not isinstance(root, Path):
             raise TypeError("root must be a pathlib.Path")
         self.root = root.resolve(strict=False)
         self.runtime_version = validate_segment(runtime_version)
         self.crash_after = crash_after
+        self.abrupt_crash = abrupt_crash
 
     @property
     def _lock_path(self) -> Path:
@@ -94,8 +95,18 @@ class Pool:
     def _journals(self) -> Path:
         return self._runtime / "transactions"
 
+    @property
+    def _generations_path(self) -> Path:
+        return self._runtime / "generations.json"
+
+    @property
+    def _recovery_authority_path(self) -> Path:
+        return self._runtime / "recovery-authority.json"
+
     def _checkpoint(self, name: str) -> None:
         if self.crash_after == name:
+            if self.abrupt_crash:
+                os._exit(97)
             raise InjectedCrash(name)
 
     def _office(self, office_id: str) -> Path:
@@ -123,9 +134,12 @@ class Pool:
             raise PoolError("invalid-count")
         validate_segment(self.runtime_version)
         self._preflight_existing_root()
+        self._preflight_lock(allow_missing=True)
         with pool_lock(self._lock_path):
+            self._validate_protected_paths(allow_missing=True)
             pool_path = self.root / "pool.json"
             if pool_path.exists():
+                self._validate_protected_paths()
                 self._ensure_initialized()
                 return
             self._runtime.mkdir(parents=True, exist_ok=True)
@@ -136,6 +150,19 @@ class Pool:
             operator = self.root / "operator-secrets"
             operator.mkdir(exist_ok=True)
             authority_digests = {}
+            generations = {office_id: 0 for office_id in OFFICE_IDS}
+            if self._generations_path.exists():
+                try:
+                    existing_generations = read_json(self._generations_path)
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    raise PoolError("recovery-required") from error
+                if existing_generations != {"schema_version": 1, "generations": generations}:
+                    raise PoolError("recovery-required")
+            else:
+                atomic_write_json(
+                    self._generations_path,
+                    {"schema_version": 1, "generations": generations},
+                )
             for office_id in OFFICE_IDS:
                 office = self._office(office_id)
                 (office / "work").mkdir(parents=True, exist_ok=True)
@@ -152,10 +179,15 @@ class Pool:
                 if not key_file.exists():
                     atomic_write_bytes(key_file, (secrets.token_urlsafe(32) + "\n").encode("utf-8"))
                 authority_digests[office_id] = _bytes_digest(key_file.read_bytes())
-            atomic_write_json(
-                self._runtime / "recovery-authority.json",
-                {"schema_version": 1, "digests": authority_digests},
-            )
+            recovery_authority = {"schema_version": 1, "digests": authority_digests}
+            if self._recovery_authority_path.exists():
+                try:
+                    if read_json(self._recovery_authority_path) != recovery_authority:
+                        raise ValueError("unexpected recovery authority")
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    raise PoolError("recovery-required") from error
+            else:
+                atomic_write_json(self._recovery_authority_path, recovery_authority)
             atomic_write_json(
                 pool_path,
                 {
@@ -166,15 +198,64 @@ class Pool:
                 },
             )
             self._verify_runtime_containment()
+            self._validate_protected_paths()
+
+    def _preflight_lock(self, *, allow_missing: bool = False) -> None:
+        path = self._lock_path
+        if path.is_symlink():
+            raise PoolError("recovery-required")
+        if not path.exists():
+            if allow_missing:
+                return
+            raise PoolError("recovery-required")
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("invalid pool lock")
+            path.resolve(strict=True).relative_to(self.root.resolve(strict=True))
+            if os.name == "nt":
+                require_within(open_identity(path), open_identity(self.root))
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
+
+    def _validate_protected_paths(self, *, allow_missing: bool = False) -> None:
+        try:
+            root = self.root.resolve(strict=True)
+            paths = [self.root, self._lock_path]
+            for parent in (
+                self._runtime,
+                self.root / "offices",
+                self.root / "operator-secrets",
+            ):
+                paths.append(parent)
+                if not parent.is_symlink():
+                    for directory, names, files in os.walk(parent, followlinks=False):
+                        base = Path(directory)
+                        paths.extend(base / name for name in names)
+                        paths.extend(base / name for name in files)
+            paths.append(self.root / "pool.json")
+            root_identity = open_identity(self.root) if os.name == "nt" else None
+            for path in paths:
+                if path.is_symlink():
+                    raise ValueError("protected path is a link")
+                if allow_missing and not path.exists():
+                    continue
+                path.resolve(strict=True).relative_to(root)
+                if os.name == "nt":
+                    require_within(open_identity(path), root_identity)
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
 
     def _preflight_existing_root(self) -> None:
         if os.name != "nt" or not self.root.exists():
             return
-        root_identity = open_identity(self.root)
-        require_within(root_identity, root_identity)
-        for path in (self._runtime, self.root / "offices"):
-            if path.exists():
-                require_within(open_identity(path), root_identity)
+        try:
+            root_identity = open_identity(self.root)
+            require_within(root_identity, root_identity)
+            for path in (self._runtime, self.root / "offices"):
+                if path.exists():
+                    require_within(open_identity(path), root_identity)
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
 
     def _verify_runtime_containment(self) -> None:
         if os.name != "nt":
@@ -196,7 +277,23 @@ class Pool:
         }
         if value != expected:
             raise PoolError("recovery-required")
+        self._generation_registry()
         return value
+
+    def _generation_registry(self) -> dict:
+        try:
+            value = read_json(self._generations_path)
+            generations = value["generations"]
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            raise PoolError("recovery-required") from error
+        if (
+            set(value) != {"schema_version", "generations"}
+            or value["schema_version"] != 1
+            or set(generations) != set(OFFICE_IDS)
+            or any(type(number) is not int or number < 0 for number in generations.values())
+        ):
+            raise PoolError("recovery-required")
+        return generations
 
     @staticmethod
     def _free_state(office_id: str, generation: int) -> dict:
@@ -233,11 +330,15 @@ class Pool:
         return value
 
     def _corrupt_state(self, office_id: str) -> dict:
-        generation = 0
+        generation = self._generation_registry()[office_id]
         try:
             value = read_json(self._state_path(office_id))
-            if type(value.get("generation")) is int and value["generation"] >= 0:
-                generation = value["generation"]
+            if (
+                type(value.get("generation")) is int
+                and value["generation"] >= 0
+                and value["generation"] != generation
+            ):
+                raise PoolError("recovery-required")
         except (OSError, ValueError, json.JSONDecodeError):
             pass
         return self._free_state(office_id, generation) | {
@@ -294,7 +395,6 @@ class Pool:
                 "reason": reason,
             },
         )
-        self._journal_path(journal["operation_id"]).unlink(missing_ok=True)
         raise PoolError("recovery-required")
 
     def _project_record(self, project_root: Path) -> dict:
@@ -341,8 +441,9 @@ class Pool:
         if mode not in MODES:
             raise PoolError("invalid-mode")
         project = self._project_record(project_root)
-        self._ensure_initialized()
+        self._preflight_lock()
         with pool_lock(self._lock_path):
+            self._validate_protected_paths()
             self._ensure_initialized()
             self._reconcile()
             states = {office_id: self._read_state(office_id) for office_id in OFFICE_IDS}
@@ -351,6 +452,8 @@ class Pool:
                 for state in states.values()
             ):
                 raise PoolError("already-claimed")
+            if self._pointer_path(holder).exists():
+                raise PoolError("recovery-required")
             free = []
             for office_id, state in states.items():
                 if state["status"] == "free" and self._unknown_paths(office_id):
@@ -363,7 +466,8 @@ class Pool:
                 raise PoolError("pool-full")
             office_id = free[0]
             before = states[office_id]
-            generation = before["generation"] + 1
+            generations = self._generation_registry()
+            generation = generations[office_id] + 1
             authority_id = secrets.token_hex(32)
             authority = {
                 "schema_version": 1,
@@ -409,6 +513,12 @@ class Pool:
             }
             atomic_write_json(journal_file, journal)
             self._checkpoint("claim:journal-prepared")
+            generations[office_id] = generation
+            atomic_write_json(
+                self._generations_path,
+                {"schema_version": 1, "generations": generations},
+            )
+            self._checkpoint("claim:generation")
             atomic_write_json(self._state_path(office_id), occupied)
             self._checkpoint("claim:office")
             atomic_write_bytes(authority_file, authority_bytes)
@@ -475,11 +585,13 @@ class Pool:
         return path, raw, record, state
 
     def resume(self, receipt_path):
-        self._ensure_initialized()
+        self._preflight_lock()
         with pool_lock(self._lock_path):
+            self._validate_protected_paths()
             self._ensure_initialized()
-            self._reconcile()
             authority, _, record, state = self._authorize(receipt_path)
+            self._reconcile()
+            authority, _, record, state = self._authorize(authority)
             if self._unknown_paths(record["office_id"]):
                 self._mark_recovery(record["office_id"], state, "unknown-residue")
                 raise PoolError("recovery-required")
@@ -503,18 +615,35 @@ class Pool:
             return authority
 
     def release(self, receipt_path) -> None:
-        self._ensure_initialized()
+        self._preflight_lock()
         with pool_lock(self._lock_path):
+            self._validate_protected_paths()
             self._ensure_initialized()
+            authority, _, _, _ = self._authorize(receipt_path)
             self._reconcile()
-            authority, authority_bytes, record, state = self._authorize(receipt_path)
+            authority, authority_bytes, record, state = self._authorize(authority)
             office_id = record["office_id"]
             if self._unknown_paths(office_id):
                 self._mark_recovery(office_id, state, "dirty-release")
                 raise PoolError("recovery-required")
             pointer_file = self._pointer_path(record["holder_digest"])
-            pointer_exists = pointer_file.exists()
-            pointer_bytes = pointer_file.read_bytes() if pointer_exists else b""
+            expected_pointer = {
+                "schema_version": 1,
+                "holder_digest": record["holder_digest"],
+                "office_id": office_id,
+                "generation": record["generation"],
+                "authority_name": authority.name,
+            }
+            if pointer_file.exists():
+                try:
+                    if read_json(pointer_file) != expected_pointer:
+                        raise ValueError("unexpected pointer")
+                except (OSError, ValueError, json.JSONDecodeError):
+                    self._mark_recovery(office_id, state, "corrupt-pointer")
+                    raise PoolError("recovery-required")
+            else:
+                atomic_write_json(pointer_file, expected_pointer)
+            pointer_bytes = pointer_file.read_bytes()
             operation_id = uuid.uuid4().hex
             journal_file = self._journal_path(operation_id)
             journal = {
@@ -528,7 +657,7 @@ class Pool:
                 "authority_name": authority.name,
                 "authority_bytes": _encoded(authority_bytes),
                 "pointer_name": pointer_file.name,
-                "pointer_existed": pointer_exists,
+                "pointer_existed": True,
                 "pointer_bytes": _encoded(pointer_bytes),
             }
             atomic_write_json(journal_file, journal)
@@ -549,16 +678,16 @@ class Pool:
             raise PoolError("invalid-office")
         if type(generation) is not int or generation < 0:
             raise PoolError("stale-generation")
-        try:
-            supplied = Path(key_path).read_bytes()
-        except (OSError, TypeError) as error:
-            raise PoolError("unauthorized") from error
-        self._ensure_initialized()
+        self._preflight_lock()
         with pool_lock(self._lock_path):
+            self._validate_protected_paths()
             self._ensure_initialized()
-            self._reconcile()
             try:
-                digests = read_json(self._runtime / "recovery-authority.json")["digests"]
+                supplied = Path(key_path).read_bytes()
+            except (OSError, TypeError) as error:
+                raise PoolError("unauthorized") from error
+            try:
+                digests = read_json(self._recovery_authority_path)["digests"]
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
                 raise PoolError("recovery-required") from error
             if not secrets.compare_digest(_bytes_digest(supplied), digests.get(office_id, "")):
@@ -568,6 +697,10 @@ class Pool:
                 raise PoolError("stale-generation")
             if state["status"] != "recovery-required":
                 raise PoolError("recovery-not-required")
+            self._reconcile()
+            state = self._read_state(office_id)
+            if state["generation"] != generation or state["status"] != "recovery-required":
+                raise PoolError("recovery-required")
             operation_id = uuid.uuid4().hex
             archive = self._office(office_id) / "history" / f"recovery-g{generation}-{operation_id}"
             moves = []
@@ -580,7 +713,14 @@ class Pool:
                     )
                 )
             for source in self._unknown_paths(office_id):
-                moves.append((source, archive / "residue" / source.name, "residue"))
+                location = "work" if source.parent == self._office(office_id) / "work" else "office"
+                moves.append(
+                    (
+                        source,
+                        archive / "residue" / location / source.name,
+                        "residue",
+                    )
+                )
             authority_name = state.get("authority_name")
             if authority_name:
                 source = self._authorities / authority_name
@@ -646,7 +786,12 @@ class Pool:
                 phase = journal["phase"]
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
                 raise PoolError("recovery-required") from error
-            self._validate_journal(journal_file, journal)
+            try:
+                self._validate_journal(journal_file, journal)
+            except PoolError:
+                if journal.get("office_id") in OFFICE_IDS:
+                    self._quarantine_journal(journal, "invalid-journal")
+                raise
             if kind == "claim":
                 self._reconcile_claim(journal, phase == "committed")
             elif kind == "release":
@@ -706,24 +851,134 @@ class Pool:
                     or any(character not in "0123456789abcdef" for character in holder)
                 ):
                     raise ValueError("invalid protected member name")
-                _decoded(journal["authority_bytes"])
-                _decoded(journal.get("pointer_bytes", ""))
-            except (TypeError, ValueError):
+                authority_bytes = _decoded(journal["authority_bytes"])
+                authority = json.loads(authority_bytes)
+                if not isinstance(authority, dict) or set(authority) != AUTHORITY_FIELDS:
+                    raise ValueError("invalid authority")
+                if (
+                    authority["schema_version"] != 1
+                    or authority["authority_id"] != authority_id
+                    or authority["holder_digest"] != holder
+                    or authority["office_id"] != journal["office_id"]
+                    or type(authority["generation"]) is not int
+                    or authority["generation"] < 1
+                    or authority["mode"] not in MODES
+                    or any(
+                        not isinstance(authority[field], str)
+                        or len(authority[field]) != 64
+                        or any(character not in "0123456789abcdef" for character in authority[field])
+                        for field in ("holder_digest", "task_digest")
+                    )
+                    or not isinstance(authority["project_path"], str)
+                    or type(authority["project_volume"]) is not int
+                    or not isinstance(authority["project_file_id"], str)
+                ):
+                    raise ValueError("incoherent authority")
+                expected_pointer = {
+                    "schema_version": 1,
+                    "holder_digest": authority["holder_digest"],
+                    "office_id": authority["office_id"],
+                    "generation": authority["generation"],
+                    "authority_name": journal["authority_name"],
+                }
+                expected_after = dict(authority)
+                expected_after.pop("authority_id")
+                expected_after["status"] = "occupied"
+                expected_after["authority_name"] = journal["authority_name"]
+                expected_after["authority_digest"] = _bytes_digest(authority_bytes)
+                before = journal["before_state"]
+                after = journal["after_state"]
+                if journal["kind"] == "claim":
+                    registry_generation = self._generation_registry()[journal["office_id"]]
+                    minimum_registry = after["generation"] - (
+                        1 if journal["phase"] == "prepared" else 0
+                    )
+                    if (
+                        not self._valid_state(before, "free")
+                        or before["office_id"] != journal["office_id"]
+                        or after != expected_after
+                        or not self._valid_state(after, "occupied")
+                        or after["generation"] <= before["generation"]
+                        or registry_generation < minimum_registry
+                        or journal["pointer"] != expected_pointer
+                    ):
+                        raise ValueError("illegal claim transition")
+                else:
+                    pointer_bytes = _decoded(journal["pointer_bytes"])
+                    if (
+                        not self._valid_state(before, "occupied")
+                        or before != expected_after
+                        or journal["pointer_existed"] is not True
+                        or json.loads(pointer_bytes) != expected_pointer
+                        or after != self._free_state(journal["office_id"], before["generation"])
+                    ):
+                        raise ValueError("illegal release transition")
+            except (KeyError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                 raise PoolError("recovery-required") from None
         else:
             self._validate_recovery_journal(journal)
 
+    @staticmethod
+    def _valid_state(value, status: str) -> bool:
+        if not isinstance(value, dict) or value.get("status") != status:
+            return False
+        fields = set(value)
+        expected = {
+            "free": FREE_STATE_FIELDS,
+            "occupied": OCCUPIED_STATE_FIELDS,
+            "recovery-required": FREE_STATE_FIELDS | {"reason"},
+        }[status]
+        if status == "recovery-required" and fields == OCCUPIED_STATE_FIELDS | {"reason"}:
+            expected = fields
+        return (
+            fields == expected
+            and value.get("schema_version") == 1
+            and value.get("office_id") in OFFICE_IDS
+            and type(value.get("generation")) is int
+            and value["generation"] >= 0
+        )
+
     def _validate_recovery_journal(self, journal: dict) -> None:
         office_id = journal["office_id"]
-        generation = journal["after_state"].get("generation")
+        before = journal["before_state"]
+        after = journal["after_state"]
+        corrupt_before = (
+            isinstance(before, dict)
+            and before.get("corrupt_state") is True
+            and set(before) == FREE_STATE_FIELDS | {"corrupt_state"}
+            and before.get("status") == "recovery-required"
+        )
+        if not (self._valid_state(before, "recovery-required") or corrupt_before):
+            raise PoolError("recovery-required")
+        generation = before.get("generation")
+        if after != self._free_state(office_id, generation):
+            raise PoolError("recovery-required")
         archive = self._office(office_id) / "history" / (
             f"recovery-g{generation}-{journal['operation_id']}"
         )
-        if Path(journal["archive"]) != archive or not isinstance(journal["moves"], list):
+        evidence = journal.get("evidence")
+        if (
+            Path(journal["archive"]) != archive
+            or not isinstance(journal["moves"], list)
+            or not isinstance(evidence, dict)
+            or set(evidence) != {"schema_version", "office_id", "generation", "entries"}
+            or evidence["schema_version"] != 1
+            or evidence["office_id"] != office_id
+            or evidence["generation"] != generation
+            or not isinstance(evidence["entries"], list)
+        ):
             raise PoolError("recovery-required")
         office = self._office(office_id)
+        kinds = {"state", "residue", "authority", "pointer"}
+        actual_entries = []
+        seen_sources = set()
+        seen_destinations = set()
         for item in journal["moves"]:
-            if not isinstance(item, dict) or set(item) != {"source", "destination", "kind"}:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"source", "destination", "kind"}
+                or item["kind"] not in kinds
+            ):
                 raise PoolError("recovery-required")
             source = Path(item["source"])
             destination = Path(item["destination"])
@@ -732,20 +987,62 @@ class Pool:
             except (OSError, ValueError):
                 raise PoolError("recovery-required") from None
             source_resolved = source.resolve(strict=False)
-            allowed = (
-                source == self._state_path(office_id)
-                or source_resolved.parent in {
-                    (office / "work").resolve(strict=False),
-                    self._authorities.resolve(strict=False),
-                    self._pointers.resolve(strict=False),
-                }
-                or (
-                    source_resolved.parent == office.resolve(strict=False)
-                    and source.name not in {"office-state.json", "work", "history"}
-                )
-            )
-            if not allowed:
+            work = (office / "work").resolve(strict=False)
+            office_resolved = office.resolve(strict=False)
+            source_kind = None
+            expected_destination = None
+            if corrupt_before and source == self._state_path(office_id):
+                source_kind = "state"
+                expected_destination = archive / "unknown-office-state.json"
+            elif before.get("authority_name") and source == (
+                self._authorities / before["authority_name"]
+            ):
+                source_kind = "authority"
+                expected_destination = archive / "authority.json"
+            elif before.get("holder_digest") and source == self._pointer_path(
+                before["holder_digest"]
+            ):
+                source_kind = "pointer"
+                expected_destination = archive / "pointer.json"
+            elif source_resolved.parent == work:
+                source_kind = "residue"
+                expected_destination = archive / "residue" / "work" / source.name
+            elif (
+                source_resolved.parent == office_resolved
+                and source.name not in {"office-state.json", "work", "history"}
+            ):
+                source_kind = "residue"
+                expected_destination = archive / "residue" / "office" / source.name
+            if (
+                source_kind != item["kind"]
+                or destination != expected_destination
+                or source in seen_sources
+                or destination in seen_destinations
+            ):
                 raise PoolError("recovery-required")
+            seen_sources.add(source)
+            seen_destinations.add(destination)
+            candidate = destination if destination.is_file() else source
+            if candidate.is_file():
+                raw = candidate.read_bytes()
+                actual_entries.append(
+                    {"kind": item["kind"], "sha256": _bytes_digest(raw), "size": len(raw)}
+                )
+        for entry in evidence["entries"]:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"kind", "sha256", "size"}
+                or entry["kind"] not in kinds
+                or not isinstance(entry["sha256"], str)
+                or len(entry["sha256"]) != 64
+                or type(entry["size"]) is not int
+                or entry["size"] < 0
+            ):
+                raise PoolError("recovery-required")
+        if sorted(evidence["entries"], key=lambda entry: (entry["kind"], entry["sha256"])) != sorted(
+            actual_entries, key=lambda entry: (entry["kind"], entry["sha256"])
+        ):
+            raise PoolError("recovery-required")
 
     def _reconcile_claim(self, journal: dict, committed: bool) -> None:
         office_id = journal["office_id"]
@@ -800,27 +1097,71 @@ class Pool:
     def _reconcile_recover(self, journal: dict, committed: bool) -> None:
         moves = [(Path(item["source"]), Path(item["destination"])) for item in journal["moves"]]
         archive = Path(journal["archive"])
+        evidence_path = archive / "recovery.json"
+        expected_evidence = (
+            json.dumps(journal["evidence"], sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if evidence_path.exists() and evidence_path.read_bytes() != expected_evidence:
+            self._quarantine_journal(journal, "unknown-recovery-evidence")
+        if archive.exists():
+            destinations = [destination.resolve(strict=False) for _, destination in moves]
+            for path in archive.rglob("*"):
+                if path == evidence_path:
+                    continue
+                resolved = path.resolve(strict=False)
+                if not any(
+                    resolved == destination
+                    or destination in resolved.parents
+                    or resolved in destination.parents
+                    for destination in destinations
+                ):
+                    self._quarantine_journal(journal, "unknown-recovery-archive")
         if committed:
             for source, destination in moves:
-                if source.exists() and not destination.exists():
+                if source.exists() and destination.exists():
+                    self._quarantine_journal(journal, "recovery-move-collision")
+                if source.exists():
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(source, destination)
+                elif not destination.exists():
+                    self._quarantine_journal(journal, "missing-recovery-bytes")
             archive.mkdir(parents=True, exist_ok=True)
             atomic_write_json(archive / "recovery.json", journal["evidence"])
             atomic_write_json(self._state_path(journal["office_id"]), journal["after_state"])
             self._marker_path(journal["office_id"]).unlink(missing_ok=True)
         else:
             for source, destination in reversed(moves):
-                if destination.exists() and not source.exists():
+                if destination.exists() and source.exists():
+                    if source == self._state_path(journal["office_id"]):
+                        try:
+                            if read_json(source) != journal["after_state"]:
+                                raise ValueError("unknown replacement state")
+                        except (OSError, ValueError, json.JSONDecodeError):
+                            self._quarantine_journal(journal, "recovery-move-collision")
+                        source.unlink()
+                    else:
+                        self._quarantine_journal(journal, "recovery-move-collision")
+                if destination.exists():
                     source.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(destination, source)
-            shutil.rmtree(archive, ignore_errors=True)
+                elif not source.exists():
+                    self._quarantine_journal(journal, "missing-recovery-bytes")
+            evidence_path.unlink(missing_ok=True)
+            if archive.exists():
+                for directory in sorted(
+                    (path for path in archive.rglob("*") if path.is_dir()),
+                    key=lambda path: len(path.parts),
+                    reverse=True,
+                ):
+                    directory.rmdir()
+                archive.rmdir()
             if not journal["before_state"].get("corrupt_state"):
                 atomic_write_json(self._state_path(journal["office_id"]), journal["before_state"])
 
     def public_status(self) -> dict:
-        self._ensure_initialized()
+        self._preflight_lock()
         with pool_lock(self._lock_path):
+            self._validate_protected_paths()
             self._ensure_initialized()
             offices = []
             for office_id in OFFICE_IDS:

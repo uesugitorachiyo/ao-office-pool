@@ -1,5 +1,7 @@
+import errno
 import json
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -51,7 +53,14 @@ def pool_lock(path: Path):
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
         else:
             import fcntl
 

@@ -3,7 +3,6 @@
   "title": "Private office lifecycle state",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "office_id", "generation", "status"],
   "properties": {
     "schema_version": {"const": 1},
     "office_id": {"enum": ["O1", "O2", "O3", "O4", "O5"]},
@@ -18,5 +17,31 @@
     "authority_name": {"type": "string", "minLength": 1},
     "authority_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "reason": {"type": "string", "minLength": 1}
-  }
+  },
+  "oneOf": [
+    {
+      "properties": {"status": {"const": "free"}},
+      "required": ["schema_version", "office_id", "generation", "status"],
+      "minProperties": 4,
+      "maxProperties": 4
+    },
+    {
+      "properties": {"status": {"const": "occupied"}},
+      "required": ["schema_version", "office_id", "generation", "status", "holder_digest", "task_digest", "project_path", "project_volume", "project_file_id", "mode", "authority_name", "authority_digest"],
+      "minProperties": 12,
+      "maxProperties": 12
+    },
+    {
+      "properties": {"status": {"const": "recovery-required"}},
+      "required": ["schema_version", "office_id", "generation", "status", "reason"],
+      "minProperties": 5,
+      "maxProperties": 5
+    },
+    {
+      "properties": {"status": {"const": "recovery-required"}},
+      "required": ["schema_version", "office_id", "generation", "status", "holder_digest", "task_digest", "project_path", "project_volume", "project_file_id", "mode", "authority_name", "authority_digest", "reason"],
+      "minProperties": 13,
+      "maxProperties": 13
+    }
+  ]
 }

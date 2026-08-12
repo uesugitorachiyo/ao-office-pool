@@ -154,6 +154,26 @@ class PoolTests(unittest.TestCase):
         self.assertNotIn("wrong", text)
         self.assertNotIn("holder-a", text)
 
+    def test_recovery_preserves_same_named_residue_from_distinct_locations(self):
+        # MUTATION: flattening recovery residue paths overwrites one same-named source.
+        authority = self.pool.claim("holder-a", "task-a", self.project, "pinned")
+        work_copy = self.root / "offices" / "O1" / "work" / "duplicate.bin"
+        office_copy = self.root / "offices" / "O1" / "duplicate.bin"
+        work_copy.write_bytes(b"work-copy")
+        office_copy.write_bytes(b"office-copy")
+        with self.assertRaises(PoolError):
+            self.pool.release(authority)
+        self.pool.recover(
+            self.root / "operator-secrets" / "recovery-key-O1", "O1", 1
+        )
+        preserved = sorted(
+            path.read_bytes()
+            for path in (self.root / "offices" / "O1" / "history").rglob(
+                "duplicate.bin"
+            )
+        )
+        self.assertEqual(preserved, [b"office-copy", b"work-copy"])
+
     def test_runtime_version_is_contained(self):
         # MUTATION: joining an unchecked version segment escapes the runtime root.
         bad_root = self.base / "bad-pool"
@@ -171,6 +191,157 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "already-claimed")
         self.assertEqual(pointer.read_bytes(), b"not json\x00")
         self.assertTrue(authority.exists())
+
+    def test_unowned_pointer_bytes_stop_claim_before_overwrite(self):
+        # MUTATION: deterministic pointer creation overwrites unowned residue.
+        holder = hashlib.sha256(b"holder-a").hexdigest()
+        pointer = self.root / "runtime" / "pointers" / f"{holder}.json"
+        pointer.write_bytes(b"unknown-pointer\x00")
+        before = self._snapshot()
+        with self.assertRaises(PoolError) as raised:
+            self.pool.claim("holder-a", "task-a", self.project, "pinned")
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(self._snapshot(), before)
+
+    def test_release_preserves_unexpected_pointer_bytes(self):
+        # MUTATION: release journals and deletes arbitrary pointer bytes.
+        authority = self.pool.claim("holder-a", "task-a", self.project, "pinned")
+        pointer = next((self.root / "runtime" / "pointers").iterdir())
+        pointer.write_bytes(b"foreign-pointer\x00")
+        with self.assertRaises(PoolError) as raised:
+            self.pool.release(authority)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(pointer.read_bytes(), b"foreign-pointer\x00")
+        self.assertTrue(authority.exists())
+
+    def test_initialize_preserves_existing_recovery_authority(self):
+        # MUTATION: initialization overwrites an unknown recovery authority record.
+        root = self.base / "partial"
+        record = root / "runtime" / "recovery-authority.json"
+        record.parent.mkdir(parents=True)
+        record.write_bytes(b"unknown-authority\x00")
+        with self.assertRaises(PoolError) as raised:
+            Pool(root).initialize()
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(record.read_bytes(), b"unknown-authority\x00")
+
+    def test_initialize_revalidates_partial_protected_paths_before_mutation(self):
+        # MUTATION: partial initialization follows protected redirects before final validation.
+        cases = (
+            ("runtime", True),
+            ("offices", True),
+            ("operator-secrets", True),
+            ("runtime/recovery-authority.json", False),
+        )
+        for number, (relative, is_directory) in enumerate(cases):
+            with self.subTest(path=relative):
+                root = self.base / f"partial-redirect-{number}"
+                root.mkdir()
+                protected = root / relative
+                protected.parent.mkdir(parents=True, exist_ok=True)
+                outside = self.base / f"partial-outside-{number}"
+                if is_directory:
+                    outside.mkdir()
+                    before = []
+                else:
+                    outside.write_bytes(b"outside-original")
+                    before = b"outside-original"
+                try:
+                    protected.symlink_to(outside, target_is_directory=is_directory)
+                except OSError as error:
+                    self.skipTest(str(error))
+
+                with self.assertRaises(PoolError) as raised:
+                    Pool(root).initialize()
+                self.assertEqual(raised.exception.code, "recovery-required")
+                if is_directory:
+                    self.assertEqual(list(outside.iterdir()), before)
+                else:
+                    self.assertEqual(outside.read_bytes(), before)
+
+    def test_every_protected_path_is_revalidated_before_mutation(self):
+        # MUTATION: omitting any protected member follows its redirected bytes.
+        static_paths = (
+            ("runtime", True),
+            ("runtime/receipts", True),
+            ("runtime/pointers", True),
+            ("runtime/transactions", True),
+            ("runtime/recovery", True),
+            ("offices", True),
+            ("offices/O1", True),
+            ("offices/O1/work", True),
+            ("offices/O1/history", True),
+            ("operator-secrets", True),
+            ("pool.json", False),
+            ("runtime/generations.json", False),
+            ("runtime/recovery-authority.json", False),
+            ("operator-secrets/recovery-key-O1", False),
+            ("offices/O1/office-state.json", False),
+        )
+        generated_paths = (
+            "runtime/receipts/generated.receipt.json",
+            "runtime/pointers/generated.json",
+            "runtime/transactions/generated.bin",
+            "runtime/recovery/generated.json",
+            "offices/O1/work/generated.bin",
+            "offices/O1/history/generated.bin",
+        )
+        cases = static_paths + tuple((path, False) for path in generated_paths)
+
+        for number, (relative, is_directory) in enumerate(cases):
+            with self.subTest(path=relative):
+                root = self.base / f"redirected-{number}"
+                pool = Pool(root)
+                pool.initialize()
+                protected = root / relative
+                if relative in generated_paths or not protected.exists():
+                    protected.write_bytes(b"protected-original")
+                outside = self.base / f"outside-{number}"
+                protected.rename(outside)
+                if is_directory:
+                    expected = {
+                        path.relative_to(outside).as_posix(): path.read_bytes()
+                        for path in outside.rglob("*")
+                        if path.is_file()
+                    }
+                else:
+                    expected = outside.read_bytes()
+                try:
+                    protected.symlink_to(outside, target_is_directory=is_directory)
+                except OSError as error:
+                    self.skipTest(str(error))
+                with self.assertRaises(PoolError) as raised:
+                    pool.claim(f"holder-{number}", f"task-{number}", self.project, "pinned")
+                self.assertEqual(raised.exception.code, "recovery-required")
+                if is_directory:
+                    actual = {
+                        path.relative_to(outside).as_posix(): path.read_bytes()
+                        for path in outside.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(actual, expected)
+                else:
+                    self.assertEqual(outside.read_bytes(), expected)
+
+    def test_swapped_lock_path_stops_before_state_mutation(self):
+        # MUTATION: opening an unchecked lock symlink locks an unrelated file.
+        root = self.base / "lock-redirect"
+        pool = Pool(root)
+        pool.initialize()
+        outside = self.base / "outside.lock"
+        outside.write_bytes(b"outside-lock")
+        lock = root / ".pool.lock"
+        lock.unlink()
+        try:
+            lock.symlink_to(outside)
+        except OSError as error:
+            self.skipTest(str(error))
+        before = self._snapshot()
+        with self.assertRaises(PoolError) as raised:
+            pool.claim("holder", "task", self.project, "pinned")
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(outside.read_bytes(), b"outside-lock")
 
     def test_claim_hides_owner_key(self):
         # MUTATION: returning protected holder material alongside the authority path.
@@ -239,8 +410,53 @@ class PoolTests(unittest.TestCase):
                 schema = json.loads(schema_root.joinpath(name).read_text(encoding="utf-8"))
                 value = json.loads(artifact.read_text(encoding="utf-8"))
                 self.assertFalse(schema["additionalProperties"])
-                self.assertLessEqual(set(schema["required"]), set(value))
                 self.assertLessEqual(set(value), set(schema["properties"]))
+                if "required" in schema:
+                    self.assertLessEqual(set(schema["required"]), set(value))
+                else:
+                    self.assertTrue(any(set(value) == set(branch["required"]) for branch in schema["oneOf"]))
+
+    def test_office_schema_has_exact_status_specific_shapes(self):
+        # MUTATION: a flat schema accepts free/occupied field combinations.
+        schema = json.loads(
+            (Path(__file__).parents[1] / "schemas" / "office-state.schema.json").read_text()
+        )
+        branches = schema["oneOf"]
+
+        def accepts(value):
+            matches = 0
+            for branch in branches:
+                required = set(branch["required"])
+                status = branch["properties"]["status"]["const"]
+                if (
+                    value.get("status") == status
+                    and set(value) == required
+                    and branch["minProperties"] == branch["maxProperties"] == len(value)
+                ):
+                    matches += 1
+            return matches == 1
+
+        free = {"schema_version": 1, "office_id": "O1", "generation": 0, "status": "free"}
+        occupied = {
+            "schema_version": 1,
+            "office_id": "O1",
+            "generation": 1,
+            "status": "occupied",
+            "holder_digest": "0" * 64,
+            "task_digest": "1" * 64,
+            "project_path": "/project",
+            "project_volume": 1,
+            "project_file_id": "2",
+            "mode": "pinned",
+            "authority_name": "a.receipt.json",
+            "authority_digest": "3" * 64,
+        }
+        self.assertTrue(accepts(free))
+        self.assertTrue(accepts(occupied))
+        self.assertFalse(accepts(free | {"holder_digest": "0" * 64}))
+        invalid_occupied = dict(occupied)
+        invalid_occupied.pop("authority_name")
+        self.assertFalse(accepts(invalid_occupied))
 
 
 if __name__ == "__main__":
