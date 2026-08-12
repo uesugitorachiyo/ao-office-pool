@@ -121,6 +121,17 @@ class MissionBridgeTests(unittest.TestCase):
         else:
             link.symlink_to(target, target_is_directory=True)
 
+    def _swap_directory(self, directory, outside):
+        parked = directory.with_name(directory.name + "-parked")
+        try:
+            os.replace(directory, parked)
+        except OSError:
+            if os.name != "nt":
+                raise
+            return None
+        self._link_directory(directory, outside)
+        return parked
+
     def test_starts_verified_mission_with_argument_array_and_project_owned_state(self):
         # MUTATION: shell=True would interpret the punctuation in the objective.
         before = {path.relative_to(self.project) for path in self.project.rglob("*")}
@@ -169,6 +180,57 @@ class MissionBridgeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "mission-storage-unsafe")
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_record_write_retains_validated_storage_directory(self):
+        # MUTATION: returning a checked path lets office-pool swap before record/HMAC writes.
+        outside = self.base / "outside-record"
+        outside.mkdir()
+        real_private_file = mission_bridge._private_file
+        parked = []
+
+        def swap_after_open(project, directories, name):
+            result = real_private_file(project, directories, name)
+            if not parked:
+                parked.append(
+                    self._swap_directory(project.joinpath(*directories), outside)
+                )
+            return result
+
+        with mock.patch.object(mission_bridge, "_private_file", swap_after_open):
+            try:
+                readback = start_or_resume(self.claim_path, self.task_text)
+            except MissionBridgeError:
+                readback = None
+        self.assertEqual(list(outside.iterdir()), [])
+        if readback is not None:
+            self.assertEqual(readback.mission_id, "mission-0123456789abcdef")
+        if os.name != "nt":
+            self.assertIsNotNone(parked[0])
+
+    def test_mission_home_retains_validated_directory_through_launch(self):
+        # MUTATION: passing the checked Mission home pathname follows a swap at launch.
+        outside = self.base / "outside-home"
+        outside.mkdir()
+        real_run = mission_bridge._run
+        parked = []
+
+        def swap_before_launch(*arguments, **keywords):
+            if not parked:
+                parked.append(
+                    self._swap_directory(self.project / ".ao/mission", outside)
+                )
+            return real_run(*arguments, **keywords)
+
+        with mock.patch.object(mission_bridge, "_run", swap_before_launch):
+            try:
+                readback = start_or_resume(self.claim_path, self.task_text)
+            except MissionBridgeError:
+                readback = None
+        self.assertEqual(list(outside.iterdir()), [])
+        if readback is not None:
+            self.assertEqual(readback.mission_id, "mission-0123456789abcdef")
+        if os.name != "nt":
+            self.assertIsNotNone(parked[0])
+
     def test_verified_open_executable_survives_path_substitution(self):
         # MUTATION: hashing then reopening the executable launches substituted bytes.
         malicious = FAKE.replace(
@@ -187,6 +249,29 @@ class MissionBridgeTests(unittest.TestCase):
                 verified,
             )
         self.assertEqual(value["mission_id"], "mission-0123456789abcdef")
+
+    @unittest.skipIf(os.name == "nt", "descriptor execution is POSIX-specific")
+    def test_launch_uses_verified_descriptor_after_private_copy_substitution(self):
+        # MUTATION: executing the verified copy pathname reopens attacker replacement bytes.
+        malicious = FAKE.replace(
+            'mission_id = "mission-0123456789abcdef"',
+            'mission_id = "mission-fedcba9876543210"',
+        )
+        with mission_bridge._open_verified_executable() as verified:
+            replacement = verified.path.with_name("replacement-verified-copy")
+            replacement.write_text(malicious, encoding="utf-8")
+            replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
+            os.replace(replacement, verified.path)
+            try:
+                value = mission_bridge._run(
+                    ["--home", str(self.project / ".ao/mission"), "start", self.task_text],
+                    self.project,
+                    verified,
+                )
+            except MissionBridgeError as error:
+                self.assertEqual(error.code, "mission-launch-failed")
+            else:
+                self.assertEqual(value["mission_id"], "mission-0123456789abcdef")
 
     def test_same_receipt_and_objective_resume_exact_mission(self):
         # MUTATION: always starting creates duplicate Mission records for one task.

@@ -8,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,90 @@ class _VerifiedExecutable:
     path: Path
     descriptors: tuple[int, ...]
     temporary: tempfile.TemporaryDirectory | None = None
+
+    @property
+    def launch_path(self) -> str:
+        if os.name != "nt" and Path("/proc/self/fd").is_dir():
+            return f"/proc/self/fd/{self.descriptors[-1]}"
+        return str(self.path)
+
+
+@dataclass
+class _PrivateDirectory:
+    path: Path
+    project_path: Path
+    descriptors: tuple[int, ...] = ()
+    handles: tuple[object, ...] = ()
+
+    @property
+    def directory_descriptor(self) -> int | None:
+        return self.descriptors[-1] if self.descriptors else None
+
+    @property
+    def launch_path(self) -> str:
+        if self.directory_descriptor is not None and Path("/proc/self/fd").is_dir():
+            return f"/proc/self/fd/{self.directory_descriptor}"
+        return str(self.path)
+
+    @property
+    def project_launch_path(self) -> str:
+        if self.descriptors and Path("/proc/self/fd").is_dir():
+            return f"/proc/self/fd/{self.descriptors[0]}"
+        return str(self.project_path)
+
+    def require_current_paths(self) -> None:
+        if self.descriptors:
+            current = self.project_path
+            parts = (None, *self.path.relative_to(self.project_path).parts)
+            for descriptor, part in zip(self.descriptors, parts):
+                if part is not None:
+                    current = current / part
+                information = os.stat(current, follow_symlinks=False)
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(information.st_mode)
+                    or information.st_dev != opened.st_dev
+                    or information.st_ino != opened.st_ino
+                ):
+                    raise MissionBridgeError("mission-storage-unsafe")
+        else:
+            for path in (self.project_path, self.path):
+                _validate_private_path(path, self.project_path, directory=True)
+
+    def close(self) -> None:
+        for descriptor in reversed(self.descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if self.handles:
+            from internal.windows_identity import _kernel32
+
+            library = _kernel32()
+            for handle in reversed(self.handles):
+                library.CloseHandle(handle)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+@dataclass
+class _PrivateFile:
+    path: Path
+    directory: _PrivateDirectory
+    name: str
+
+    def close(self) -> None:
+        self.directory.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 def _digest(value: bytes) -> str:
@@ -185,54 +270,275 @@ def _validate_private_path(path: Path, project: Path, *, directory: bool) -> Non
         raise ValueError("private path escaped project")
 
 
-def _private_directory(project: Path, *parts: str) -> Path:
+def _open_windows_directory(path: Path):
+    from internal.windows_identity import (
+        _BY_HANDLE_FILE_INFORMATION,
+        _FILE_ATTRIBUTE_DIRECTORY,
+        _FILE_ATTRIBUTE_REPARSE_POINT,
+        _FILE_SHARE_READ,
+        _FILE_SHARE_WRITE,
+        _INVALID_HANDLE_VALUE,
+        _final_path,
+        _kernel32,
+        _native_path,
+    )
+    from internal.windows_paths import canonical_windows_path
+
+    library = _kernel32()
+    canonical = canonical_windows_path(str(path))
+    handle = library.CreateFileW(
+        _native_path(canonical),
+        0x80000000,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    information = _BY_HANDLE_FILE_INFORMATION()
+    if not library.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        library.CloseHandle(handle)
+        raise ctypes.WinError(ctypes.get_last_error())
+    if (
+        not information.file_attributes & _FILE_ATTRIBUTE_DIRECTORY
+        or information.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+        or _final_path(library, handle) != canonical
+    ):
+        library.CloseHandle(handle)
+        raise ValueError("unsafe private directory")
+    return handle
+
+
+def _private_directory(project: Path, *parts: str) -> _PrivateDirectory:
+    descriptors = []
+    handles = []
     try:
         _project_identity(project)
-        current = project
         for part in parts:
-            if not isinstance(part, str) or not part or part in {".", ".."} or "/" in part or "\\" in part:
+            if (
+                not isinstance(part, str)
+                or not part
+                or part in {".", ".."}
+                or "/" in part
+                or "\\" in part
+            ):
                 raise ValueError("unsafe private segment")
-            current = current / part
+        current = project
+        if os.name == "nt":
+            handles.append(_open_windows_directory(current))
+            for part in parts:
+                current = current / part
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    pass
+                handles.append(_open_windows_directory(current))
+            return _PrivateDirectory(current, project, handles=tuple(handles))
+
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(project, flags)
+        descriptors.append(descriptor)
+        information = os.fstat(descriptor)
+        if not stat.S_ISDIR(information.st_mode):
+            raise ValueError("unsafe project")
+        for part in parts:
             try:
-                current.mkdir()
+                os.mkdir(part, dir_fd=descriptor)
             except FileExistsError:
                 pass
-            _validate_private_path(current, project, directory=True)
-        return current
+            child = os.open(part, flags, dir_fd=descriptor)
+            descriptors.append(child)
+            information = os.fstat(child)
+            if not stat.S_ISDIR(information.st_mode):
+                raise ValueError("unsafe private directory")
+            descriptor = child
+            current = current / part
+        return _PrivateDirectory(current, project, descriptors=tuple(descriptors))
+    except (OSError, TypeError, ValueError) as error:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if handles:
+            from internal.windows_identity import _kernel32
+
+            library = _kernel32()
+            for handle in reversed(handles):
+                library.CloseHandle(handle)
+        raise MissionBridgeError("mission-storage-unsafe") from error
+
+
+def _private_file(
+    project: Path, directories: tuple[str, ...], name: str
+) -> _PrivateFile:
+    if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+        raise MissionBridgeError("mission-storage-unsafe")
+    parent = _private_directory(project, *directories)
+    path = parent.path / name
+    return _PrivateFile(path, parent, name)
+
+
+def _private_exists(path: _PrivateFile) -> bool:
+    try:
+        if path.directory.directory_descriptor is not None:
+            information = os.stat(
+                path.name,
+                dir_fd=path.directory.directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(information.st_mode) or information.st_nlink != 1:
+                raise ValueError("unsafe private file")
+            return True
+        if not path.path.exists() and not path.path.is_symlink():
+            return False
+        _validate_private_path(path.path, path.directory.project_path, directory=False)
+        return True
+    except FileNotFoundError:
+        return False
     except (OSError, TypeError, ValueError) as error:
         raise MissionBridgeError("mission-storage-unsafe") from error
 
 
-def _private_file(project: Path, directories: tuple[str, ...], name: str) -> Path:
-    if not isinstance(name, str) or not name or "/" in name or "\\" in name:
-        raise MissionBridgeError("mission-storage-unsafe")
-    parent = _private_directory(project, *directories)
-    path = parent / name
-    if path.exists() or path.is_symlink():
+def _private_sibling(path: _PrivateFile, suffix: str) -> _PrivateFile:
+    name = Path(path.name).with_suffix(suffix).name
+    return _PrivateFile(path.path.with_suffix(suffix), path.directory, name)
+
+
+def _write_private_bytes(path: _PrivateFile, data: bytes) -> None:
+    descriptor = path.directory.directory_descriptor
+    if descriptor is None:
+        atomic_write_bytes(path.path, data)
+        _validate_private_path(
+            path.path, path.directory.project_path, directory=False
+        )
+        return
+    temporary = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    opened = None
+    try:
+        opened = os.open(temporary, flags, 0o600, dir_fd=descriptor)
+        view = memoryview(data)
+        while view:
+            written = os.write(opened, view)
+            view = view[written:]
+        os.fsync(opened)
+        os.close(opened)
+        opened = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+        )
+        os.fsync(descriptor)
+    finally:
+        if opened is not None:
+            os.close(opened)
         try:
-            _validate_private_path(path, project, directory=False)
-        except (OSError, TypeError, ValueError) as error:
-            raise MissionBridgeError("mission-storage-unsafe") from error
-    return path
+            os.unlink(temporary, dir_fd=descriptor)
+        except FileNotFoundError:
+            pass
 
 
-def _write_authenticated(path: Path, value: dict, key: bytes, schema: Path) -> None:
+def _read_private_bytes(path: _PrivateFile) -> bytes:
+    descriptor = path.directory.directory_descriptor
+    if descriptor is None:
+        if os.name != "nt":
+            raise ValueError("private directory descriptor required")
+        import msvcrt
+
+        from internal.windows_identity import (
+            _BY_HANDLE_FILE_INFORMATION,
+            _FILE_ATTRIBUTE_DIRECTORY,
+            _FILE_ATTRIBUTE_REPARSE_POINT,
+            _FILE_SHARE_READ,
+            _INVALID_HANDLE_VALUE,
+            _final_path,
+            _kernel32,
+            _native_path,
+        )
+        from internal.windows_paths import canonical_windows_path
+
+        library = _kernel32()
+        canonical = canonical_windows_path(str(path.path))
+        handle = library.CreateFileW(
+            _native_path(canonical),
+            0x80000000,
+            _FILE_SHARE_READ,
+            None,
+            3,
+            0x00200000,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            information = _BY_HANDLE_FILE_INFORMATION()
+            if not library.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if (
+                information.file_attributes
+                & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT)
+                or information.number_of_links != 1
+                or _final_path(library, handle) != canonical
+            ):
+                raise ValueError("unsafe private file")
+            opened = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+            handle = None
+            try:
+                chunks = []
+                while True:
+                    chunk = os.read(opened, 64 * 1024)
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+            finally:
+                os.close(opened)
+        finally:
+            if handle is not None:
+                library.CloseHandle(handle)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    opened = os.open(path.name, flags, dir_fd=descriptor)
+    try:
+        information = os.fstat(opened)
+        if not stat.S_ISREG(information.st_mode) or information.st_nlink != 1:
+            raise ValueError("unsafe private file")
+        chunks = []
+        while True:
+            chunk = os.read(opened, 64 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(opened)
+
+
+def _write_authenticated(
+    path: _PrivateFile, value: dict, key: bytes, schema: Path
+) -> None:
     _validate_schema(value, schema)
     raw = _canonical_bytes(value)
     tag = hmac.new(key, raw, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
-    atomic_write_bytes(path, raw)
-    atomic_write_bytes(path.with_suffix(".hmac"), tag)
-    _validate_private_path(path, Path(value["project_path"]), directory=False)
-    _validate_private_path(path.with_suffix(".hmac"), Path(value["project_path"]), directory=False)
+    _write_private_bytes(path, raw)
+    _write_private_bytes(_private_sibling(path, ".hmac"), tag)
 
 
-def _read_authenticated(path: Path, key: bytes, schema: Path, project: Path) -> dict:
-    seal = path.with_suffix(".hmac")
+def _read_authenticated(
+    path: _PrivateFile, key: bytes, schema: Path, project: Path
+) -> dict:
+    seal = _private_sibling(path, ".hmac")
     try:
-        _validate_private_path(path, project, directory=False)
-        _validate_private_path(seal, project, directory=False)
-        raw = path.read_bytes()
-        supplied = seal.read_text(encoding="ascii")
+        raw = _read_private_bytes(path)
+        supplied = _read_private_bytes(seal).decode("ascii")
         expected = hmac.new(key, raw, hashlib.sha256).hexdigest() + "\n"
         if not hmac.compare_digest(supplied, expected):
             raise ValueError("authentication mismatch")
@@ -370,15 +676,36 @@ def _open_verified_executable():
 
 
 def _run(
-    arguments: list[str], project: Path, executable: _VerifiedExecutable
+    arguments: list[str],
+    project: Path | _PrivateDirectory,
+    executable: _VerifiedExecutable,
 ) -> dict:
+    launch_path = executable.launch_path
+    if isinstance(project, _PrivateDirectory):
+        project.require_current_paths()
+        cwd = project.project_launch_path
+        private_descriptors = project.descriptors
+    else:
+        cwd = project
+        private_descriptors = ()
+    options = {}
+    if os.name != "nt":
+        if not launch_path.startswith("/proc/self/fd/"):
+            source = os.fstat(executable.descriptors[-1])
+            current = executable.path.stat()
+            if source.st_dev != current.st_dev or source.st_ino != current.st_ino:
+                raise MissionBridgeError("mission-launch-failed")
+        options["pass_fds"] = tuple(
+            dict.fromkeys((*executable.descriptors, *private_descriptors))
+        )
     try:
         process = subprocess.Popen(
-            [str(executable.path), *arguments],
-            cwd=project,
+            [launch_path, *arguments],
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **options,
         )
     except OSError as error:
         raise MissionBridgeError("mission-launch-failed") from error
@@ -447,7 +774,7 @@ def _run(
 
 def _record_paths(
     authority: dict, authority_raw: bytes, project: Path, objective: str
-) -> tuple[Path, Path]:
+) -> tuple[_PrivateFile, _PrivateFile]:
     identity = _canonical_bytes(
         {
             "authority_id": authority["authority_id"],
@@ -456,9 +783,11 @@ def _record_paths(
             "objective_digest": _digest(objective.encode("utf-8")),
         }
     )
-    name = hmac.new(authority_raw, b"mission-record\0" + identity, hashlib.sha256).hexdigest()
+    name = hmac.new(
+        authority_raw, b"mission-record\0" + identity, hashlib.sha256
+    ).hexdigest()
     record = _private_file(project, (".ao", "mission", "office-pool"), name + ".json")
-    return record, record.with_suffix(".hmac")
+    return record, _private_sibling(record, ".hmac")
 
 
 def _expected_record(authority: dict, authority_raw: bytes, readback: dict) -> dict:
@@ -477,24 +806,36 @@ def _expected_record(authority: dict, authority_raw: bytes, readback: dict) -> d
 
 
 def _load_record(
-    authority: dict, authority_raw: bytes, project: Path, objective: str
-) -> tuple[dict, Path]:
-    record, seal = _record_paths(authority, authority_raw, project, objective)
-    if not record.exists() or not seal.exists():
-        raise MissionBridgeError("mission-record-mismatch")
-    wrapper = _read_authenticated(record, authority_raw, MISSION_SCHEMA, project)
-    expected = {
-        "objective_digest": "sha256:" + authority["task_digest"],
-        "authority_digest": _digest(authority_raw),
-        "chat_digest": authority["holder_digest"],
-        "task_digest": authority["task_digest"],
-        "office_id": authority["office_id"],
-        "generation": authority["generation"],
-        "project_path": authority["project_path"],
-    }
-    if any(wrapper.get(field) != value for field, value in expected.items()):
-        raise MissionBridgeError("mission-record-mismatch")
-    return wrapper, record
+    authority: dict,
+    authority_raw: bytes,
+    project: Path,
+    objective: str,
+    record: _PrivateFile | None = None,
+) -> tuple[dict, _PrivateFile]:
+    owned = record is None
+    if record is None:
+        record, seal = _record_paths(authority, authority_raw, project, objective)
+    else:
+        seal = _private_sibling(record, ".hmac")
+    try:
+        if not _private_exists(record) or not _private_exists(seal):
+            raise MissionBridgeError("mission-record-mismatch")
+        wrapper = _read_authenticated(record, authority_raw, MISSION_SCHEMA, project)
+        expected = {
+            "objective_digest": "sha256:" + authority["task_digest"],
+            "authority_digest": _digest(authority_raw),
+            "chat_digest": authority["holder_digest"],
+            "task_digest": authority["task_digest"],
+            "office_id": authority["office_id"],
+            "generation": authority["generation"],
+            "project_path": authority["project_path"],
+        }
+        if any(wrapper.get(field) != value for field, value in expected.items()):
+            raise MissionBridgeError("mission-record-mismatch")
+        return wrapper, record
+    finally:
+        if owned:
+            record.close()
 
 
 def _load_authenticated_record(receipt: Path, objective: str) -> tuple[dict, dict, bytes, Path]:
@@ -505,32 +846,40 @@ def _load_authenticated_record(receipt: Path, objective: str) -> tuple[dict, dic
 
 def start_or_resume(receipt: Path, objective: str) -> MissionReadback:
     authority, authority_raw, project = _authority(receipt, objective)
-    with _open_verified_executable() as executable:
-        record, seal = _record_paths(authority, authority_raw, project, objective)
-        resumed = record.exists() or seal.exists()
+    with _open_verified_executable() as executable, _private_directory(
+        project, ".ao", "mission"
+    ) as mission_home, _record_paths(
+        authority, authority_raw, project, objective
+    )[0] as record:
+        seal = _private_sibling(record, ".hmac")
+        record_exists = _private_exists(record)
+        seal_exists = _private_exists(seal)
+        resumed = record_exists or seal_exists
         if resumed:
-            if not record.exists() or not seal.exists():
+            if not record_exists or not seal_exists:
                 raise MissionBridgeError("mission-record-mismatch")
-            wrapper, _ = _load_record(authority, authority_raw, project, objective)
+            wrapper, _ = _load_record(
+                authority, authority_raw, project, objective, record
+            )
             readback = _run(
                 [
                     "--home",
-                    str(project / ".ao/mission"),
+                    mission_home.launch_path,
                     "mission",
                     "inspect",
                     "--mission",
                     wrapper["mission_id"],
                     "--json",
                 ],
-                project,
+                mission_home,
                 executable,
             )
             if readback["mission_id"] != wrapper["mission_id"]:
                 raise MissionBridgeError("mission-record-mismatch")
         else:
             readback = _run(
-                ["--home", str(project / ".ao/mission"), "start", objective],
-                project,
+                ["--home", mission_home.launch_path, "start", objective],
+                mission_home,
                 executable,
             )
         wrapper = _expected_record(authority, authority_raw, readback)
@@ -540,11 +889,12 @@ def start_or_resume(receipt: Path, objective: str) -> MissionReadback:
             _write_authenticated(record, wrapper, authority_raw, MISSION_SCHEMA)
         except (OSError, TypeError, ValueError) as error:
             raise MissionBridgeError("mission-record-mismatch") from error
+        record_path = record.path
     return MissionReadback(
         mission_id=readback["mission_id"],
         objective_digest=readback["objective_digest"],
         status=readback["status"],
         current_route=readback["current_route"],
-        record=record,
+        record=record_path,
         resumed=resumed,
     )

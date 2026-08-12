@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import internal.conversation_lifecycle as conversation_lifecycle
 from internal.conversation_lifecycle import (
     ConversationError,
     ConversationEvent,
@@ -95,6 +96,17 @@ class ConversationLifecycleTests(unittest.TestCase):
             )
         else:
             link.symlink_to(target, target_is_directory=True)
+
+    def _swap_directory(self, directory, outside):
+        parked = directory.with_name(directory.name + "-parked")
+        try:
+            os.replace(directory, parked)
+        except OSError:
+            if os.name != "nt":
+                raise
+            return None
+        self._link_directory(directory, outside)
+        return parked
 
     def _state(self, mode="conversation"):
         claim_path = self.pool.claim(self.chat, self.task, self.project, mode)
@@ -218,6 +230,35 @@ class ConversationLifecycleTests(unittest.TestCase):
         self.assertTrue(receipt.exists())
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_checkpoint_write_retains_validated_storage_directory(self):
+        # MUTATION: a checked checkpoint pathname can be swapped before atomic write.
+        _, state = self._state()
+        outside = self.base / "outside-checkpoint-race"
+        outside.mkdir()
+        real_private_file = conversation_lifecycle._private_file
+        parked = []
+
+        def swap_after_open(project, directories, name):
+            result = real_private_file(project, directories, name)
+            if not parked:
+                parked.append(
+                    self._swap_directory(project.joinpath(*directories), outside)
+                )
+            return result
+
+        with mock.patch.object(
+            conversation_lifecycle, "_private_file", swap_after_open
+        ):
+            try:
+                result = transition(self._event("cancel", state), state)
+            except ConversationError:
+                result = None
+        self.assertEqual(list(outside.iterdir()), [])
+        if result is not None:
+            self.assertEqual(result.action, "cancel")
+        if os.name != "nt":
+            self.assertIsNotNone(parked[0])
+
     def test_cancel_checkpoints_before_release(self):
         # MUTATION: releasing first loses the final restart checkpoint on failure.
         receipt, state = self._state()
@@ -282,6 +323,38 @@ class ConversationLifecycleTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "conversation-storage-unsafe")
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_handoff_write_retains_validated_storage_directory(self):
+        # MUTATION: a checked handoff pathname can be swapped before JSON/HMAC writes.
+        _, state = self._state()
+        outside = self.base / "outside-handoff-race"
+        outside.mkdir()
+        real_private_file = conversation_lifecycle._private_file
+        parked = []
+
+        def swap_after_open(project, directories, name):
+            result = real_private_file(project, directories, name)
+            if not parked:
+                parked.append(
+                    self._swap_directory(project.joinpath(*directories), outside)
+                )
+            return result
+
+        with mock.patch.object(
+            conversation_lifecycle, "_private_file", swap_after_open
+        ):
+            try:
+                result = transition(
+                    self._event("compress", state, summary="one", next_action="two"),
+                    state,
+                )
+            except ConversationError:
+                result = None
+        self.assertEqual(list(outside.iterdir()), [])
+        if result is not None:
+            self.assertEqual(result.action, "compress")
+        if os.name != "nt":
+            self.assertIsNotNone(parked[0])
 
     def test_tampered_compression_handoff_is_denied(self):
         # MUTATION: trusting handoff fields without its digest accepts altered context.
