@@ -1,10 +1,13 @@
 import hashlib
+import io
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,14 +25,34 @@ FAKE_AO2 = r'''
 #include <string.h>
 #include <unistd.h>
 
+extern char **environ;
+
 int main(int argc, char **argv) {
   const char *target = NULL, *run = NULL;
+  char mode_buffer[64] = {0};
   for (int i = 1; i + 1 < argc; i++) {
     if (strcmp(argv[i], "--target") == 0) target = argv[i + 1];
     if (strcmp(argv[i], "--run-id") == 0) run = argv[i + 1];
   }
   if (argc < 3 || !target || !run) return 64;
-  const char *mode = getenv("AO_TEST_FAKE_AO2_MODE");
+  FILE *mode_file = fopen("ao2-mode", "rb");
+  if (mode_file) {
+    fread(mode_buffer, 1, sizeof(mode_buffer) - 1, mode_file);
+    fclose(mode_file);
+  }
+  const char *mode = mode_buffer[0] ? mode_buffer : NULL;
+  FILE *environment = fopen("ao2-environment.txt", "wb");
+  if (!environment) return 72;
+  const char *environment_names[] = {
+    "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "PYTHONPATH"
+  };
+  for (int i = 0; i < 3; i++) {
+    if (getenv(environment_names[i])) fprintf(environment, "%s\n", environment_names[i]);
+  }
+  for (char **entry = environ; *entry; entry++) {
+    if (strncmp(*entry, "AO_TEST_", 8) == 0) fprintf(environment, "%s\n", *entry);
+  }
+  fclose(environment);
   if (mode && (strcmp(mode, "child-timeout") == 0 || strcmp(mode, "child-large") == 0)) {
     pid_t child = fork();
     if (child < 0) return 71;
@@ -85,7 +108,6 @@ class ExecutionTests(unittest.TestCase):
         )
         self.harness.setUp()
         self.addCleanup(self.harness.tearDown)
-        self.addCleanup(os.environ.pop, "AO_TEST_FAKE_AO2_MODE", None)
         self.base = self.harness.base
         self.project = self.harness.project
         self.pool = self.harness.pool
@@ -137,20 +159,24 @@ class ExecutionTests(unittest.TestCase):
             self.harness.valid_artifacts(),
         )
 
+    def _set_ao2_mode(self, mode: str) -> None:
+        (self.project / "ao2-mode").write_text(mode, encoding="utf-8")
+
     def _replace_verified_copy(self, verified) -> None:
         replacement = verified.path.with_name("replacement-" + verified.path.name)
         shutil.copy2(self.malicious, replacement)
         os.replace(replacement, verified.path)
 
     def _replace_workflow_stage(self) -> None:
-        staging = (
+        staging_directory = (
             self.project
             / ".ao"
             / "governance"
             / "office-pool"
             / "staging"
-            / hashlib.sha256(self.harness.workflow.read_bytes()).hexdigest()
         )
+        digest = hashlib.sha256(self.harness.workflow.read_bytes()).hexdigest()
+        staging = next(staging_directory.glob(f"{digest}-*"))
         replacement = staging.with_name("replacement-workflow")
         replacement.write_text("name: substituted\n", encoding="utf-8")
         os.replace(replacement, staging)
@@ -273,16 +299,90 @@ class ExecutionTests(unittest.TestCase):
             return real_run(arguments, project, executable, **options)
 
         with mock.patch.object(execution_module, "_run_output", replace_then_run):
+            if sys.platform == "darwin":
+                with self.assertRaises(ExecutionError) as raised:
+                    execute(self.claim_path, self.envelope)
+                self.assertEqual(raised.exception.code, "workflow-identity-mismatch")
+            else:
+                execute(self.claim_path, self.envelope)
+        copied = self.project / "ao2-workflow.txt"
+        if copied.exists():
+            self.assertEqual(copied.read_bytes(), self.harness.workflow.read_bytes())
+
+    def test_launched_workflow_snapshot_rejects_in_place_mutation(self):
+        # MUTATION: launching a same-user writable staging inode lets verified bytes change.
+        real_run = mission_bridge._run_output
+        mutation_succeeded = []
+
+        def mutate_then_run(arguments, project, executable, **options):
+            workflow_path = Path(arguments[1])
+            if os.name != "nt":
+                descriptor = int(workflow_path.name)
+                try:
+                    os.pwrite(descriptor, b"name: substituted\n", 0)
+                except OSError:
+                    mutation_succeeded.append(False)
+                else:
+                    mutation_succeeded.append(True)
+                launched = os.fstat(descriptor)
+                snapshot = next(
+                    (
+                        candidate
+                        for candidate in (
+                            self.project
+                            / ".ao"
+                            / "governance"
+                            / "office-pool"
+                            / "staging"
+                        ).iterdir()
+                        if (candidate.stat().st_dev, candidate.stat().st_ino)
+                        == (launched.st_dev, launched.st_ino)
+                    ),
+                    workflow_path,
+                )
+            else:
+                snapshot = workflow_path
+            opened = None
+            try:
+                opened = os.open(snapshot, os.O_WRONLY)
+                os.write(opened, b"name: substituted\n")
+            except OSError:
+                mutation_succeeded.append(False)
+            else:
+                mutation_succeeded.append(True)
+            finally:
+                if opened is not None:
+                    os.close(opened)
+            return real_run(arguments, project, executable, **options)
+
+        with mock.patch.object(execution_module, "_run_output", mutate_then_run):
             execute(self.claim_path, self.envelope)
+        self.assertTrue(mutation_succeeded)
+        self.assertFalse(any(mutation_succeeded), mutation_succeeded)
         self.assertEqual(
             (self.project / "ao2-workflow.txt").read_bytes(),
             self.harness.workflow.read_bytes(),
         )
 
+    def test_ao2_environment_strips_ambient_injection_variables(self):
+        # MUTATION: inheriting the parent environment exposes AO2 to config/code injection.
+        hostile = {
+            "DYLD_INSERT_LIBRARIES": "/tmp/hostile.dylib",
+            "LD_PRELOAD": "/tmp/hostile.so",
+            "PYTHONPATH": "/tmp/hostile-python",
+            "AO_TEST_FAKE_AO2_MODE": "wrong-types",
+            "AO_TEST_UNRELATED_CONFIG": "hostile",
+        }
+        with mock.patch.dict(os.environ, hostile):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(
+            (self.project / "ao2-environment.txt").read_text(encoding="utf-8"), ""
+        )
+
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_timeout_kills_complete_process_tree(self):
         # MUTATION: killing only the AO2 leader leaves its child alive.
-        os.environ["AO_TEST_FAKE_AO2_MODE"] = "child-timeout"
+        self._set_ao2_mode("child-timeout")
         with self.assertRaises(ExecutionError) as raised:
             execute(self.claim_path, self.envelope, timeout_seconds=1)
         self.assertEqual(raised.exception.code, "execution-timeout")
@@ -292,7 +392,7 @@ class ExecutionTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_output_overflow_kills_complete_process_tree(self):
         # MUTATION: killing only the AO2 leader on overflow leaves its child alive.
-        os.environ["AO_TEST_FAKE_AO2_MODE"] = "child-large"
+        self._set_ao2_mode("child-large")
         with self.assertRaises(ExecutionError) as raised:
             execute(self.claim_path, self.envelope)
         self.assertEqual(raised.exception.code, "execution-output-too-large")
@@ -307,7 +407,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "governance-envelope-consumed")
 
     def test_native_ao2_allowlisted_readback_is_accepted(self):
-        os.environ["AO_TEST_FAKE_AO2_MODE"] = "native-readback"
+        self._set_ao2_mode("native-readback")
         result = execute(self.claim_path, self.envelope)
         self.assertEqual(
             result.diagnostics,
@@ -319,7 +419,7 @@ class ExecutionTests(unittest.TestCase):
         for mode in ("json-list", "wrong-types", "invalid-utf8"):
             with self.subTest(mode=mode):
                 envelope = self.envelope if mode == "json-list" else self._witness()
-                os.environ["AO_TEST_FAKE_AO2_MODE"] = mode
+                self._set_ao2_mode(mode)
                 with self.assertRaises(ExecutionError) as raised:
                     execute(self.claim_path, envelope)
                 self.assertEqual(raised.exception.code, "invalid-execution-readback")
@@ -342,6 +442,81 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotEqual(first.record, second.record)
         self.assertTrue(first.record.is_file())
         self.assertTrue(second.record.is_file())
+
+
+@unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
+class BoundedStreamCleanupTests(unittest.TestCase):
+    def test_unexpected_wait_failure_kills_descendant_and_reaps_leader(self):
+        # MUTATION: joining readers before killing on wait failure leaks the process tree.
+        child_pid_path = Path(self.id().replace(".", "-"))
+        child_pid_path = Path.cwd() / child_pid_path
+        child_pid_path.unlink(missing_ok=True)
+        self.addCleanup(child_pid_path.unlink, missing_ok=True)
+        leader = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, subprocess, sys, time; "
+                    "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                    "time.sleep(30)"
+                ),
+                str(child_pid_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        def cleanup_group() -> None:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                leader.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+        self.addCleanup(cleanup_group)
+
+        def kill() -> None:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        wait_calls = 0
+
+        def wait() -> int:
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                deadline = time.monotonic() + 5
+                while not child_pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not child_pid_path.exists():
+                    raise AssertionError("descendant was not created")
+                raise RuntimeError("unexpected wait failure")
+            return leader.wait(timeout=5)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected wait failure"):
+            mission_bridge._read_bounded_streams(
+                (io.BytesIO(), io.BytesIO()), kill, wait
+            )
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        self.assertEqual(wait_calls, 2)
+        self.assertIsNotNone(leader.returncode)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= deadline:
+                self.fail(f"descendant {child_pid} survived cleanup")
+            time.sleep(0.01)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import sys
 import uuid
 from contextlib import contextmanager
@@ -52,6 +53,19 @@ def _digest(value) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _execution_environment() -> dict[str, str]:
+    if os.name == "nt":
+        environment = {}
+        for name in ("SystemRoot", "WINDIR", "TEMP", "TMP"):
+            if os.environ.get(name):
+                environment[name] = os.environ[name]
+        return environment
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    if os.environ.get("TMPDIR"):
+        environment["TMPDIR"] = os.environ["TMPDIR"]
+    return environment
+
+
 def _pool(receipt: Path) -> Pool:
     try:
         root = receipt.parents[2]
@@ -76,13 +90,82 @@ def _descriptor_bytes(descriptor: int) -> bytes:
             raise ExecutionError("workflow-identity-mismatch")
 
 
-def _pread_digest(descriptor: int) -> str:
-    digest = hashlib.sha256()
-    offset = 0
-    while chunk := os.pread(descriptor, 64 * 1024, offset):
-        digest.update(chunk)
-        offset += len(chunk)
-    return digest.hexdigest()
+def _workflow_identity(descriptor: int, digest: str) -> tuple[int, int, int, int]:
+    information = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or information.st_nlink != 1
+        or not hmac.compare_digest(_hash_descriptor(descriptor), digest)
+    ):
+        raise ExecutionError("workflow-identity-mismatch")
+    return (
+        information.st_dev,
+        information.st_ino,
+        information.st_ctime_ns,
+        information.st_size,
+    )
+
+
+def _sealed_workflow_descriptor(raw: bytes, digest: str) -> int | None:
+    if not (
+        sys.platform.startswith("linux")
+        and hasattr(os, "memfd_create")
+        and hasattr(os, "MFD_ALLOW_SEALING")
+        and Path("/proc/self/fd").is_dir()
+    ):
+        return None
+    import fcntl
+
+    seal_names = (
+        "F_ADD_SEALS",
+        "F_GET_SEALS",
+        "F_SEAL_WRITE",
+        "F_SEAL_GROW",
+        "F_SEAL_SHRINK",
+        "F_SEAL_SEAL",
+    )
+    if not all(hasattr(fcntl, name) for name in seal_names):
+        return None
+    required = (
+        fcntl.F_SEAL_WRITE
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_SEAL
+    )
+    descriptor = os.memfd_create(
+        "ao2-workflow", getattr(os, "MFD_CLOEXEC", 0) | os.MFD_ALLOW_SEALING
+    )
+    readonly = None
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("workflow snapshot write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required)
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & required != required:
+            raise OSError("workflow snapshot sealing failed")
+        if not hmac.compare_digest(_hash_descriptor(descriptor), digest):
+            raise ExecutionError("workflow-identity-mismatch")
+        readonly = os.open(f"/proc/self/fd/{descriptor}", os.O_RDONLY)
+        source = os.fstat(descriptor)
+        retained = os.fstat(readonly)
+        if (
+            not stat.S_ISREG(retained.st_mode)
+            or (source.st_dev, source.st_ino) != (retained.st_dev, retained.st_ino)
+            or not hmac.compare_digest(_hash_descriptor(readonly), digest)
+        ):
+            raise ExecutionError("workflow-identity-mismatch")
+        return readonly
+    except BaseException:
+        if readonly is not None:
+            os.close(readonly)
+        raise
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -95,7 +178,7 @@ def _retained_workflow(governed: GovernedExecution):
     staged = _private_file(
         governed.target,
         (".ao", "governance", "office-pool", "staging"),
-        governed.workflow_digest,
+        f"{governed.workflow_digest}-{uuid.uuid4().hex}",
     )
     try:
         with _open_retained_file(source) as source_descriptor:
@@ -104,35 +187,45 @@ def _retained_workflow(governed: GovernedExecution):
                 _hash_descriptor(source_descriptor), governed.workflow_digest
             ):
                 raise ExecutionError("workflow-identity-mismatch")
-            try:
-                _create_private(staged, raw)
-            except FileExistsError:
-                pass
-            with _open_retained_file(staged) as staged_descriptor:
-                if not (
-                    hmac.compare_digest(
-                        _hash_descriptor(source_descriptor), governed.workflow_digest
-                    )
-                    and hmac.compare_digest(
-                        _hash_descriptor(staged_descriptor), governed.workflow_digest
-                    )
-                ):
+            _create_private(staged, raw)
+            with _open_retained_file(staged) as created_descriptor:
+                if os.name != "nt":
+                    os.fchmod(created_descriptor, 0o400)
+                    os.fsync(created_descriptor)
+            with _open_retained_file(staged) as snapshot_descriptor:
+                snapshot_identity = _workflow_identity(
+                    snapshot_descriptor, governed.workflow_digest
+                )
+                if os.name != "nt" and stat.S_IMODE(
+                    os.fstat(snapshot_descriptor).st_mode
+                ) != 0o400:
                     raise ExecutionError("workflow-identity-mismatch")
-                with _open_retained_file(staged) as launch_descriptor:
-                    staged_identity = os.fstat(staged_descriptor)
-                    launch_identity = os.fstat(launch_descriptor)
-                    if (
-                        (staged_identity.st_dev, staged_identity.st_ino)
-                        != (launch_identity.st_dev, launch_identity.st_ino)
-                        or (
-                            os.name != "nt"
-                            and not hmac.compare_digest(
-                                _pread_digest(launch_descriptor),
+                sealed_descriptor = _sealed_workflow_descriptor(
+                    raw, governed.workflow_digest
+                )
+                launch_descriptor = sealed_descriptor or snapshot_descriptor
+
+                def verify_retained() -> None:
+                    try:
+                        if sealed_descriptor is not None:
+                            if not hmac.compare_digest(
+                                _hash_descriptor(sealed_descriptor),
                                 governed.workflow_digest,
-                            )
-                        )
-                    ):
-                        raise ExecutionError("workflow-identity-mismatch")
+                            ):
+                                raise MissionBridgeError(
+                                    "workflow-identity-mismatch"
+                                )
+                            return
+                        if _workflow_identity(
+                            snapshot_descriptor, governed.workflow_digest
+                        ) != snapshot_identity:
+                            raise MissionBridgeError("workflow-identity-mismatch")
+                    except ExecutionError as error:
+                        raise MissionBridgeError(
+                            "workflow-identity-mismatch"
+                        ) from error
+
+                try:
                     if os.name == "nt":
                         launch_path = str(staged.path)
                     elif sys.platform == "darwin":
@@ -141,7 +234,10 @@ def _retained_workflow(governed: GovernedExecution):
                         if not Path("/proc/self/fd").is_dir():
                             raise ExecutionError("execution-launch-failed")
                         launch_path = f"/proc/self/fd/{launch_descriptor}"
-                    yield launch_path, (launch_descriptor,)
+                    yield launch_path, (launch_descriptor,), verify_retained
+                finally:
+                    if sealed_descriptor is not None:
+                        os.close(sealed_descriptor)
     except ExecutionError:
         raise
     except (MissionBridgeError, OSError, TypeError, ValueError) as error:
@@ -308,6 +404,8 @@ def _write_record(
 
 
 def _process_error_code(error: MissionBridgeError) -> str:
+    if error.code == "workflow-identity-mismatch":
+        return error.code
     return {
         "timeout": "execution-timeout",
         "output-too-large": "execution-output-too-large",
@@ -340,7 +438,9 @@ def _execute_governed(receipt, lease, governed, timeout_seconds) -> ExecutionRes
                     governed.target,
                     executable,
                     timeout_seconds=timeout_seconds,
+                    environment=_execution_environment(),
                     retained_descriptors=workflow[1],
+                    retained_verifier=workflow[2],
                 )
                 diagnostics = _diagnostics(stdout, governed.run_id)
             except (ExecutionError, MissionBridgeError) as error:

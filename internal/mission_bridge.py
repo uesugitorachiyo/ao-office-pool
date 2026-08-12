@@ -1423,14 +1423,34 @@ def _read_bounded_streams(
     ]
     for reader in readers:
         reader.start()
+    failure = None
     try:
         return_code = wait()
         kill()
+    except BaseException as error:
+        failure = error
+        try:
+            kill()
+        except BaseException:
+            pass
+        try:
+            wait()
+        except BaseException:
+            pass
+        raise
     finally:
         for reader in readers:
-            reader.join(timeout=5)
+            try:
+                reader.join(timeout=5)
+            except BaseException:
+                if failure is None:
+                    raise
         for stream in streams:
-            stream.close()
+            try:
+                stream.close()
+            except BaseException:
+                if failure is None:
+                    raise
     if too_large.is_set():
         raise MissionBridgeError(
             "mission-output-too-large", reason="output-too-large"
@@ -1448,6 +1468,7 @@ def _run_darwin(
     timeout_seconds: int = 30,
     environment: dict[str, str] | None = None,
     retained_descriptors: tuple[int, ...] = (),
+    retained_verifier=None,
 ) -> bytes:
     descriptor = project.descriptors[0]
     child = (
@@ -1464,6 +1485,8 @@ def _run_darwin(
         stderr = os.fdopen(child.stderr_descriptor, "rb", buffering=0)
         _darwin_wait_stopped(child.pid)
         _darwin_verify_suspended(child.pid, descriptor, executable)
+        if retained_verifier is not None:
+            retained_verifier()
         os.kill(child.pid, signal.SIGCONT)
     except BaseException as error:
         _darwin_kill_wait(child.pid)
@@ -1520,6 +1543,7 @@ def _run_output(
     timeout_seconds: int = 30,
     environment: dict[str, str] | None = None,
     retained_descriptors: tuple[int, ...] = (),
+    retained_verifier=None,
 ) -> bytes:
     launch_path = executable.launch_path
     if isinstance(project, _PrivateDirectory):
@@ -1539,6 +1563,7 @@ def _run_output(
             timeout_seconds=timeout_seconds,
             environment=environment,
             retained_descriptors=retained_descriptors,
+            retained_verifier=retained_verifier,
         )
     options = {}
     if os.name != "nt":
@@ -1552,6 +1577,8 @@ def _run_output(
         )
     else:
         options["creationflags"] = 0x00000004
+    if retained_verifier is not None:
+        retained_verifier()
     try:
         process = subprocess.Popen(
             [launch_path, *arguments],
