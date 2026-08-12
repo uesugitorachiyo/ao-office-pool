@@ -152,13 +152,22 @@ class PoolTests(unittest.TestCase):
 
     def test_constructed_or_expired_authority_lease_is_not_a_capability(self):
         self.assertFalse(hasattr(pool_module, "_activate_lease"))
+        self.assertFalse(hasattr(pool_module, "_LEASE_SENTINEL"))
+        self.assertFalse(hasattr(pool_module, "_register_lease"))
+        self.assertFalse(hasattr(Pool, "_open_witness_key"))
         authority = self.pool.claim("holder-capability", "task-capability", self.project, "pinned")
         with self.pool.authority_lease(authority) as active:
             with self.assertRaises(PoolError):
                 AuthorityLease(active.authority_path, active.authority_bytes, active.authority)
-            self.pool._require_authority_lease(active)
+            tag = active.sign_witness(b"payload")
+            self.assertTrue(active.verify_witness(b"payload", tag))
+            forged = object.__new__(AuthorityLease)
+            for name in ("authority_path", "authority_bytes", "authority", "_checker", "_signer", "_verifier"):
+                object.__setattr__(forged, name, getattr(active, name))
+            with self.assertRaises(PoolError):
+                forged.sign_witness(b"payload")
         with self.assertRaises(PoolError):
-            self.pool._require_authority_lease(active)
+            active.sign_witness(b"payload")
 
     def test_legacy_pool_migrates_governance_storage_once_without_rotation(self):
         key = self.root / "operator-secrets/governance-witness.key"

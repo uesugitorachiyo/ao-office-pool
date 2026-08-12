@@ -101,6 +101,8 @@ class _RetainedFile:
     private: object
     descriptor: int
     parent_change: int
+    change: int
+    digest: str | None = None
 
     @property
     def path(self) -> Path:
@@ -135,7 +137,12 @@ class _RetainedFile:
             not stat.S_ISREG(opened.st_mode)
             or opened.st_nlink != 1
             or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            or opened.st_ctime_ns != self.change
             or (parent is not None and os.fstat(parent).st_ctime_ns != self.parent_change)
+        ):
+            raise GovernanceError("governance-artifact-changed")
+        if self.digest is not None and not hmac.compare_digest(
+            _digest_bytes(self.read(_MAX_ARTIFACT)), self.digest
         ):
             raise GovernanceError("governance-artifact-changed")
 
@@ -144,6 +151,31 @@ class _RetainedFile:
             self.parent_change = os.fstat(
                 self.private.directory.directory_descriptor
             ).st_ctime_ns
+
+    def refresh_identity(self, digest: str | None = None) -> None:
+        self.change = os.fstat(self.descriptor).st_ctime_ns
+        self.refresh_parent_identity()
+        self.digest = digest
+
+    def accept_producer_write(self) -> None:
+        opened = os.fstat(self.descriptor)
+        current = os.stat(
+            self.private.name,
+            dir_fd=self.private.directory.directory_descriptor,
+            follow_symlinks=False,
+        ) if self.private.directory.directory_descriptor is not None else self.private.path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            or (
+                self.private.directory.directory_descriptor is not None
+                and os.fstat(self.private.directory.directory_descriptor).st_ctime_ns
+                != self.parent_change
+            )
+        ):
+            raise GovernanceError("governance-artifact-changed")
+        self.refresh_identity()
 
     def close(self) -> None:
         os.close(self.descriptor)
@@ -155,6 +187,9 @@ class _RetainedDirectory:
     directory: _PrivateDirectory
     digest: str
     change: int | None
+    children: tuple[_RetainedFile, ...]
+    child_directories: tuple[_PrivateDirectory, ...]
+    directory_changes: tuple[int, ...]
 
     @property
     def path(self) -> Path:
@@ -162,7 +197,15 @@ class _RetainedDirectory:
 
     @property
     def descriptors(self) -> tuple[int, ...]:
-        return ((self.directory.directory_descriptor,) if self.directory.directory_descriptor is not None else ())
+        return tuple(
+            descriptor
+            for descriptor in (
+                self.directory.directory_descriptor,
+                *(directory.directory_descriptor for directory in self.child_directories),
+                *(child.descriptor for child in self.children),
+            )
+            if descriptor is not None
+        )
 
     def recheck(self, project: _PrivateDirectory) -> None:
         self.directory.require_current_paths()
@@ -172,8 +215,21 @@ class _RetainedDirectory:
             _directory_digest(project, self.directory.path, _PRIVATE_PARTS), self.digest
         ):
             raise GovernanceError("governance-artifact-changed")
+        for child in self.children:
+            child.recheck()
+        for directory, change in zip(self.child_directories, self.directory_changes):
+            directory.require_current_paths()
+            if (
+                directory.directory_descriptor is not None
+                and os.fstat(directory.directory_descriptor).st_ctime_ns != change
+            ):
+                raise GovernanceError("governance-artifact-changed")
 
     def close(self) -> None:
+        for child in self.children:
+            child.close()
+        for directory in self.child_directories:
+            directory.close()
         self.directory.close()
 
 
@@ -450,7 +506,7 @@ def _run_producer(
             os.set_inheritable(descriptor, inheritable)
     if name == "ao-blueprint":
         try:
-            output.recheck()
+            output.accept_producer_write()
             authorization = output.read(_MAX_ENVELOPE)
         except (OSError, ValueError, MissionBridgeError) as error:
             raise GovernanceError("governance-producer-readback") from error
@@ -690,7 +746,9 @@ def _stage_file(
             os.fstat(staged.directory.directory_descriptor).st_ctime_ns
             if staged.directory.directory_descriptor is not None else 0
         )
-        return _RetainedFile(staged, descriptor, parent_change), digest
+        return _RetainedFile(
+            staged, descriptor, parent_change, os.fstat(descriptor).st_ctime_ns, digest
+        ), digest
     except BaseException:
         staged.close()
         raise
@@ -702,14 +760,16 @@ def _stage_directory(
     digest = _directory_digest(project, path, root)
     destination_parts = (*_PRIVATE_PARTS, "producer-input", f"blueprint-{digest}")
     destination = _private_directory(project, *destination_parts)
+    children = []
+    child_directories = []
     try:
         for directory, names, filenames in os.walk(path, followlinks=False):
             current = Path(directory)
             relative_directory = current.relative_to(path).parts
             for name in names:
-                _private_directory(
+                child_directories.append(_private_directory(
                     project, *destination_parts, *relative_directory, name
-                ).close()
+                ))
             for name in filenames:
                 source = current / name
                 raw = _read_file(project, source, root)
@@ -719,23 +779,63 @@ def _stage_directory(
                     name,
                 )
                 try:
-                    try:
-                        _create_private(retained, raw)
-                    except FileExistsError:
-                        if _read_private_bytes(retained, _MAX_ARTIFACT) != raw:
-                            raise GovernanceError("governance-artifact-changed")
-                finally:
-                    retained.close()
+                    _create_private(retained, raw)
+                except FileExistsError:
+                    if _read_private_bytes(retained, _MAX_ARTIFACT) != raw:
+                        retained.close()
+                        raise GovernanceError("governance-artifact-changed")
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = (
+                    os.open(retained.name, flags, dir_fd=retained.directory.directory_descriptor)
+                    if retained.directory.directory_descriptor is not None
+                    else os.open(retained.path, flags)
+                )
+                children.append(
+                    _RetainedFile(
+                        retained,
+                        descriptor,
+                        os.fstat(retained.directory.directory_descriptor).st_ctime_ns
+                        if retained.directory.directory_descriptor is not None else 0,
+                        os.fstat(descriptor).st_ctime_ns,
+                        _digest_bytes(raw),
+                    )
+                )
+                if os.name != "nt":
+                    os.fchmod(descriptor, 0o400)
+                    children[-1].refresh_identity(children[-1].digest)
         if not hmac.compare_digest(
             _directory_digest(project, destination.path, _PRIVATE_PARTS), digest
         ):
             raise GovernanceError("governance-artifact-changed")
+        if os.name != "nt":
+            for directory in (*child_directories, destination):
+                os.fchmod(directory.directory_descriptor, 0o500)
+        for child in children:
+            child.refresh_parent_identity()
         change = (
             os.fstat(destination.directory_descriptor).st_ctime_ns
             if destination.directory_descriptor is not None else None
         )
-        return _RetainedDirectory(destination, digest, change), digest
+        directory_changes = tuple(
+            os.fstat(directory.directory_descriptor).st_ctime_ns
+            if directory.directory_descriptor is not None else 0
+            for directory in child_directories
+        )
+        return _RetainedDirectory(
+            destination,
+            digest,
+            change,
+            tuple(children),
+            tuple(child_directories),
+            directory_changes,
+        ), digest
     except BaseException:
+        for child in children:
+            child.close()
+        for directory in child_directories:
+            directory.close()
         destination.close()
         raise
 
@@ -760,7 +860,9 @@ def _retained_output(project: _PrivateDirectory) -> _RetainedFile:
             os.fstat(output.directory.directory_descriptor).st_ctime_ns
             if output.directory.directory_descriptor is not None else 0
         )
-        return _RetainedFile(output, descriptor, parent_change)
+        return _RetainedFile(
+            output, descriptor, parent_change, os.fstat(descriptor).st_ctime_ns
+        )
     except BaseException:
         output.close()
         raise
@@ -879,6 +981,7 @@ def issue_witness(
                 )
                 authorization.recheck()
                 authorization_raw = authorization.read(_MAX_ENVELOPE)
+                authorization.refresh_identity(_digest_bytes(authorization_raw))
                 artifact_digests["ao-blueprint"] = _digest_bytes(
                     authorization_raw
                 )
@@ -1016,8 +1119,7 @@ def issue_witness(
                         {name: value for name, value in envelope.items() if name != "payload_digest"}
                     )
                     raw = _canonical_bytes(envelope)
-                    with pool._open_witness_key(lease) as key:
-                        tag = hmac.new(key, raw, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+                    tag = lease.sign_witness(raw)
                     record = _private_file(project, _PRIVATE_PARTS, identifier + ".json")
                     seal = _private_file(project, _PRIVATE_PARTS, identifier + ".hmac")
                     created_seal = False
@@ -1064,7 +1166,7 @@ def _load_envelope(
         raise GovernanceError("governance-invalid-request")
     pool = _pool(lease.authority_path)
     try:
-        pool._require_authority_lease(lease)
+        lease.require_active()
     except PoolError as error:
         raise GovernanceError("governance-unauthorized") from error
     project = _receipt_project_root(lease.authority)
@@ -1091,11 +1193,7 @@ def _load_envelope(
         digest = payload.pop("payload_digest")
         if not hmac.compare_digest(digest, _digest_value(payload)):
             raise ValueError("payload digest")
-        with pool._open_witness_key(lease) as key:
-            expected = hmac.new(
-                key, raw, hashlib.sha256
-            ).hexdigest().encode("ascii") + b"\n"
-        if not hmac.compare_digest(supplied, expected):
+        if not lease.verify_witness(raw, supplied):
             raise ValueError("authentication")
         authority_expected = {
             "authority_digest": _digest_bytes(lease.authority_bytes),

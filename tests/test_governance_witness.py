@@ -1,5 +1,4 @@
 import dataclasses
-import contextlib
 import hashlib
 import json
 import os
@@ -789,6 +788,28 @@ class GovernanceWitnessTests(unittest.TestCase):
                 ),
             )
 
+    def test_blueprint_child_content_a_b_a_mutation_is_detected(self):
+        run_producer = governance._run_producer
+
+        def mutate_child(name, component, artifact, project, *rest):
+            result = run_producer(name, component, artifact, project, *rest)
+            if name == "ao-blueprint":
+                child = artifact.children[0]
+                original = child.private.path.read_bytes()
+                child.private.directory.path.chmod(0o700)
+                child.private.path.chmod(0o600)
+                child.private.path.write_bytes(b"temporary replacement")
+                child.private.path.write_bytes(original)
+            return result
+
+        with mock.patch.object(governance, "_run_producer", side_effect=mutate_child):
+            self._assert_code(
+                "governance-artifact-changed",
+                lambda: issue_witness(
+                    self.claim_path, self.task_text, self.valid_artifacts()
+                ),
+            )
+
     def test_blueprint_output_path_swap_fails_closed(self):
         run_producer = governance._run_producer
 
@@ -950,30 +971,6 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertNotIn(b"pack-inspection", published)
         self.assertNotIn(b"goal_run", published)
         self.assertNotIn(b"policy_explanations", published)
-
-    def test_witness_hmac_uses_the_retained_key_descriptor_during_path_swap(self):
-        key_path = self.pool_root / "operator-secrets/governance-witness.key"
-        original_open = Pool._open_witness_key
-
-        @contextlib.contextmanager
-        def swap_after_open(pool, lease):
-            with original_open(pool, lease) as key:
-                parked = key_path.with_name("parked-witness.key")
-                key_path.rename(parked)
-                key_path.write_bytes(b"x" * 32)
-                try:
-                    yield key
-                finally:
-                    key_path.unlink()
-                    parked.rename(key_path)
-
-        with mock.patch.object(Pool, "_open_witness_key", swap_after_open):
-            envelope = issue_witness(
-                self.claim_path, self.task_text, self.valid_artifacts()
-            )
-        governed = self._consume(envelope)
-        governed.target.close()
-
 
 if __name__ == "__main__":
     unittest.main()
