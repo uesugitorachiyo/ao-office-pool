@@ -1,7 +1,10 @@
+import ctypes
+import errno
 import hashlib
 import hmac
 import json
 import os
+import signal
 import stat
 import shutil
 import subprocess
@@ -9,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -278,6 +282,101 @@ class MissionBridgeTests(unittest.TestCase):
         self.project.mkdir()
         return parked
 
+    def _assert_darwin_pre_resume_failure(self, fault=None, fdopen_failure=None):
+        real_spawn = mission_bridge._darwin_spawn_suspended
+        child = []
+        continued = []
+        pipe_wrapper_calls = 0
+
+        def capture_spawn(*arguments):
+            child.append(real_spawn(*arguments))
+            return child[0]
+
+        real_kill = os.kill
+
+        def capture_signal(pid, sent_signal):
+            if sent_signal == signal.SIGCONT:
+                continued.append(pid)
+            return real_kill(pid, sent_signal)
+
+        real_fdopen = os.fdopen
+
+        def inject_fdopen(descriptor, *arguments, **keywords):
+            nonlocal pipe_wrapper_calls
+            if child and descriptor in (
+                child[0].stdout_descriptor,
+                child[0].stderr_descriptor,
+            ):
+                pipe_wrapper_calls += 1
+                if pipe_wrapper_calls == fdopen_failure:
+                    raise OSError("injected pipe wrapper failure")
+            return real_fdopen(descriptor, *arguments, **keywords)
+
+        error = None
+        try:
+            with (
+                mock.patch.object(
+                    mission_bridge, "_darwin_spawn_suspended", capture_spawn
+                ),
+                mock.patch.object(*fault) if fault else nullcontext(),
+                mock.patch.object(mission_bridge.os, "fdopen", inject_fdopen)
+                if fdopen_failure
+                else nullcontext(),
+                mock.patch.object(mission_bridge.os, "kill", capture_signal),
+            ):
+                try:
+                    start_or_resume(self.claim_path, self.task_text)
+                except BaseException as caught:
+                    error = caught
+            descriptors = (
+                child[0].stdout_descriptor,
+                child[0].stderr_descriptor,
+            )
+            open_descriptors = tuple(
+                self._descriptor_is_open(descriptor) for descriptor in descriptors
+            )
+            try:
+                os.waitpid(child[0].pid, os.WNOHANG)
+            except ChildProcessError:
+                reaped = True
+            else:
+                reaped = False
+            self.assertEqual(
+                (
+                    error.code
+                    if isinstance(error, MissionBridgeError)
+                    else type(error).__name__,
+                    tuple(continued),
+                    (self.project / ".ao/mission/payload-marker").exists(),
+                    open_descriptors,
+                    reaped,
+                ),
+                ("mission-launch-failed", (), False, (False, False), True),
+            )
+        finally:
+            if child:
+                mission_bridge._darwin_kill_wait(child[0].pid)
+            for descriptor in (
+                ()
+                if not child
+                else (
+                    child[0].stdout_descriptor,
+                    child[0].stderr_descriptor,
+                )
+            ):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _descriptor_is_open(descriptor):
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            return False
+        return True
+
     def test_starts_verified_mission_with_argument_array_and_project_owned_state(self):
         # MUTATION: shell=True would interpret the punctuation in the objective.
         before = {path.relative_to(self.project) for path in self.project.rglob("*")}
@@ -477,6 +576,58 @@ class MissionBridgeTests(unittest.TestCase):
                 start_or_resume(self.claim_path, self.task_text)
         self.assertEqual(raised.exception.code, "mission-launch-failed")
         self.assertFalse((self.project / ".ao/mission/payload-marker").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
+    def test_darwin_partial_region_enumeration_failure_never_resumes(self):
+        # MUTATION: any libproc error after one matching main region is normal end.
+        real_libraries = mission_bridge._darwin_libraries
+
+        class PartialFailure:
+            def __init__(self, process):
+                self.process = process
+                self.matched = False
+
+            def __getattr__(self, name):
+                return getattr(self.process, name)
+
+            def proc_pidinfo(self, pid, flavor, address, buffer, size):
+                if flavor == 8 and self.matched:
+                    ctypes.set_errno(errno.EIO)
+                    return 0
+                result = self.process.proc_pidinfo(
+                    pid, flavor, address, buffer, size
+                )
+                if flavor == 8 and result == size:
+                    region = ctypes.cast(
+                        buffer, ctypes.POINTER(mission_bridge._DarwinRegionPath)
+                    ).contents
+                    path = bytes(region.vnode.path).split(b"\0", 1)[0]
+                    if path and region.region.protection & 0x4:
+                        process_path = ctypes.create_string_buffer(4096)
+                        self.process.proc_pidpath(
+                            pid, process_path, ctypes.sizeof(process_path)
+                        )
+                        if path == process_path.value:
+                            self.matched = True
+                return result
+
+        def partial_libraries():
+            system, process = real_libraries()
+            return system, PartialFailure(process)
+
+        self._assert_darwin_pre_resume_failure(
+            (mission_bridge, "_darwin_libraries", partial_libraries)
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
+    def test_darwin_first_pipe_wrapper_failure_never_resumes(self):
+        # MUTATION: first fdopen failure escapes before child ownership cleanup.
+        self._assert_darwin_pre_resume_failure(fdopen_failure=1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
+    def test_darwin_second_pipe_wrapper_failure_never_resumes(self):
+        # MUTATION: second fdopen failure leaks first wrapper and stopped child.
+        self._assert_darwin_pre_resume_failure(fdopen_failure=2)
 
     @unittest.skipUnless(sys.platform == "darwin", "suspended spawn is Darwin-specific")
     def test_darwin_post_spawn_entry_replacement_runs_loaded_verified_vnode(self):

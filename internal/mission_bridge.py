@@ -1,4 +1,5 @@
 import ctypes
+import errno
 import hashlib
 import hmac
 import json
@@ -1034,6 +1035,7 @@ def _darwin_verify_suspended(
     address = 0
     while True:
         region = _DarwinRegionPath()
+        ctypes.set_errno(0)
         size = process.proc_pidinfo(
             pid,
             8,
@@ -1041,7 +1043,7 @@ def _darwin_verify_suspended(
             ctypes.byref(region),
             ctypes.sizeof(region),
         )
-        if size <= 0:
+        if size == 0 and ctypes.get_errno() == errno.EINVAL:
             break
         if size != ctypes.sizeof(region):
             raise MissionBridgeError("mission-launch-failed")
@@ -1138,21 +1140,31 @@ def _run_darwin(
 ) -> bytes:
     descriptor = project.descriptors[0]
     child = _darwin_spawn_suspended(arguments, descriptor, executable)
-    streams = (
-        os.fdopen(child.stdout_descriptor, "rb", buffering=0),
-        os.fdopen(child.stderr_descriptor, "rb", buffering=0),
-    )
+    stdout = None
+    stderr = None
     try:
+        stdout = os.fdopen(child.stdout_descriptor, "rb", buffering=0)
+        stderr = os.fdopen(child.stderr_descriptor, "rb", buffering=0)
         _darwin_wait_stopped(child.pid)
         _darwin_verify_suspended(child.pid, descriptor, executable)
         os.kill(child.pid, signal.SIGCONT)
-    except (MissionBridgeError, OSError) as error:
+    except BaseException as error:
         _darwin_kill_wait(child.pid)
-        for stream in streams:
-            stream.close()
+        for stream, raw_descriptor in (
+            (stdout, child.stdout_descriptor),
+            (stderr, child.stderr_descriptor),
+        ):
+            try:
+                stream.close() if stream is not None else os.close(raw_descriptor)
+            except OSError:
+                pass
         if isinstance(error, MissionBridgeError):
             raise
-        raise MissionBridgeError("mission-launch-failed") from error
+        if isinstance(error, Exception):
+            raise MissionBridgeError("mission-launch-failed") from error
+        raise
+
+    streams = (stdout, stderr)
 
     deadline = time.monotonic() + 30
 
