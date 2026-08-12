@@ -23,12 +23,13 @@ from internal.mission_bridge import (
     _open_verified_file,
     _private_file,
     _run_output,
-    _write_private_bytes,
+    _validate_schema,
 )
 from internal.pool import Pool, PoolError
 
 
 MAX_WORKFLOW = 64 * 1024 * 1024
+EXECUTION_SCHEMA = Path(__file__).parents[1] / "schemas/execution-record.schema.json"
 
 
 class ExecutionError(RuntimeError):
@@ -432,7 +433,6 @@ def _write_record(
     )
     value = {
         "schema_version": 1,
-        "execution_id": "execution-" + uuid.uuid4().hex[:16],
         "phase": phase,
         "request_digest": governed.request_digest,
         "mission_id": governed.mission.mission_id,
@@ -455,17 +455,101 @@ def _write_record(
         "exit_code": exit_code,
         "failure_code": failure_code,
     }
-    value["record_digest"] = _digest(value)
-    record = _private_file(
-        project,
-        (".ao", "evidence", "office-pool"),
-        value["execution_id"] + ".json",
-    )
+    record = None
     try:
-        _write_private_bytes(record, _canonical(value) + b"\n")
+        candidate = {
+            **value,
+            "execution_id": "execution-" + "0" * 32,
+            "record_digest": "0" * 64,
+        }
+        _validate_schema(candidate, EXECUTION_SCHEMA)
+        while True:
+            value["execution_id"] = "execution-" + uuid.uuid4().hex
+            value["record_digest"] = _digest(
+                {
+                    name: member
+                    for name, member in value.items()
+                    if name != "record_digest"
+                }
+            )
+            _validate_schema(value, EXECUTION_SCHEMA)
+            expected = _canonical(value) + b"\n"
+            record = _private_file(
+                project,
+                (".ao", "evidence", "office-pool"),
+                value["execution_id"] + ".json",
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            try:
+                if record.directory.directory_descriptor is None:
+                    descriptor = os.open(record.path, flags, 0o600)
+                else:
+                    descriptor = os.open(
+                        record.name,
+                        flags,
+                        0o600,
+                        dir_fd=record.directory.directory_descriptor,
+                    )
+            except FileExistsError:
+                record.close()
+                record = None
+                continue
+            try:
+                view = memoryview(expected)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("execution record write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if record.directory.directory_descriptor is not None:
+                os.fsync(record.directory.directory_descriptor)
+            break
+
+        with _open_retained_file(record) as descriptor:
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        raw = b"".join(chunks)
+        readback = json.loads(raw)
+        _validate_schema(readback, EXECUTION_SCHEMA)
+        digest_value = {
+            name: member
+            for name, member in readback.items()
+            if name != "record_digest"
+        }
+        if (
+            not hmac.compare_digest(readback["record_digest"], _digest(digest_value))
+            or raw != _canonical(readback) + b"\n"
+            or raw != expected
+        ):
+            raise ValueError("execution record readback mismatch")
         return record.path
+    except ExecutionError:
+        raise
+    except (
+        MissionBridgeError,
+        OSError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ExecutionError(
+            "recovery-required", None if record is None else record.path
+        ) from error
     finally:
-        record.close()
+        if record is not None:
+            record.close()
 
 
 def _process_error_code(error: MissionBridgeError) -> str:

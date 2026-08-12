@@ -10,6 +10,7 @@ import sys
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -192,6 +193,26 @@ class ExecutionTests(unittest.TestCase):
                 os.kill(child, 9)
             except ProcessLookupError:
                 pass
+
+    @property
+    def _execution_records(self) -> Path:
+        return self.project / ".ao" / "evidence" / "office-pool"
+
+    @contextmanager
+    def _mutated_record_readback(self, mutate):
+        real_open = mission_bridge._open_retained_file
+
+        @contextmanager
+        def mutate_then_open(private):
+            if private.name.startswith("execution-"):
+                private.path.write_bytes(mutate(private.path.read_bytes()))
+            with real_open(private) as descriptor:
+                yield descriptor
+
+        with mock.patch.object(
+            execution_module, "_open_retained_file", mutate_then_open
+        ):
+            yield
 
     def test_executes_only_envelope_bound_objects_and_relative_target(self):
         # MUTATION: reopening caller paths exposes absolute workflow/target pathnames.
@@ -559,6 +580,111 @@ class ExecutionTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(raised.exception.record.read_text())["phase"], "failed"
                 )
+
+    def test_completed_record_schema_rejects_cross_phase_fields(self):
+        # MUTATION: independent field schemas accept failed-record fields in completed records.
+        record = json.loads(execute(self.claim_path, self.envelope).record.read_text())
+        invalid = (
+            {**record, "diagnostics": {}},
+            {**record, "diagnostics": {**record["diagnostics"], "extra": "field"}},
+            {**record, "diagnostics": {"status": 1, "run_id": record["run_id"]}},
+            {**record, "exit_code": None},
+            {**record, "exit_code": 1},
+            {**record, "failure_code": "execution-failed"},
+        )
+        schema = Path(execution_module.__file__).parents[1] / "schemas" / "execution-record.schema.json"
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mission_bridge._validate_schema(value, schema)
+
+    def test_failed_record_schema_rejects_cross_phase_fields(self):
+        # MUTATION: an open failure_code and diagnostics object admit ambiguous failed records.
+        completed = json.loads(execute(self.claim_path, self.envelope).record.read_text())
+        failed = {
+            **completed,
+            "phase": "failed",
+            "diagnostics": {},
+            "exit_code": None,
+            "failure_code": "execution-failed",
+        }
+        invalid = (
+            {**failed, "diagnostics": completed["diagnostics"]},
+            {**failed, "diagnostics": {"extra": "field"}},
+            {**failed, "exit_code": True},
+            {**failed, "exit_code": "1"},
+            {**failed, "failure_code": None},
+            {**failed, "failure_code": "unbounded-failure"},
+        )
+        schema = Path(execution_module.__file__).parents[1] / "schemas" / "execution-record.schema.json"
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mission_bridge._validate_schema(value, schema)
+
+    def test_record_write_rejects_malformed_diagnostic_types_before_creation(self):
+        # MUTATION: writing before schema validation persists untyped AO2 diagnostics.
+        before = set(self._execution_records.glob("execution-*.json"))
+        malformed = {"status": 1, "run_id": self.harness.run_id}
+        with (
+            mock.patch.object(execution_module, "_diagnostics", return_value=malformed),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(
+            set(self._execution_records.glob("execution-*.json")), before
+        )
+
+    def test_execution_id_collision_never_overwrites(self):
+        # MUTATION: replace-based record writes overwrite pre-existing evidence.
+        self._execution_records.mkdir(parents=True, exist_ok=True)
+        sentinel = self._execution_records / ("execution-" + "a" * 32 + ".json")
+        sentinel.write_bytes(b"preserve-me")
+        identifiers = [
+            types.SimpleNamespace(hex="c" * 32),
+            types.SimpleNamespace(hex="a" * 32),
+            types.SimpleNamespace(hex="b" * 32),
+        ]
+        with mock.patch.object(
+            execution_module.uuid, "uuid4", side_effect=identifiers
+        ):
+            result = execute(self.claim_path, self.envelope)
+        self.assertEqual(sentinel.read_bytes(), b"preserve-me")
+        self.assertEqual(result.record.name, "execution-" + "b" * 32 + ".json")
+
+    def test_record_readback_mutation_preserves_written_evidence(self):
+        # MUTATION: returning without exact readback accepts noncanonical changed bytes.
+        def add_whitespace(raw: bytes) -> bytes:
+            return raw[:-1] + b" \n"
+
+        with (
+            self._mutated_record_readback(add_whitespace),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertIsNotNone(raised.exception.record)
+        self.assertEqual(
+            raised.exception.record.read_bytes()[-2:], b" \n"
+        )
+
+    def test_record_digest_mismatch_preserves_written_evidence(self):
+        # MUTATION: schema-only readback accepts a syntactically valid false record digest.
+        def replace_digest(raw: bytes) -> bytes:
+            value = json.loads(raw)
+            value["record_digest"] = "0" * 64
+            return (
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+
+        with (
+            self._mutated_record_readback(replace_digest),
+            self.assertRaises(ExecutionError) as raised,
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertIsNotNone(raised.exception.record)
+        preserved = json.loads(raised.exception.record.read_bytes())
+        self.assertEqual(preserved["record_digest"], "0" * 64)
 
     def test_runtime_tampering_fails_before_launch(self):
         # MUTATION: trusting only the envelope AO2 name accepts changed runtime bytes.
