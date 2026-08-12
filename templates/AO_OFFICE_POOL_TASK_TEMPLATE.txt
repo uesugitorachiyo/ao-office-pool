@@ -1,0 +1,7 @@
+Objective: {objective}
+Connected project: {project}
+Office: {office_id}
+Generation: {generation}
+Mission: {mission_id}
+
+AO Mission records and routes this objective only. AO2 remains the receipt-bound execution runtime. Mission must not execute, approve policy, call providers, publish, deploy, access credentials, or mutate repositories.
