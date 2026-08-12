@@ -588,6 +588,55 @@ class MissionBridgeTests(unittest.TestCase):
         waitpid.assert_called_once_with(child.pid, 0)
         self.assertTrue(all(stream.closed for stream in streams))
 
+    def test_darwin_deadline_failure_happens_before_suspended_spawn(self):
+        # MUTATION: calculating the deadline after spawn leaves a child unowned on abort.
+        project = types.SimpleNamespace(descriptors=(20,))
+        child = mission_bridge._DarwinChild(123, 10, 11)
+        spawn = mock.Mock(return_value=child)
+        with (
+            mock.patch.object(
+                mission_bridge.time,
+                "monotonic",
+                side_effect=KeyboardInterrupt("deadline original"),
+            ),
+            mock.patch.object(mission_bridge, "_darwin_spawn_suspended", spawn),
+            mock.patch.object(
+                mission_bridge.os, "fdopen", side_effect=(io.BytesIO(), io.BytesIO())
+            ),
+            mock.patch.object(mission_bridge, "_darwin_wait_stopped"),
+            mock.patch.object(mission_bridge, "_darwin_verify_suspended"),
+            mock.patch.object(mission_bridge.os, "kill"),
+            self.assertRaisesRegex(KeyboardInterrupt, "deadline original"),
+        ):
+            mission_bridge._run_darwin([], project, types.SimpleNamespace())
+        spawn.assert_not_called()
+
+    def test_generic_and_windows_deadline_failure_happens_before_process_spawn(self):
+        # MUTATION: calculating the deadline after Popen leaks the process or Windows job.
+        executable = types.SimpleNamespace(
+            launch_path="/proc/self/fd/10", descriptors=(10,)
+        )
+        for platform, name in (("linux", "posix"), ("win32", "nt")):
+            with self.subTest(platform=platform):
+                process = types.SimpleNamespace(
+                    pid=123, stdout=io.BytesIO(), stderr=io.BytesIO()
+                )
+                popen = mock.Mock(return_value=process)
+                with (
+                    mock.patch.object(mission_bridge.sys, "platform", platform),
+                    mock.patch.object(mission_bridge.os, "name", name),
+                    mock.patch.object(
+                        mission_bridge.time,
+                        "monotonic",
+                        side_effect=KeyboardInterrupt("deadline original"),
+                    ),
+                    mock.patch.object(mission_bridge.subprocess, "Popen", popen),
+                    mock.patch.object(mission_bridge, "_windows_job"),
+                    self.assertRaisesRegex(KeyboardInterrupt, "deadline original"),
+                ):
+                    mission_bridge._run_output([], self.project, executable)
+                popen.assert_not_called()
+
     def test_windows_job_setup_abort_cleans_owned_process_resources(self):
         # MUTATION: catching only MissionBridgeError skips process cleanup on BaseException.
         events = []

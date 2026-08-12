@@ -1496,8 +1496,13 @@ def _run_darwin(
     environment: dict[str, str] | None = None,
     retained_descriptors: tuple[int, ...] = (),
     retained_verifier=None,
+    deadline: float | None = None,
 ) -> bytes:
+    if deadline is None:
+        deadline = time.monotonic() + timeout_seconds
     descriptor = project.descriptors[0]
+    stdout = None
+    stderr = None
     child = (
         _darwin_spawn_suspended(arguments, descriptor, executable)
         if environment is None and not retained_descriptors
@@ -1505,8 +1510,6 @@ def _run_darwin(
             arguments, descriptor, executable, environment, retained_descriptors
         )
     )
-    stdout = None
-    stderr = None
     try:
         stdout = os.fdopen(child.stdout_descriptor, "rb", buffering=0)
         stderr = os.fdopen(child.stderr_descriptor, "rb", buffering=0)
@@ -1532,8 +1535,6 @@ def _run_darwin(
         raise
 
     streams = (stdout, stderr)
-
-    deadline = time.monotonic() + timeout_seconds
 
     def kill() -> None:
         try:
@@ -1578,6 +1579,7 @@ def _run_output(
     retained_descriptors: tuple[int, ...] = (),
     retained_verifier=None,
 ) -> bytes:
+    deadline = time.monotonic() + timeout_seconds
     launch_path = executable.launch_path
     if isinstance(project, _PrivateDirectory):
         project.require_current_paths()
@@ -1597,6 +1599,7 @@ def _run_output(
             environment=environment,
             retained_descriptors=retained_descriptors,
             retained_verifier=retained_verifier,
+            deadline=deadline,
         )
     options = {}
     if os.name != "nt":
@@ -1612,6 +1615,7 @@ def _run_output(
         options["creationflags"] = 0x00000004
     if retained_verifier is not None:
         retained_verifier()
+    job = None
     try:
         process = subprocess.Popen(
             [launch_path, *arguments],
@@ -1625,7 +1629,6 @@ def _run_output(
         )
     except OSError as error:
         raise MissionBridgeError("mission-launch-failed") from error
-    job = None
     if os.name == "nt":
         try:
             job = _windows_job(process)
@@ -1644,8 +1647,6 @@ def _run_output(
                 except BaseException:
                     pass
             raise
-    deadline = time.monotonic() + timeout_seconds
-
     def kill() -> None:
         if os.name != "nt":
             try:

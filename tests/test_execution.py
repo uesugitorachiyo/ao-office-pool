@@ -482,6 +482,21 @@ class ExecutionTests(unittest.TestCase):
             execute(self.claim_path, self._witness())
         self.assertEqual(list(staging.iterdir()), [])
 
+    def test_deadline_setup_abort_removes_per_run_workflow_snapshot(self):
+        staging = (
+            self.project / ".ao" / "governance" / "office-pool" / "staging"
+        )
+        with (
+            mock.patch.object(
+                mission_bridge.time,
+                "monotonic",
+                side_effect=KeyboardInterrupt("deadline original"),
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "deadline original"),
+        ):
+            execute(self.claim_path, self.envelope)
+        self.assertEqual(list(staging.iterdir()), [])
+
     def test_ao2_environment_strips_ambient_injection_variables(self):
         # MUTATION: inheriting the parent environment exposes AO2 to config/code injection.
         hostile = {
