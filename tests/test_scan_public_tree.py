@@ -25,6 +25,18 @@ class ScanPublicTreeTests(unittest.TestCase):
         for name, contents in cases: self.write(name, contents)
         self.assertTrue({name for name, _ in cases} <= self.paths())
 
+    def test_reports_governance_envelopes_detached_tags_and_markers(self):
+        prefix = ".ao/governance/office-pool/witness-0123456789abcdef0123456789abcdef"
+        names = {
+            prefix + ".json",
+            prefix + ".hmac",
+            prefix + ".consumed",
+            prefix + ".revoked",
+        }
+        for name in names:
+            self.write(name)
+        self.assertEqual(names - self.paths(), set())
+
     def test_reports_links_without_following_targets(self):
         target = Path(tempfile.mkdtemp(dir=Path(tempfile.gettempdir()).resolve())) / "private.txt"; target.write_text("x")
         link = self.root / "link"

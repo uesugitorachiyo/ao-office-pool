@@ -237,6 +237,25 @@ class _DarwinVnodePaths(ctypes.Structure):
     _fields_ = (("current", _DarwinVnodePath), ("root", _DarwinVnodePath))
 
 
+class _WindowsJob:
+    def __init__(self, library, handle):
+        self.library = library
+        self.handle = handle
+        self.lock = threading.Lock()
+
+    def terminate(self) -> bool:
+        with self.lock:
+            if self.handle is None:
+                return False
+            return bool(self.library.TerminateJobObject(self.handle, 1))
+
+    def close(self) -> None:
+        with self.lock:
+            if self.handle is not None:
+                self.library.CloseHandle(self.handle)
+                self.handle = None
+
+
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -252,7 +271,33 @@ def _validate_schema(value: object, schema_path: Path) -> dict:
         raise ValueError("schema unavailable") from error
 
     def validate(item: object, rule: dict) -> None:
+        branches = rule.get("oneOf")
+        if branches is not None:
+            if not isinstance(branches, list) or not branches:
+                raise ValueError("invalid oneOf")
+            matches = 0
+            for branch in branches:
+                try:
+                    validate(item, branch)
+                except ValueError:
+                    continue
+                matches += 1
+            if matches != 1:
+                raise ValueError("oneOf mismatch")
         kind = rule.get("type")
+        if isinstance(kind, list):
+            if not kind:
+                raise ValueError("invalid type union")
+            matches = 0
+            for member_kind in kind:
+                try:
+                    validate(item, {**rule, "type": member_kind})
+                except ValueError:
+                    continue
+                matches += 1
+            if matches != 1:
+                raise ValueError("type union mismatch")
+            return
         if kind == "object":
             if not isinstance(item, dict):
                 raise ValueError("object required")
@@ -262,6 +307,10 @@ def _validate_schema(value: object, schema_path: Path) -> dict:
                 raise ValueError("invalid schema")
             if any(name not in item for name in required):
                 raise ValueError("required property missing")
+            if len(item) < rule.get("minProperties", 0) or len(item) > rule.get(
+                "maxProperties", len(item)
+            ):
+                raise ValueError("object property count")
             if rule.get("additionalProperties") is False and set(item) - set(properties):
                 raise ValueError("additional property")
             for name, member in item.items():
@@ -282,6 +331,25 @@ def _validate_schema(value: object, schema_path: Path) -> dict:
                 raise ValueError("integer required")
             if "minimum" in rule and item < rule["minimum"]:
                 raise ValueError("integer minimum")
+        elif kind == "boolean":
+            if type(item) is not bool:
+                raise ValueError("boolean required")
+        elif kind == "null":
+            if item is not None:
+                raise ValueError("null required")
+        elif kind == "array":
+            if not isinstance(item, list):
+                raise ValueError("array required")
+            if len(item) < rule.get("minItems", 0) or len(item) > rule.get(
+                "maxItems", len(item)
+            ):
+                raise ValueError("array length")
+            member_rule = rule.get("items")
+            if member_rule is not None:
+                if not isinstance(member_rule, dict):
+                    raise ValueError("invalid array items")
+                for member in item:
+                    validate(member, member_rule)
         elif kind is not None:
             raise ValueError("unsupported schema type")
         if "const" in rule:
@@ -758,11 +826,12 @@ def _locked_component() -> dict:
 
 
 @contextmanager
-def _open_verified_executable():
-    component = _locked_component()
+def _open_verified_file(path: Path, expected_digest: str):
     descriptors = []
     temporary = None
     try:
+        if not isinstance(path, Path) or not _DIGEST.fullmatch(expected_digest):
+            raise ValueError("invalid executable identity")
         if os.name == "nt":
             import msvcrt
 
@@ -780,7 +849,7 @@ def _open_verified_executable():
 
             library = _kernel32()
             handle = library.CreateFileW(
-                _native_path(canonical_windows_path(str(MISSION_EXECUTABLE))),
+                _native_path(canonical_windows_path(str(path))),
                 0x80000000,
                 _FILE_SHARE_READ,
                 None,
@@ -799,7 +868,7 @@ def _open_verified_executable():
                     & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT)
                     or information.number_of_links != 1
                     or _final_path(library, handle)
-                    != canonical_windows_path(str(MISSION_EXECUTABLE))
+                    != canonical_windows_path(str(path))
                 ):
                     raise ValueError("unsafe executable")
                 descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
@@ -808,19 +877,19 @@ def _open_verified_executable():
             finally:
                 if handle is not None:
                     library.CloseHandle(handle)
-            launch_path = MISSION_EXECUTABLE
+            launch_path = path
         else:
             flags = os.O_RDONLY
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            source = os.open(MISSION_EXECUTABLE, flags)
+            source = os.open(path, flags)
             descriptors.append(source)
             information = os.fstat(source)
             if not stat.S_ISREG(information.st_mode) or information.st_nlink != 1:
                 raise ValueError("unsafe executable")
-            temporary = tempfile.TemporaryDirectory(prefix="ao-mission-verified-")
+            temporary = tempfile.TemporaryDirectory(prefix="ao-verified-")
             os.chmod(temporary.name, 0o700)
-            launch_path = Path(temporary.name) / MISSION_EXECUTABLE.name
+            launch_path = Path(temporary.name) / path.name
             target = os.open(launch_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o500)
             try:
                 while True:
@@ -842,7 +911,9 @@ def _open_verified_executable():
                 raise ValueError("unsafe verified copy")
             if _hash_descriptor(source) != _hash_descriptor(copied):
                 raise ValueError("verified copy mismatch")
-        if _hash_descriptor(descriptors[0]) != component["sha256"]:
+        if not hmac.compare_digest(
+            _hash_descriptor(descriptors[0]), expected_digest
+        ):
             raise ValueError("digest mismatch")
         yield _VerifiedExecutable(Path(launch_path), tuple(descriptors), temporary)
     except (OSError, TypeError, ValueError) as error:
@@ -855,6 +926,20 @@ def _open_verified_executable():
                 pass
         if temporary is not None:
             temporary.cleanup()
+
+
+@contextmanager
+def _open_verified_executable():
+    component = _locked_component()
+    manager = _open_verified_file(MISSION_EXECUTABLE, component["sha256"])
+    try:
+        value = manager.__enter__()
+    except MissionBridgeError as error:
+        raise MissionBridgeError("mission-identity-mismatch") from error
+    try:
+        yield value
+    finally:
+        manager.__exit__(None, None, None)
 
 
 def _darwin_libraries():
@@ -899,6 +984,11 @@ def _darwin_libraries():
         ctypes.c_short,
     )
     system.posix_spawnattr_setflags.restype = ctypes.c_int
+    system.posix_spawnattr_setpgroup.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+    )
+    system.posix_spawnattr_setpgroup.restype = ctypes.c_int
     system.posix_spawn.argtypes = (
         ctypes.POINTER(ctypes.c_int),
         ctypes.c_char_p,
@@ -923,6 +1013,99 @@ def _darwin_libraries():
     )
     process.proc_pidinfo.restype = ctypes.c_int
     return system, process
+
+
+def _windows_job(process, library=None, native=None) -> _WindowsJob:
+    from ctypes import wintypes
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = (
+            ("per_process_user_time_limit", ctypes.c_int64),
+            ("per_job_user_time_limit", ctypes.c_int64),
+            ("limit_flags", ctypes.c_uint32),
+            ("minimum_working_set_size", ctypes.c_size_t),
+            ("maximum_working_set_size", ctypes.c_size_t),
+            ("active_process_limit", ctypes.c_uint32),
+            ("affinity", ctypes.c_size_t),
+            ("priority_class", ctypes.c_uint32),
+            ("scheduling_class", ctypes.c_uint32),
+        )
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = (
+            ("read_operation_count", ctypes.c_uint64),
+            ("write_operation_count", ctypes.c_uint64),
+            ("other_operation_count", ctypes.c_uint64),
+            ("read_transfer_count", ctypes.c_uint64),
+            ("write_transfer_count", ctypes.c_uint64),
+            ("other_transfer_count", ctypes.c_uint64),
+        )
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = (
+            ("basic_limit_information", _BasicLimitInformation),
+            ("io_info", _IoCounters),
+            ("process_memory_limit", ctypes.c_size_t),
+            ("job_memory_limit", ctypes.c_size_t),
+            ("peak_process_memory_used", ctypes.c_size_t),
+            ("peak_job_memory_used", ctypes.c_size_t),
+        )
+
+    try:
+        if library is None:
+            library = ctypes.WinDLL("kernel32", use_last_error=True)
+        if native is None:
+            native = ctypes.WinDLL("ntdll", use_last_error=True)
+        library.CreateJobObjectW.argtypes = (
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+        )
+        library.CreateJobObjectW.restype = wintypes.HANDLE
+        library.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        library.SetInformationJobObject.restype = wintypes.BOOL
+        library.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        )
+        library.AssignProcessToJobObject.restype = wintypes.BOOL
+        library.TerminateJobObject.argtypes = (wintypes.HANDLE, ctypes.c_uint32)
+        library.TerminateJobObject.restype = wintypes.BOOL
+        library.CloseHandle.argtypes = (wintypes.HANDLE,)
+        library.CloseHandle.restype = wintypes.BOOL
+        native.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+        native.NtResumeProcess.restype = ctypes.c_long
+        handle = library.CreateJobObjectW(None, None)
+        if not handle:
+            raise OSError("CreateJobObjectW failed")
+        try:
+            limits = _ExtendedLimitInformation()
+            limits.basic_limit_information.limit_flags = 0x2000
+            if not library.SetInformationJobObject(
+                handle,
+                9,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            ):
+                raise OSError("SetInformationJobObject failed")
+            process_handle = getattr(process, "_handle", None)
+            if process_handle is None or not library.AssignProcessToJobObject(
+                handle, process_handle
+            ):
+                raise OSError("AssignProcessToJobObject failed")
+            if native.NtResumeProcess(process_handle) != 0:
+                raise OSError("NtResumeProcess failed")
+            return _WindowsJob(library, handle)
+        except BaseException:
+            library.TerminateJobObject(handle, 1)
+            library.CloseHandle(handle)
+            raise
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise MissionBridgeError("mission-launch-failed") from error
 
 
 def _darwin_call(function, *arguments) -> None:
@@ -979,9 +1162,14 @@ def _darwin_spawn_suspended(
         _darwin_call(system.posix_spawnattr_init, ctypes.byref(attributes))
         attributes_ready = True
         _darwin_call(
+            system.posix_spawnattr_setpgroup,
+            ctypes.byref(attributes),
+            0,
+        )
+        _darwin_call(
             system.posix_spawnattr_setflags,
             ctypes.byref(attributes),
-            0x0080,
+            0x0080 | 0x0002,
         )
         raw_arguments = [os.fsencode(executable.path), *(os.fsencode(x) for x in arguments)]
         argv = (ctypes.c_char_p * (len(raw_arguments) + 1))(*raw_arguments, None)
@@ -1090,9 +1278,14 @@ def _darwin_wait_stopped(pid: int) -> None:
 
 def _darwin_kill_wait(pid: int) -> None:
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
@@ -1135,12 +1328,16 @@ def _read_bounded_streams(
     if too_large.is_set():
         raise MissionBridgeError("mission-output-too-large")
     if return_code:
+        kill()
         raise MissionBridgeError("mission-launch-failed")
     return bytes(buffers[0]), bytes(buffers[1])
 
 
 def _run_darwin(
-    arguments: list[str], project: _PrivateDirectory, executable: _VerifiedExecutable
+    arguments: list[str],
+    project: _PrivateDirectory,
+    executable: _VerifiedExecutable,
+    timeout_seconds: int = 30,
 ) -> bytes:
     descriptor = project.descriptors[0]
     child = _darwin_spawn_suspended(arguments, descriptor, executable)
@@ -1170,13 +1367,18 @@ def _run_darwin(
 
     streams = (stdout, stderr)
 
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + timeout_seconds
 
     def kill() -> None:
         try:
-            os.kill(child.pid, signal.SIGKILL)
+            os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            try:
+                os.kill(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def wait() -> int:
         while True:
@@ -1194,11 +1396,13 @@ def _run_darwin(
     return _read_bounded_streams(streams, kill, wait)[0]
 
 
-def _run(
+def _run_output(
     arguments: list[str],
     project: Path | _PrivateDirectory,
     executable: _VerifiedExecutable,
-) -> dict:
+    *,
+    timeout_seconds: int = 30,
+) -> bytes:
     launch_path = executable.launch_path
     if isinstance(project, _PrivateDirectory):
         project.require_current_paths()
@@ -1210,8 +1414,9 @@ def _run(
     if sys.platform == "darwin":
         if not isinstance(project, _PrivateDirectory) or not project.descriptors:
             raise MissionBridgeError("mission-launch-failed")
-        raw_output = _run_darwin(arguments, project, executable)
-        return _validated_readback(raw_output)
+        return _run_darwin(
+            arguments, project, executable, timeout_seconds=timeout_seconds
+        )
     options = {}
     if os.name != "nt":
         if not launch_path.startswith("/proc/self/fd/"):
@@ -1222,6 +1427,8 @@ def _run(
         options["pass_fds"] = tuple(
             dict.fromkeys((*executable.descriptors, *private_descriptors))
         )
+    else:
+        options["creationflags"] = 0x00000004
     try:
         process = subprocess.Popen(
             [launch_path, *arguments],
@@ -1229,25 +1436,66 @@ def _run(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=os.name != "nt",
             **options,
         )
     except OSError as error:
         raise MissionBridgeError("mission-launch-failed") from error
-    deadline = time.monotonic() + 30
+    job = None
+    if os.name == "nt":
+        try:
+            job = _windows_job(process)
+        except MissionBridgeError:
+            try:
+                process.kill()
+                process.wait()
+            finally:
+                process.stdout.close()
+                process.stderr.close()
+            raise
+    deadline = time.monotonic() + timeout_seconds
+
+    def kill() -> None:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                return
+        if job is not None and job.terminate():
+            return
+        process.kill()
 
     def wait() -> int:
         remaining = deadline - time.monotonic()
         try:
-            return process.wait(timeout=max(remaining, 0))
+            return_code = process.wait(timeout=max(remaining, 0))
+            if job is not None:
+                job.close()
+            return return_code
         except subprocess.TimeoutExpired as error:
-            process.kill()
+            kill()
             process.wait()
+            if job is not None:
+                job.close()
             raise MissionBridgeError("mission-launch-failed") from error
 
-    raw_output, _ = _read_bounded_streams(
-        (process.stdout, process.stderr), process.kill, wait
-    )
-    return _validated_readback(raw_output)
+    try:
+        raw_output, _ = _read_bounded_streams(
+            (process.stdout, process.stderr), kill, wait
+        )
+        return raw_output
+    finally:
+        if job is not None:
+            job.close()
+
+
+def _run(
+    arguments: list[str],
+    project: Path | _PrivateDirectory,
+    executable: _VerifiedExecutable,
+) -> dict:
+    return _validated_readback(_run_output(arguments, project, executable))
 
 
 def _validated_readback(raw_output: bytes) -> dict:
@@ -1280,14 +1528,19 @@ def _record_paths(
     authority: dict,
     authority_raw: bytes,
     project: Path | _PrivateDirectory,
-    objective: str,
+    objective: str | None,
 ) -> tuple[_PrivateFile, _PrivateFile]:
+    objective_digest = (
+        authority["task_digest"]
+        if objective is None
+        else _digest(objective.encode("utf-8"))
+    )
     identity = _canonical_bytes(
         {
             "authority_id": authority["authority_id"],
             "chat_digest": authority["holder_digest"],
             "task_digest": authority["task_digest"],
-            "objective_digest": _digest(objective.encode("utf-8")),
+            "objective_digest": objective_digest,
         }
     )
     name = hmac.new(
@@ -1317,7 +1570,7 @@ def _load_record(
     authority: dict,
     authority_raw: bytes,
     project: Path | _PrivateDirectory,
-    objective: str,
+    objective: str | None,
     record: _PrivateFile | None = None,
 ) -> tuple[dict, _PrivateFile]:
     owned = record is None

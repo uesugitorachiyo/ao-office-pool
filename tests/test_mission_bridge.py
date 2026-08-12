@@ -377,6 +377,134 @@ class MissionBridgeTests(unittest.TestCase):
             return False
         return True
 
+    def test_local_schema_validator_supports_tracked_combinators_and_types(self):
+        # MUTATION: treating bool as int or oneOf as anyOf accepts ambiguous records.
+        schema = self.base / "local.schema.json"
+        schema.write_text(
+            json.dumps(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "minProperties": 3,
+                    "maxProperties": 3,
+                    "required": ["enabled", "values", "choice"],
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "values": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "items": {"type": ["string", "null"]},
+                        },
+                        "choice": {
+                            "oneOf": [
+                                {"type": "integer", "minimum": 1},
+                                {"type": "string", "pattern": "^x"},
+                            ]
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        valid = {"enabled": True, "values": ["x", None], "choice": 1}
+        self.assertEqual(mission_bridge._validate_schema(valid, schema), valid)
+        invalid = (
+            {"enabled": True, "values": ["x"], "choice": True},
+            {"enabled": True, "values": "x", "choice": 1},
+            {"enabled": True, "values": [1], "choice": 1},
+            {"enabled": True, "values": [], "choice": 1},
+            {"enabled": True, "values": ["x", None, "y"], "choice": 1},
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mission_bridge._validate_schema(value, schema)
+        for value in (True, 1, [], "not-an-object"):
+            with self.subTest(root=value), self.assertRaises(ValueError):
+                mission_bridge._validate_schema(value, schema)
+
+    def test_local_schema_validator_requires_exactly_one_oneof_branch(self):
+        schema = self.base / "oneof.schema.json"
+        schema.write_text(
+            json.dumps(
+                {
+                    "oneOf": [
+                        {"type": "integer"},
+                        {"type": "integer", "minimum": 0},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        for value in (1, "not-an-integer"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mission_bridge._validate_schema(value, schema)
+
+    def test_windows_job_assigns_suspended_process_before_resume(self):
+        # MUTATION: resuming before assignment lets descendants escape cleanup.
+        events = []
+
+        class Function:
+            def __init__(self, operation):
+                self.operation = operation
+
+            def __call__(self, *arguments):
+                return self.operation(*arguments)
+
+        class Kernel:
+            def __init__(self):
+                self.limit_information = b""
+                self.CreateJobObjectW = Function(lambda *_: 101)
+                self.SetInformationJobObject = Function(self.set_information)
+                self.AssignProcessToJobObject = Function(self.assign)
+                self.TerminateJobObject = Function(self.terminate)
+                self.CloseHandle = Function(self.close)
+
+            def set_information(self, _job, _kind, information, size):
+                self.limit_information = ctypes.string_at(information, size)
+                events.append("configured")
+                return 1
+
+            def assign(self, job, process):
+                self.assigned = (job, process)
+                events.append("assigned")
+                return 1
+
+            def terminate(self, job, code):
+                self.terminated = (job, code)
+                events.append("terminated")
+                return 1
+
+            def close(self, job):
+                self.closed = job
+                events.append("closed")
+                return 1
+
+        class Native:
+            def __init__(self):
+                self.NtResumeProcess = Function(self.resume)
+
+            def resume(self, process):
+                self.resumed = process
+                events.append("resumed")
+                return 0
+
+        class Process:
+            _handle = 202
+
+        kernel = Kernel()
+        native = Native()
+        try:
+            job = mission_bridge._windows_job(Process(), kernel, native)
+        except AttributeError as error:
+            self.fail(f"Windows Job Object helper unavailable: {error}")
+        self.assertEqual(events, ["configured", "assigned", "resumed"])
+        self.assertEqual(kernel.assigned, (101, 202))
+        self.assertIn((0x2000).to_bytes(4, "little"), kernel.limit_information)
+        self.assertTrue(job.terminate())
+        job.close()
+        self.assertEqual(events[-2:], ["terminated", "closed"])
+
     def test_starts_verified_mission_with_argument_array_and_project_owned_state(self):
         # MUTATION: shell=True would interpret the punctuation in the objective.
         before = {path.relative_to(self.project) for path in self.project.rglob("*")}

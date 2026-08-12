@@ -61,6 +61,23 @@ class BuildReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError): build_release(self.source,self.output,self.allowlist)
         self.assertFalse(self.output.exists())
 
+    def test_governance_envelopes_tags_markers_and_keys_cannot_be_exported(self):
+        prefix = ".ao/governance/office-pool/witness-0123456789abcdef0123456789abcdef"
+        private = (
+            prefix + ".json",
+            prefix + ".hmac",
+            prefix + ".consumed",
+            prefix + ".revoked",
+            "governance-witness.key",
+        )
+        for name in private:
+            self.source.joinpath(name).parent.mkdir(parents=True, exist_ok=True)
+            self.source.joinpath(name).write_text("private")
+        self.manifest(files=private, excluded_roots=[".ao"], excluded_patterns=["*.key"])
+        with self.assertRaises(ValueError):
+            build_release(self.source, self.output, self.allowlist)
+        self.assertFalse(self.output.exists())
+
     def test_rejects_schema_dot_and_wrong_kinds_but_allows_absence(self):
         self.source.joinpath("file").write_text("x"); (self.source/"directory").mkdir()
         for files,roots,changes in ((("file",),(),{"schema_version":2}), ((),(".",),{}), (("directory",),(),{}), ((),("file",),{})):
