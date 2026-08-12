@@ -419,6 +419,22 @@ class MissionBridgeTests(unittest.TestCase):
         else:
             self.assertEqual(recorded_cwd, str(self.project))
 
+    def test_authenticated_record_binds_current_route(self):
+        # MUTATION: omitting the route leaves execution authority caller-forgeable.
+        readback = start_or_resume(self.claim_path, self.task_text)
+        record = json.loads(readback.record.read_text(encoding="utf-8"))
+        self.assertEqual(record["current_route"], "ao-blueprint")
+
+    def test_authenticated_route_tampering_is_rejected(self):
+        # MUTATION: accepting a changed durable route bypasses the fixed route table.
+        readback = start_or_resume(self.claim_path, self.task_text)
+        value = json.loads(readback.record.read_text(encoding="utf-8"))
+        value["current_route"] = "ao-forge"
+        readback.record.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaises(MissionBridgeError) as raised:
+            start_or_resume(self.claim_path, self.task_text)
+        self.assertEqual(raised.exception.code, "mission-record-mismatch")
+
     def test_rejects_linked_project_private_storage(self):
         # MUTATION: lexical `.ao` containment writes through a link outside project.
         outside = self.base / "outside"

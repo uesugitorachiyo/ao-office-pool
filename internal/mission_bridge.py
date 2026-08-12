@@ -299,7 +299,11 @@ def _authority(receipt: Path, objective: str) -> tuple[dict, bytes, _PrivateDire
     if not isinstance(receipt, Path) or not isinstance(objective, str) or not objective:
         raise MissionBridgeError("invalid-request")
     try:
-        pool = Pool(receipt.parents[2])
+        pool_root = receipt.parents[2]
+        runtime_version = json.loads(
+            (pool_root / "pool.json").read_text(encoding="utf-8")
+        )["runtime_version"]
+        pool = Pool(pool_root, runtime_version=runtime_version)
         pool.resume(receipt)
         raw = receipt.read_bytes()
         authority = json.loads(raw)
@@ -1305,6 +1309,7 @@ def _expected_record(authority: dict, authority_raw: bytes, readback: dict) -> d
         "generation": authority["generation"],
         "project_path": authority["project_path"],
         "mission_status": readback["status"],
+        "current_route": readback["current_route"],
     }
 
 

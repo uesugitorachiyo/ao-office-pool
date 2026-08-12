@@ -1,6 +1,5 @@
 import dataclasses
 import hashlib
-import hmac
 import json
 import os
 import shutil
@@ -12,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import internal.execution as execution_module
+import internal.mission_bridge as mission_bridge
 from internal.execution import (
     AtlasWorkgraph,
     BlueprintAuthorization,
@@ -130,9 +130,7 @@ class ExecutionTests(unittest.TestCase):
         self.configuration.stop()
         self.temporary_directory.cleanup()
 
-    def _mission(self):
-        record = self.project / ".ao" / "mission" / "office-pool" / "mission.json"
-        record.parent.mkdir(parents=True)
+    def _mission(self, route="ao-forge"):
         value = {
             "schema_version": 1,
             "mission_id": "mission-0123456789abcdef",
@@ -144,19 +142,24 @@ class ExecutionTests(unittest.TestCase):
             "generation": self.authority["generation"],
             "project_path": self.authority["project_path"],
             "mission_status": "active",
+            "current_route": route,
         }
-        raw = canonical(value) + b"\n"
-        record.write_bytes(raw)
-        record.with_suffix(".hmac").write_text(
-            hmac.new(self.authority_raw, raw, hashlib.sha256).hexdigest() + "\n",
-            encoding="ascii",
-        )
+        with mission_bridge._record_paths(
+            self.authority, self.authority_raw, self.project, self.task_text
+        )[0] as record:
+            mission_bridge._write_authenticated(
+                record,
+                value,
+                self.authority_raw,
+                mission_bridge.MISSION_SCHEMA,
+            )
+            record_path = record.path
         return MissionReadback(
             mission_id=value["mission_id"],
             objective_digest=value["objective_digest"],
             status="active",
-            current_route="ao-forge",
-            record=record,
+            current_route=route,
+            record=record_path,
             resumed=True,
         )
 
@@ -258,10 +261,6 @@ class ExecutionTests(unittest.TestCase):
         cases = [
             self._request(authority=wrong_receipt),
             self._replace(self.request, "task_text", "wrong"),
-            dataclasses.replace(
-                self.request,
-                mission=dataclasses.replace(self.mission, objective_digest="sha256:" + "0" * 64),
-            ),
         ]
         for request in cases:
             with self.subTest(request=request):
@@ -270,7 +269,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertFalse((self.project / "ao2-output.txt").exists())
 
     def test_atlas_workgraph_is_required_and_digest_bound_when_routed(self):
-        routed = dataclasses.replace(self.mission, current_route="ao-atlas")
+        routed = self._mission("ao-atlas")
         route = select_route(routed)
         request = dataclasses.replace(self.request, mission=routed, route=route)
         with self.assertRaises(ExecutionError) as raised:
@@ -279,7 +278,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertFalse((self.project / "ao2-output.txt").exists())
 
     def test_validated_atlas_workgraph_can_reach_governed_execution(self):
-        mission = dataclasses.replace(self.mission, current_route="ao-atlas")
+        mission = self._mission("ao-atlas")
         route = select_route(mission)
         atlas_value = {
             "schema_version": 1,
@@ -407,16 +406,26 @@ class ExecutionTests(unittest.TestCase):
         self.assertFalse((self.project / "ao2-output.txt").exists())
 
     def test_route_decision_cannot_bypass_the_fixed_rule_table(self):
-        mission = dataclasses.replace(self.mission, current_route="ao-blueprint")
         route = dataclasses.replace(
-            select_route(mission),
-            route="ao-forge",
-            execution_candidate=True,
+            select_route(self.mission),
+            route="ao-blueprint",
+            execution_candidate=False,
         )
-        request = dataclasses.replace(self.request, mission=mission, route=route)
+        request = dataclasses.replace(self.request, route=route)
         with self.assertRaises(ExecutionError) as raised:
             execute(request)
         self.assertEqual(raised.exception.code, "route-mismatch")
+        self.assertFalse((self.project / "ao2-output.txt").exists())
+
+    def test_caller_mission_route_cannot_override_authenticated_record(self):
+        # MUTATION: deriving authority from this caller value accepts an Atlas route.
+        mission = dataclasses.replace(self.mission, current_route="ao-atlas")
+        request = dataclasses.replace(
+            self.request, mission=mission, route=select_route(mission)
+        )
+        with self.assertRaises(ExecutionError) as raised:
+            execute(request)
+        self.assertEqual(raised.exception.code, "mission-mismatch")
         self.assertFalse((self.project / "ao2-output.txt").exists())
 
     def test_covenant_digest_mismatch_fails_before_launch(self):

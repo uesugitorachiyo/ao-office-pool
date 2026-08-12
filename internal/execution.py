@@ -11,18 +11,19 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from internal.mission_bridge import (
+    MissionBridgeError,
     MissionReadback,
+    _load_authenticated_record,
     _private_directory,
     _private_file,
     _receipt_project_root,
     _write_private_bytes,
 )
 from internal.planning_routes import PlanningRouteError, RouteDecision, select_route
-from internal.pool import Pool, PoolError
 
 
 MAX_OUTPUT = 64 * 1024
@@ -145,22 +146,37 @@ def _validated_evidence(value, expected_type: type, digest_field: str, *, code: 
     return {"schema_version": 1, **record, digest_field: supplied}
 
 
-def _validate_mission(request: ExecutionRequest, authority: dict, authority_raw: bytes) -> None:
+def _authenticated_mission(
+    authority_path: Path, task_text: str
+) -> tuple[MissionReadback, dict]:
+    try:
+        record, authority, _, project_path = _load_authenticated_record(
+            authority_path, task_text
+        )
+    except MissionBridgeError as error:
+        code = (
+            "unauthorized"
+            if error.code in {"invalid-request", "task-mismatch", "unauthorized"}
+            else "mission-record-mismatch"
+        )
+        raise ExecutionError(code) from error
+    return (
+        MissionReadback(
+            mission_id=record["mission_id"],
+            objective_digest=record["objective_digest"],
+            status=record["mission_status"],
+            current_route=record["current_route"],
+            record=project_path,
+            resumed=True,
+        ),
+        authority,
+    )
+
+
+def _validate_mission(request: ExecutionRequest, authority: dict) -> None:
     mission = request.mission
     if (
-        not isinstance(mission, MissionReadback)
-        or any(
-            getattr(mission, field)
-            for field in (
-                "executes_work",
-                "approves_policy",
-                "calls_providers",
-                "publishes",
-                "deploys",
-                "mutates_repositories",
-            )
-        )
-        or mission.objective_digest != "sha256:" + authority["task_digest"]
+        mission.objective_digest != "sha256:" + authority["task_digest"]
         or hashlib.sha256(request.task_text.encode()).hexdigest()
         != authority["task_digest"]
         or request.route.mission_id != mission.mission_id
@@ -173,32 +189,6 @@ def _validate_mission(request: ExecutionRequest, authority: dict, authority_raw:
             raise ExecutionError("route-mismatch")
     except PlanningRouteError as error:
         raise ExecutionError("route-mismatch") from error
-    project = Path(authority["project_path"])
-    try:
-        record = mission.record.resolve(strict=True)
-        expected_parent = (project / ".ao" / "mission" / "office-pool").resolve(strict=True)
-        if record.parent != expected_parent or record.is_symlink() or record.stat().st_nlink != 1:
-            raise ValueError("unsafe record")
-        raw = record.read_bytes()
-        seal = record.with_suffix(".hmac").read_text(encoding="ascii")
-        expected_seal = hmac.new(authority_raw, raw, hashlib.sha256).hexdigest() + "\n"
-        value = json.loads(raw)
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        raise ExecutionError("mission-record-mismatch") from error
-    expected = {
-        "schema_version": 1,
-        "mission_id": mission.mission_id,
-        "objective_digest": mission.objective_digest,
-        "authority_digest": hashlib.sha256(authority_raw).hexdigest(),
-        "chat_digest": authority["holder_digest"],
-        "task_digest": authority["task_digest"],
-        "office_id": authority["office_id"],
-        "generation": authority["generation"],
-        "project_path": authority["project_path"],
-        "mission_status": mission.status,
-    }
-    if value != expected or not hmac.compare_digest(seal, expected_seal):
-        raise ExecutionError("mission-record-mismatch")
 
 
 def _same_project(path: Path, authority: dict) -> bool:
@@ -503,13 +493,13 @@ def execute(request: ExecutionRequest) -> ExecutionResult:
     try:
         pool_root = request.authority_path.parents[2]
         pool_metadata = json.loads((pool_root / "pool.json").read_text(encoding="utf-8"))
-        pool = Pool(pool_root, runtime_version=pool_metadata["runtime_version"])
-        pool.resume(request.authority_path)
-        authority_raw = request.authority_path.read_bytes()
-        authority = json.loads(authority_raw)
-    except (OSError, IndexError, TypeError, ValueError, json.JSONDecodeError, PoolError) as error:
+        mission, authority = _authenticated_mission(
+            request.authority_path, request.task_text
+        )
+    except (OSError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ExecutionError("unauthorized") from error
-    _validate_mission(request, authority, authority_raw)
+    request = replace(request, mission=mission)
+    _validate_mission(request, authority)
     blueprint = _validated_evidence(
         request.blueprint,
         BlueprintAuthorization,
