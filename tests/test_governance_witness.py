@@ -248,7 +248,7 @@ class GovernanceWitnessTests(unittest.TestCase):
                 {
                     "contract_version": "ao.atlas.workgraph.v0.1",
                     "id": "atlas-workgraph",
-                    "target_instance": str(self.project),
+                    "target_instance": self.authority["project_path"],
                     "mission_id": self.mission_id,
                     "objective_digest": "sha256:" + self.authority["task_digest"],
                     "nodes": [{"id": "node", "status": "ready"}],
@@ -262,7 +262,7 @@ class GovernanceWitnessTests(unittest.TestCase):
                 {
                     "schema_version": "ao.forge.goal-run.v0.1",
                     "goal_id": "bounded-goal",
-                    "repo": str(self.project),
+                    "repo": self.authority["project_path"],
                     **{OBJECTIVE_FIELD: self.task_text},
                     "acceptance_criteria": ["bounded"],
                     "allowed_scope": ["."],
@@ -295,12 +295,12 @@ class GovernanceWitnessTests(unittest.TestCase):
                 {
                     "schema_version": "covenant.governance-evidence.v1",
                     "decision": "authorized",
-                    "scope": str(self.project),
+                    "scope": self.authority["project_path"],
                     "expires_at": "2099-01-01T00:00:00Z",
                     "revoked": False,
                     "mission_id": self.mission_id,
                     "objective_digest": "sha256:" + self.authority["task_digest"],
-                    "target_path": str(self.project),
+                    "target_path": self.authority["project_path"],
                     "workflow_sha256": workflow_digest,
                     "run_id": self.run_id,
                     "ao2_sha256": self.ao2_digest,
@@ -341,6 +341,23 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.run_id,
             self.evidence_set,
         )
+
+    def test_fixture_artifacts_use_authority_canonical_project_path(self):
+        # MUTATION: host-path fixture values break Windows authority cross-references.
+        canonical = "C:\\fixture\\canonical-project"
+        self.authority["project_path"] = canonical
+        shutil.rmtree(self.project / ".ao" / "evidence")
+        self._write_artifacts()
+        self.assertEqual(
+            json.loads(self.atlas.read_text(encoding="utf-8"))["target_instance"],
+            canonical,
+        )
+        self.assertEqual(
+            json.loads(self.forge.read_text(encoding="utf-8"))["repo"], canonical
+        )
+        covenant = json.loads(self.covenant.read_text(encoding="utf-8"))
+        self.assertEqual(covenant["scope"], canonical)
+        self.assertEqual(covenant["target_path"], canonical)
 
     def _consume(self, envelope):
         with self.pool.authority_lease(self.claim_path) as lease:
@@ -775,6 +792,16 @@ class GovernanceWitnessTests(unittest.TestCase):
             if name == "ao-forge":
                 original = artifact.private.path
                 parked = original.with_name(original.name + ".parked")
+                before = original.read_bytes()
+                identity = (original.stat().st_dev, original.stat().st_ino)
+                if os.name == "nt":
+                    with self.assertRaises(PermissionError):
+                        original.rename(parked)
+                    self.assertEqual(original.read_bytes(), before)
+                    self.assertEqual(
+                        (original.stat().st_dev, original.stat().st_ino), identity
+                    )
+                    return result
                 original.rename(parked)
                 original.write_bytes(b"replacement")
                 original.unlink()
@@ -820,6 +847,16 @@ class GovernanceWitnessTests(unittest.TestCase):
                 output = rest[1]
                 original = output.private.path
                 parked = original.with_name(original.name + ".parked")
+                before = original.read_bytes()
+                identity = (original.stat().st_dev, original.stat().st_ino)
+                if os.name == "nt":
+                    with self.assertRaises(PermissionError):
+                        original.rename(parked)
+                    self.assertEqual(original.read_bytes(), before)
+                    self.assertEqual(
+                        (original.stat().st_dev, original.stat().st_ino), identity
+                    )
+                    return result
                 original.rename(parked)
                 original.write_bytes(b"replacement")
                 original.unlink()

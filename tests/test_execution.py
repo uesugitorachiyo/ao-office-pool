@@ -25,9 +25,19 @@ FAKE_AO2 = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#define environ _environ
+#define task_sleep(seconds) Sleep((seconds) * 1000)
+#else
 #include <unistd.h>
+#define task_sleep(seconds) sleep(seconds)
+#endif
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 int main(int argc, char **argv) {
   const char *target = NULL, *run = NULL;
@@ -56,6 +66,21 @@ int main(int argc, char **argv) {
   }
   fclose(environment);
   if (mode && (strcmp(mode, "child-timeout") == 0 || strcmp(mode, "child-large") == 0)) {
+#ifdef _WIN32
+    STARTUPINFOA startup;
+    PROCESS_INFORMATION child;
+    char command[] = "cmd.exe /d /c timeout /t 30 /nobreak >NUL";
+    ZeroMemory(&startup, sizeof(startup));
+    ZeroMemory(&child, sizeof(child));
+    startup.cb = sizeof(startup);
+    if (!CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 71;
+    FILE *pid_file = fopen("ao2-child-pid", "wb");
+    if (pid_file) { fprintf(pid_file, "%lu", (unsigned long)child.dwProcessId); fclose(pid_file); }
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    Sleep(50);
+    if (strcmp(mode, "child-timeout") == 0) task_sleep(30);
+#else
     pid_t child = fork();
     if (child < 0) return 71;
     if (child == 0) {
@@ -64,9 +89,10 @@ int main(int argc, char **argv) {
       close(1); close(2); sleep(30); return 0;
     }
     usleep(50000);
-    if (strcmp(mode, "child-timeout") == 0) sleep(30);
+    if (strcmp(mode, "child-timeout") == 0) task_sleep(30);
+#endif
     char output[70000]; memset(output, 'x', sizeof(output));
-    fwrite(output, 1, sizeof(output), stdout); fflush(stdout); sleep(30);
+    fwrite(output, 1, sizeof(output), stdout); fflush(stdout); task_sleep(30);
   }
   FILE *arguments = fopen("ao2-arguments.txt", "wb");
   if (!arguments) return 65;
@@ -673,77 +699,119 @@ class ExecutionTests(unittest.TestCase):
     def test_record_readback_mutation_preserves_written_evidence(self):
         # MUTATION: returning without exact readback accepts noncanonical changed bytes.
         def add_whitespace(record, _descriptor, _amount):
+            before = record.read_bytes()
+            if os.name == "nt":
+                with self.assertRaises(PermissionError):
+                    with record.open("ab") as stream:
+                        stream.write(b" ")
+                self.assertEqual(record.read_bytes(), before)
+                return
             with record.open("ab") as stream:
                 stream.write(b" ")
 
-        with (
-            self._during_record_readback(add_whitespace),
-            self.assertRaises(ExecutionError) as raised,
-        ):
-            execute(self.claim_path, self.envelope)
-        self.assertEqual(raised.exception.code, "recovery-required")
-        self.assertIsNotNone(raised.exception.record)
-        self.assertEqual(
-            raised.exception.record.read_bytes()[-2:], b"\n "
-        )
+        if os.name == "nt":
+            with self._during_record_readback(add_whitespace):
+                execute(self.claim_path, self.envelope)
+        else:
+            with (
+                self._during_record_readback(add_whitespace),
+                self.assertRaises(ExecutionError) as raised,
+            ):
+                execute(self.claim_path, self.envelope)
+            self.assertEqual(raised.exception.code, "recovery-required")
+            self.assertIsNotNone(raised.exception.record)
+            self.assertEqual(
+                raised.exception.record.read_bytes()[-2:], b"\n "
+            )
 
     def test_record_digest_mismatch_preserves_written_evidence(self):
         # MUTATION: schema-only readback accepts a syntactically valid false record digest.
         def replace_digest(record, _descriptor, _amount):
+            before = record.read_bytes()
             value = json.loads(record.read_bytes())
             value["record_digest"] = "0" * 64
-            record.write_bytes(
-                (
-                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-                ).encode()
-            )
+            replacement = (
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            if os.name == "nt":
+                with self.assertRaises(PermissionError):
+                    record.write_bytes(replacement)
+                self.assertEqual(record.read_bytes(), before)
+                return
+            record.write_bytes(replacement)
 
-        with (
-            self._during_record_readback(replace_digest),
-            self.assertRaises(ExecutionError) as raised,
-        ):
-            execute(self.claim_path, self.envelope)
-        self.assertEqual(raised.exception.code, "recovery-required")
-        self.assertIsNotNone(raised.exception.record)
-        preserved = json.loads(raised.exception.record.read_bytes())
-        self.assertEqual(preserved["record_digest"], "0" * 64)
+        if os.name == "nt":
+            with self._during_record_readback(replace_digest):
+                execute(self.claim_path, self.envelope)
+        else:
+            with (
+                self._during_record_readback(replace_digest),
+                self.assertRaises(ExecutionError) as raised,
+            ):
+                execute(self.claim_path, self.envelope)
+            self.assertEqual(raised.exception.code, "recovery-required")
+            self.assertIsNotNone(raised.exception.record)
+            preserved = json.loads(raised.exception.record.read_bytes())
+            self.assertEqual(preserved["record_digest"], "0" * 64)
 
-    @unittest.skipIf(os.name == "nt", "POSIX retained-descriptor mutation assertion")
     def test_record_rename_recreate_is_rejected_without_touching_replacement(self):
         # MUTATION: verifying only the open inode accepts a substituted record pathname.
         parked = self._execution_records / "parked-created-record.json"
 
         def replace_path(record, _descriptor, _amount):
+            before = record.read_bytes()
+            identity = (record.stat().st_dev, record.stat().st_ino)
+            if os.name == "nt":
+                with self.assertRaises(PermissionError):
+                    os.replace(record, parked)
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual((record.stat().st_dev, record.stat().st_ino), identity)
+                return
             os.replace(record, parked)
             record.write_bytes(b"replacement-sentinel")
 
-        with (
-            self._during_record_readback(replace_path),
-            self.assertRaises(ExecutionError) as raised,
-        ):
-            execute(self.claim_path, self.envelope)
-        self.assertEqual(raised.exception.code, "recovery-required")
-        self.assertEqual(raised.exception.record.read_bytes(), b"replacement-sentinel")
-        self.assertTrue(parked.read_bytes().startswith(b'{"ao2_sha256"'))
+        if os.name == "nt":
+            with self._during_record_readback(replace_path):
+                execute(self.claim_path, self.envelope)
+        else:
+            with (
+                self._during_record_readback(replace_path),
+                self.assertRaises(ExecutionError) as raised,
+            ):
+                execute(self.claim_path, self.envelope)
+            self.assertEqual(raised.exception.code, "recovery-required")
+            self.assertEqual(raised.exception.record.read_bytes(), b"replacement-sentinel")
+            self.assertTrue(parked.read_bytes().startswith(b'{"ao2_sha256"'))
 
-    @unittest.skipIf(os.name == "nt", "POSIX retained-descriptor mutation assertion")
     def test_record_delete_recreate_is_rejected_without_touching_replacement(self):
         # MUTATION: reopening the pathname reads attacker replacement instead of created bytes.
         preserved = self._execution_records / "preserved-created-record.json"
 
         def replace_path(record, descriptor, _amount):
+            before = record.read_bytes()
+            identity = (record.stat().st_dev, record.stat().st_ino)
+            if os.name == "nt":
+                with self.assertRaises(PermissionError):
+                    record.unlink()
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual((record.stat().st_dev, record.stat().st_ino), identity)
+                return
             preserved.write_bytes(os.pread(descriptor, record.stat().st_size, 0))
             record.unlink()
             record.write_bytes(b"replacement-sentinel")
 
-        with (
-            self._during_record_readback(replace_path),
-            self.assertRaises(ExecutionError) as raised,
-        ):
-            execute(self.claim_path, self.envelope)
-        self.assertEqual(raised.exception.code, "recovery-required")
-        self.assertEqual(raised.exception.record.read_bytes(), b"replacement-sentinel")
-        self.assertTrue(preserved.read_bytes().startswith(b'{"ao2_sha256"'))
+        if os.name == "nt":
+            with self._during_record_readback(replace_path):
+                execute(self.claim_path, self.envelope)
+        else:
+            with (
+                self._during_record_readback(replace_path),
+                self.assertRaises(ExecutionError) as raised,
+            ):
+                execute(self.claim_path, self.envelope)
+            self.assertEqual(raised.exception.code, "recovery-required")
+            self.assertEqual(raised.exception.record.read_bytes(), b"replacement-sentinel")
+            self.assertTrue(preserved.read_bytes().startswith(b'{"ao2_sha256"'))
 
     @unittest.skipIf(os.name == "nt", "POSIX hard-link mutation assertion")
     def test_record_hardlink_during_readback_is_rejected_and_bytes_preserved(self):
