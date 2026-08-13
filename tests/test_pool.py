@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import hmac
 import json
@@ -292,25 +293,73 @@ class PoolTests(unittest.TestCase):
 
     def test_authority_lease_holds_release_lock(self):
         authority = self.pool.claim("holder-a", "task-a", self.project, "pinned")
-        attempting_lock = threading.Event()
+        contention_observed = threading.Event()
         finished = threading.Event()
-        real_pool_lock = pool_module.pool_lock
+        observations = []
+        release_errors = []
         wait_seconds = 30 if os.name == "nt" else 5
 
-        def observed_pool_lock(*arguments, **keywords):
-            attempting_lock.set()
-            return real_pool_lock(*arguments, **keywords)
+        if os.name == "nt":
+            import msvcrt
+
+            real_lock = msvcrt.locking
+
+            def observed_lock(descriptor, mode, count):
+                if mode == msvcrt.LK_NBLCK and not observations:
+                    try:
+                        real_lock(descriptor, mode, count)
+                    except OSError as error:
+                        if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                            contention_observed.set()
+                            raise
+                        observations.append("contended")
+                    else:
+                        observations.append("acquired")
+                        real_lock(descriptor, msvcrt.LK_UNLCK, count)
+                    contention_observed.set()
+                return real_lock(descriptor, mode, count)
+
+            lock_patch = mock.patch.object(msvcrt, "locking", observed_lock)
+        else:
+            import fcntl
+
+            real_lock = fcntl.flock
+
+            def observed_lock(descriptor, operation):
+                if operation == fcntl.LOCK_EX and not observations:
+                    try:
+                        real_lock(descriptor, operation | fcntl.LOCK_NB)
+                    except OSError as error:
+                        if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                            contention_observed.set()
+                            raise
+                        observations.append("contended")
+                    else:
+                        observations.append("acquired")
+                        real_lock(descriptor, fcntl.LOCK_UN)
+                    contention_observed.set()
+                return real_lock(descriptor, operation)
+
+            lock_patch = mock.patch.object(fcntl, "flock", observed_lock)
+
+        def require_contention():
+            self.assertTrue(contention_observed.wait(wait_seconds))
+            self.assertEqual(observations, ["contended"])
 
         def release():
-            self.pool.release(authority)
-            finished.set()
+            try:
+                self.pool.release(authority)
+            except BaseException as error:
+                release_errors.append(error)
+            else:
+                finished.set()
 
-        thread = threading.Thread(target=release)
+        thread = threading.Thread(target=release, daemon=True)
         try:
             with self.pool.authority_lease(authority) as lease:
-                with mock.patch.object(pool_module, "pool_lock", observed_pool_lock):
+                with lock_patch:
                     thread.start()
-                    self.assertTrue(attempting_lock.wait(wait_seconds))
+                    require_contention()
                     self.assertFalse(finished.is_set())
                     self.assertEqual(lease.authority_path, authority.resolve())
                     self.assertEqual(lease.authority_bytes, authority.read_bytes())
@@ -320,6 +369,8 @@ class PoolTests(unittest.TestCase):
         finally:
             if thread.ident is not None:
                 thread.join(wait_seconds)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(release_errors, [])
         self.assertTrue(finished.is_set())
 
     def test_runtime_containment_value_error_requires_recovery(self):

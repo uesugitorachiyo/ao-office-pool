@@ -648,6 +648,26 @@ class MissionBridgeTests(unittest.TestCase):
         else:
             self.assertEqual(recorded_cwd, str(self.project))
 
+    def test_native_fake_mission_creates_missing_home(self):
+        # MUTATION: writing markers before creating --home makes fresh direct runs exit 65.
+        project = self.base / "fresh-project"
+        home = project / ".ao" / "mission"
+        project.mkdir()
+
+        result = subprocess.run(
+            [self.executable, "--home", str(home), "start", self.task_text],
+            cwd=project,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((project / "ao2-output.txt").exists())
+        self.assertEqual(
+            json.loads(result.stdout)["mission_id"],
+            "mission-0123456789abcdef",
+        )
+        self.assertTrue((home / "payload-marker").is_file())
+
     def test_authenticated_record_binds_current_route(self):
         # MUTATION: omitting the route leaves execution authority caller-forgeable.
         readback = start_or_resume(self.claim_path, self.task_text)

@@ -22,6 +22,7 @@ from tests import test_governance_witness as witness_tests
 
 
 FAKE_AO2 = r'''
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -33,10 +34,13 @@ FAKE_AO2 = r'''
 #define environ _environ
 #define task_sleep(seconds) Sleep((seconds) * 1000)
 #define task_getcwd _getcwd
+#define task_mkdir(path) _mkdir(path)
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #define task_sleep(seconds) sleep(seconds)
 #define task_getcwd getcwd
+#define task_mkdir(path) mkdir(path, 0700)
 #endif
 
 #ifndef _WIN32
@@ -52,6 +56,48 @@ static const char *argument_value(int argc, char **argv, const char *name) {
     if (strcmp(argv[i], name) == 0) return argv[i + 1];
   }
   return NULL;
+}
+
+static int path_separator(char value) {
+#ifdef _WIN32
+  return value == '/' || value == '\\';
+#else
+  return value == '/';
+#endif
+}
+
+static int make_directory(const char *path) {
+  return task_mkdir(path) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+static int make_directories(const char *path) {
+  char copy[4096];
+  size_t length = strlen(path);
+  if (length == 0 || length >= sizeof(copy)) return -1;
+  memcpy(copy, path, length + 1);
+  char *cursor = copy;
+#ifdef _WIN32
+  if (length >= 3 && copy[1] == ':' && path_separator(copy[2])) {
+    cursor = copy + 3;
+  } else if (length >= 2 && path_separator(copy[0]) && path_separator(copy[1])) {
+    cursor = copy + 2;
+    for (int component = 0; component < 2; component++) {
+      while (*cursor && !path_separator(*cursor)) cursor++;
+      while (path_separator(*cursor)) cursor++;
+    }
+  }
+#else
+  while (path_separator(*cursor)) cursor++;
+#endif
+  for (; *cursor; cursor++) {
+    if (!path_separator(*cursor)) continue;
+    char separator = *cursor;
+    *cursor = '\0';
+    if (make_directory(copy) != 0) return -1;
+    *cursor = separator;
+    while (path_separator(cursor[1])) cursor++;
+  }
+  return make_directory(copy);
 }
 
 static int write_bytes(const char *path, const char *value) {
@@ -211,6 +257,7 @@ static int fake_mission(int argc, char **argv) {
   }
   const char *home = argument_value(argc, argv, "--home");
   if (!home) return 64;
+  if (make_directories(home) != 0) return 65;
   char path[4096], cwd[4096], objective[72];
   char mission[64] = "mission-0123456789abcdef";
   snprintf(path, sizeof(path), "%s/payload-marker", home);
