@@ -8,6 +8,8 @@ import re
 import stat
 import sys
 import uuid
+from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +20,7 @@ from internal.mission_bridge import (
     MissionReadback,
     _PrivateDirectory,
     _canonical_bytes,
+    _hash_descriptor,
     _load_record,
     _open_verified_file,
     _private_directory,
@@ -34,6 +37,8 @@ from internal.pool import AuthorityLease, Pool, PoolError
 
 COMPONENT_LOCK = Path(__file__).parents[1] / "manifests/components.lock.json"
 BIN_DIR = Path(__file__).parents[1] / ".local/bin"
+FORGE_RUNTIME_ROOT = Path(__file__).parents[1] / "packaging/runtime/ao-forge"
+FORGE_SCHEMA_SHA256 = "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
 ENVELOPE_SCHEMA = Path(__file__).parents[1] / "schemas/governance-envelope.schema.json"
 REQUIREMENTS_MANIFEST = Path(__file__).parents[1] / "manifests/requirements.json"
 _PRIVATE_PARTS = (".ao", "governance", "office-pool")
@@ -62,6 +67,7 @@ _RUN_ID = re.compile(r"^run-[0-9a-f]{16}$")
 _WITNESS = re.compile(r"^witness-[0-9a-f]{32}$")
 _MAX_ARTIFACT = 64 * 1024 * 1024
 _MAX_ENVELOPE = 64 * 1024
+_FORGE_SCHEMA_PARTS = ("docs", "contracts", "goal-run-v0.1.schema.json")
 
 
 class GovernanceError(RuntimeError):
@@ -446,6 +452,45 @@ def _readback(name: str, raw: bytes) -> dict:
         raise GovernanceError("governance-producer-readback") from error
 
 
+def _forge_runtime(
+    stack: ExitStack, project: _PrivateDirectory
+) -> tuple[_PrivateDirectory, Callable[[], None]]:
+    try:
+        schema_path = FORGE_RUNTIME_ROOT.joinpath(*_FORGE_SCHEMA_PARTS)
+        schema = stack.enter_context(
+            _open_verified_file(schema_path, FORGE_SCHEMA_SHA256)
+        )
+        runtime = stack.enter_context(
+            _private_directory(FORGE_RUNTIME_ROOT, *_FORGE_SCHEMA_PARTS[:-1])
+        )
+        descriptor = schema.descriptors[0]
+        initial = os.fstat(descriptor)
+    except (IndexError, OSError, TypeError, ValueError, MissionBridgeError) as error:
+        raise MissionBridgeError("mission-identity-mismatch") from error
+
+    def verify() -> None:
+        try:
+            project.require_current_paths()
+            runtime.require_current_paths()
+            opened = os.fstat(descriptor)
+            current = schema_path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+                or opened.st_ctime_ns != initial.st_ctime_ns
+                or not hmac.compare_digest(
+                    _hash_descriptor(descriptor), FORGE_SCHEMA_SHA256
+                )
+            ):
+                raise ValueError("Forge runtime schema changed")
+        except (OSError, TypeError, ValueError, MissionBridgeError) as error:
+            raise MissionBridgeError("mission-identity-mismatch") from error
+
+    verify()
+    return runtime, verify
+
+
 def _run_producer(
     name: str,
     component: dict,
@@ -483,17 +528,27 @@ def _run_producer(
             for descriptor in retained_descriptors:
                 previous_inheritable[descriptor] = os.get_inheritable(descriptor)
                 os.set_inheritable(descriptor, True)
-        with _open_verified_file(
-            BIN_DIR / component["asset"], component["sha256"]
-        ) as executable:
+        with ExitStack() as stack:
+            executable = stack.enter_context(
+                _open_verified_file(
+                    BIN_DIR / component["asset"], component["sha256"]
+                )
+            )
+            launch_project = project
+            retained_verifier = None
+            if name == "ao-forge":
+                launch_project, retained_verifier = _forge_runtime(stack, project)
             raw = _run_output(
                 arguments,
-                project,
+                launch_project,
                 executable,
                 timeout_seconds=10,
                 environment=environment,
                 retained_descriptors=retained_descriptors,
+                retained_verifier=retained_verifier,
             )
+            if retained_verifier is not None:
+                retained_verifier()
     except MissionBridgeError as error:
         code = (
             "governance-producer-identity-mismatch"

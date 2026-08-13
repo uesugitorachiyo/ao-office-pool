@@ -159,5 +159,16 @@ class ScanPublicTreeTests(unittest.TestCase):
         self.write("README.md")
         self.assertEqual(scan_tree(self.root), [])
 
+    def test_accepts_only_hash_bound_pinned_forge_runtime_schema(self):
+        relative = "packaging/runtime/ao-forge/docs/contracts/goal-run-v0.1.schema.json"
+        packaged = Path(__file__).parents[1] / relative
+        target = self.root / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(packaged.read_bytes())
+        self.assertNotIn(relative, self.paths())
+        target.write_bytes(b"public replacement\n")
+        findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
+        self.assertEqual(findings[relative], "identity")
+
 
 if __name__ == "__main__": unittest.main()

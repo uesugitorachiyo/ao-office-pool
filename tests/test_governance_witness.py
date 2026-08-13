@@ -26,6 +26,9 @@ from internal.pool import AuthorityLease, Pool, PoolError
 from tests.windows_crt import windows_text_mode
 
 
+TEST_FORGE_SCHEMA = b"test-forge-goal-run-schema\n"
+
+
 FAKE_PRODUCER = r'''
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +37,22 @@ FAKE_PRODUCER = r'''
 
 static const char *base(const char *path) {
   const char *slash = strrchr(path, '/');
+  const char *backslash = strrchr(path, '\\');
+  if (!slash || (backslash && backslash > slash)) slash = backslash;
   return slash ? slash + 1 : path;
+}
+
+static int valid_forge_schema(void) {
+  const char expected[] = "test-forge-goal-run-schema\n";
+  char buffer[sizeof(expected)] = {0};
+  FILE *schema = fopen("docs/contracts/goal-run-v0.1.schema.json", "rb");
+  if (!schema) return 0;
+  size_t count = fread(buffer, 1, sizeof(buffer), schema);
+  int trailing = fgetc(schema);
+  fclose(schema);
+  return count == sizeof(expected) - 1
+    && trailing == EOF
+    && memcmp(buffer, expected, sizeof(expected) - 1) == 0;
 }
 
 int main(int argc, char **argv) {
@@ -108,6 +126,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc > 2 && strcmp(argv[1], "goal") == 0) {
+    if (!valid_forge_schema()) return 66;
     puts("{\"goal_run\":\"goal-run.json\",\"schema\":\"goal-run-v0.1.schema.json\",\"schema_version\":\"ao.forge.goal-run.v0.1\",\"goal_id\":\"bounded-goal\",\"current_phase\":\"implementation\",\"next_action_guard\":\"enabled\",\"status\":\"passed\",\"errors\":[]}");
     return 0;
   }
@@ -143,6 +162,16 @@ ASSETS = {
 OBJECTIVE_FIELD = "obj" + "ective"
 
 
+class ForgeRuntimePackageTests(unittest.TestCase):
+    def test_packaged_schema_matches_pinned_forge_contract(self):
+        schema = governance.FORGE_RUNTIME_ROOT.joinpath(
+            *governance._FORGE_SCHEMA_PARTS
+        )
+        expected = "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
+        self.assertEqual(governance.FORGE_SCHEMA_SHA256, expected)
+        self.assertEqual(hashlib.sha256(schema.read_bytes()).hexdigest(), expected)
+
+
 class GovernanceWitnessTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -160,6 +189,15 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.authority = json.loads(self.authority_raw)
         self.mission_id = "mission-0123456789abcdef"
         self._write_mission("ao-forge")
+        self.forge_runtime = self.base / "forge-runtime"
+        self.forge_schema = (
+            self.forge_runtime
+            / "docs"
+            / "contracts"
+            / "goal-run-v0.1.schema.json"
+        )
+        self.forge_schema.parent.mkdir(parents=True)
+        self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
         self.bin_dir = self.base / "bin"
         self.bin_dir.mkdir()
         source = self.base / "fake-producer.c"
@@ -181,6 +219,9 @@ class GovernanceWitnessTests(unittest.TestCase):
             governance,
             COMPONENT_LOCK=self.lock,
             BIN_DIR=self.bin_dir,
+            FORGE_RUNTIME_ROOT=self.forge_runtime,
+            FORGE_SCHEMA_SHA256=hashlib.sha256(TEST_FORGE_SCHEMA).hexdigest(),
+            create=True,
         )
         self.configuration.start()
         self.workflow = self.project / "workflow.yaml"
@@ -371,6 +412,115 @@ class GovernanceWitnessTests(unittest.TestCase):
     def _mode(self, value):
         (self.project / "producer-mode").write_text(value, encoding="utf-8")
 
+    def _producer_commands(self):
+        commands = {}
+        for root in (self.project, self.forge_runtime):
+            path = root / "producer-commands"
+            if path.is_file():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    commands[line.split("|", 1)[0]] = line
+        return commands
+
+    def _producer_environment(self):
+        lines = []
+        for root in (self.project, self.forge_runtime):
+            path = root / "producer-environment"
+            if path.is_file():
+                lines.extend(path.read_text(encoding="utf-8").splitlines())
+        return lines
+
+    def test_forge_uses_hash_bound_packaged_runtime_outside_connected_project(self):
+        self.assertFalse((self.project / "docs").exists())
+        envelope = issue_witness(
+            self.claim_path, self.task_text, self.valid_artifacts()
+        )
+        self.assertTrue(envelope.is_file())
+        self.assertFalse((self.project / "docs").exists())
+        project_commands = (
+            self.project / "producer-commands"
+        ).read_text(encoding="utf-8").splitlines()
+        runtime_commands = (
+            self.forge_runtime / "producer-commands"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            {line.split("|", 1)[0] for line in project_commands},
+            {"ao-blueprint", "covenant"},
+        )
+        self.assertEqual(len(runtime_commands), 1)
+        self.assertIn("|goal|validate|--goal-run|", runtime_commands[0])
+        goal_run = runtime_commands[0].split("|--goal-run|", 1)[1].split("|", 1)[0]
+        self.assertTrue(Path(goal_run).is_absolute())
+
+    def test_missing_forge_runtime_schema_fails_before_forge_launch(self):
+        self.forge_schema.unlink()
+        self._assert_code(
+            "governance-producer-identity-mismatch",
+            lambda: issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            ),
+        )
+        self.assertNotIn("forge", self._producer_commands())
+        self.assertFalse((self.project / "docs").exists())
+
+    def test_substituted_forge_runtime_schema_fails_before_forge_launch(self):
+        self.forge_schema.write_bytes(b"x" * len(TEST_FORGE_SCHEMA))
+        self._assert_code(
+            "governance-producer-identity-mismatch",
+            lambda: issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            ),
+        )
+        self.assertNotIn("forge", self._producer_commands())
+        self.assertFalse((self.project / "docs").exists())
+
+    def test_forge_runtime_schema_substitution_during_launch_fails_closed(self):
+        run_output = governance._run_output
+
+        def substitute_before_launch(arguments, *args, **kwargs):
+            if arguments[:2] == ["goal", "validate"]:
+                before = self.forge_schema.read_bytes()
+                identity = (
+                    self.forge_schema.stat().st_dev,
+                    self.forge_schema.stat().st_ino,
+                )
+                if os.name == "nt":
+                    with self.assertRaises(PermissionError):
+                        self.forge_schema.write_bytes(b"x" * len(before))
+                    self.assertEqual(self.forge_schema.read_bytes(), before)
+                    self.assertEqual(
+                        (
+                            self.forge_schema.stat().st_dev,
+                            self.forge_schema.stat().st_ino,
+                        ),
+                        identity,
+                    )
+                else:
+                    self.forge_schema.write_bytes(b"x" * len(before))
+            return run_output(arguments, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                governance, "_run_output", side_effect=substitute_before_launch
+            ):
+                if os.name == "nt":
+                    envelope = issue_witness(
+                        self.claim_path, self.task_text, self.valid_artifacts()
+                    )
+                    self.assertEqual(
+                        json.loads(envelope.read_text(encoding="utf-8"))["state"],
+                        "ready",
+                    )
+                else:
+                    self._assert_code(
+                        "governance-producer-identity-mismatch",
+                        lambda: issue_witness(
+                            self.claim_path, self.task_text, self.valid_artifacts()
+                        ),
+                    )
+                    self.assertNotIn("forge", self._producer_commands())
+        finally:
+            self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
+
     def test_issues_closed_detached_authenticated_envelope_from_native_producers(self):
         envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
         value = json.loads(envelope.read_text(encoding="utf-8"))
@@ -383,14 +533,14 @@ class GovernanceWitnessTests(unittest.TestCase):
             set(value["producer_artifacts"]),
             {"ao-blueprint", "ao-atlas", "ao-forge", "ao-covenant"},
         )
-        commands = (self.project / "producer-commands").read_text().splitlines()
+        commands = self._producer_commands()
         self.assertEqual(len(commands), 3)
-        self.assertIn("|authorize|--pack|", commands[0])
-        self.assertIn("|--out|", commands[0])
-        self.assertIn("|goal|validate|--goal-run|", commands[1])
-        self.assertIn("|verify|--ledger|", commands[2])
-        self.assertIn("|--evidence|", commands[2])
-        self.assertTrue(commands[2].endswith("|--json"))
+        self.assertIn("|authorize|--pack|", commands["ao-blueprint"])
+        self.assertIn("|--out|", commands["ao-blueprint"])
+        self.assertIn("|goal|validate|--goal-run|", commands["forge"])
+        self.assertIn("|verify|--ledger|", commands["covenant"])
+        self.assertIn("|--evidence|", commands["covenant"])
+        self.assertTrue(commands["covenant"].endswith("|--json"))
 
     def test_arbitrary_envelope_sealer_and_forged_lease_are_rejected(self):
         self.assertFalse(hasattr(governance, "_seal"))
@@ -781,7 +931,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
         with mock.patch.object(mission_bridge, "_run_output", side_effect=swap_during_launch):
             envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
-        self.assertNotIn(str(self.forge), (self.project / "producer-commands").read_text())
+        self.assertNotIn(str(self.forge), "\n".join(self._producer_commands().values()))
         self.assertTrue(envelope.is_file())
 
     def test_staged_candidate_a_b_a_swap_fails_closed(self):
@@ -907,7 +1057,8 @@ class GovernanceWitnessTests(unittest.TestCase):
             AO_TEST_PRODUCER_MODE="failure",
         )
         issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
-        lines = (self.project / "producer-environment").read_text().splitlines()
+        lines = self._producer_environment()
+        self.assertEqual(len(lines), 3)
         self.assertEqual(set(lines), {"DYLD=unset LD=unset PYTHON=unset TEST=unset"})
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
