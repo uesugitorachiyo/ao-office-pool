@@ -27,6 +27,7 @@ from tests.windows_crt import windows_text_mode
 
 
 TEST_FORGE_SCHEMA = b"test-forge-goal-run-schema\n"
+TEST_FORGE_REPLACEMENT = b"unverified-forge-goal-schema\n"
 
 
 FAKE_PRODUCER = r'''
@@ -42,31 +43,45 @@ static const char *base(const char *path) {
   return slash ? slash + 1 : path;
 }
 
-static int valid_forge_schema(void) {
-  const char expected[] = "test-forge-goal-run-schema\n";
-  char buffer[sizeof(expected)] = {0};
+static int valid_forge_schema(const char *expected) {
+  char buffer[128] = {0};
   FILE *schema = fopen("docs/contracts/goal-run-v0.1.schema.json", "rb");
   if (!schema) return 0;
   size_t count = fread(buffer, 1, sizeof(buffer), schema);
   int trailing = fgetc(schema);
   fclose(schema);
-  return count == sizeof(expected) - 1
+  return count == strlen(expected)
     && trailing == EOF
-    && memcmp(buffer, expected, sizeof(expected) - 1) == 0;
+    && memcmp(buffer, expected, count) == 0;
+}
+
+static int create_marker(const char *path) {
+  FILE *marker = fopen(path, "wb");
+  if (!marker) return 0;
+  fclose(marker);
+  return 1;
+}
+
+static int wait_for_marker(const char *path) {
+  for (int i = 0; i < 1000; i++) {
+    if (access(path, F_OK) == 0) return 1;
+    usleep(10000);
+  }
+  return 0;
 }
 
 int main(int argc, char **argv) {
-  FILE *log = fopen("producer-commands", "ab");
+  FILE *log = fopen("producer-logs/commands", "ab");
   if (!log) return 70;
   fprintf(log, "%s", base(argv[0]));
   for (int i = 1; i < argc; i++) fprintf(log, "|%s", argv[i]);
   fputc('\n', log);
   fclose(log);
   char mode_buffer[64] = {0};
-  FILE *mode_file = fopen("producer-mode", "rb");
+  FILE *mode_file = fopen("producer-sync/mode", "rb");
   if (mode_file) { fscanf(mode_file, "%63s", mode_buffer); fclose(mode_file); }
   const char *mode = mode_buffer[0] ? mode_buffer : NULL;
-  FILE *environment = fopen("producer-environment", "ab");
+  FILE *environment = fopen("producer-logs/environment", "ab");
   if (environment) {
     fprintf(environment, "DYLD=%s LD=%s PYTHON=%s TEST=%s\n",
       getenv("DYLD_INSERT_LIBRARIES") ? "set" : "unset",
@@ -126,7 +141,19 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc > 2 && strcmp(argv[1], "goal") == 0) {
-    if (!valid_forge_schema()) return 66;
+    const char *expected = "test-forge-goal-run-schema\n";
+    if (mode && strcmp(mode, "forge-parent-aba") == 0) {
+      if (!create_marker("producer-sync/schema-ready")
+          || !wait_for_marker("producer-sync/schema-continue")) return 67;
+      if (access("producer-sync/schema-denied", F_OK) != 0) {
+        expected = "unverified-forge-goal-schema\n";
+      }
+    }
+    if (!valid_forge_schema(expected)) return 66;
+    if (mode && strcmp(mode, "forge-parent-aba") == 0) {
+      if (!create_marker("producer-sync/schema-read")
+          || !wait_for_marker("producer-sync/schema-restored")) return 68;
+    }
     puts("{\"goal_run\":\"goal-run.json\",\"schema\":\"goal-run-v0.1.schema.json\",\"schema_version\":\"ao.forge.goal-run.v0.1\",\"goal_id\":\"bounded-goal\",\"current_phase\":\"implementation\",\"next_action_guard\":\"enabled\",\"status\":\"passed\",\"errors\":[]}");
     return 0;
   }
@@ -178,6 +205,8 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.base = Path(self.temporary_directory.name).resolve()
         self.project = self.base / "project"
         self.project.mkdir()
+        self.project.joinpath("producer-logs").mkdir()
+        self.project.joinpath("producer-sync").mkdir()
         self.pool_root = self.base / "pool"
         self.pool = Pool(self.pool_root, runtime_version="test-runtime")
         self.pool.initialize()
@@ -198,6 +227,8 @@ class GovernanceWitnessTests(unittest.TestCase):
         )
         self.forge_schema.parent.mkdir(parents=True)
         self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
+        self.forge_runtime.joinpath("producer-logs").mkdir()
+        self.forge_runtime.joinpath("producer-sync").mkdir()
         self.bin_dir = self.base / "bin"
         self.bin_dir.mkdir()
         source = self.base / "fake-producer.c"
@@ -410,12 +441,12 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, code)
 
     def _mode(self, value):
-        (self.project / "producer-mode").write_text(value, encoding="utf-8")
+        (self.project / "producer-sync/mode").write_text(value, encoding="utf-8")
 
     def _producer_commands(self):
         commands = {}
         for root in (self.project, self.forge_runtime):
-            path = root / "producer-commands"
+            path = root / "producer-logs/commands"
             if path.is_file():
                 for line in path.read_text(encoding="utf-8").splitlines():
                     commands[line.split("|", 1)[0]] = line
@@ -424,7 +455,7 @@ class GovernanceWitnessTests(unittest.TestCase):
     def _producer_environment(self):
         lines = []
         for root in (self.project, self.forge_runtime):
-            path = root / "producer-environment"
+            path = root / "producer-logs/environment"
             if path.is_file():
                 lines.extend(path.read_text(encoding="utf-8").splitlines())
         return lines
@@ -437,10 +468,10 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertTrue(envelope.is_file())
         self.assertFalse((self.project / "docs").exists())
         project_commands = (
-            self.project / "producer-commands"
+            self.project / "producer-logs/commands"
         ).read_text(encoding="utf-8").splitlines()
         runtime_commands = (
-            self.forge_runtime / "producer-commands"
+            self.forge_runtime / "producer-logs/commands"
         ).read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             {line.split("|", 1)[0] for line in project_commands},
@@ -520,6 +551,100 @@ class GovernanceWitnessTests(unittest.TestCase):
                     self.assertNotIn("forge", self._producer_commands())
         finally:
             self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
+
+    def test_forge_runtime_parent_directory_aba_during_launch_fails_closed(self):
+        sync = self.forge_runtime / "producer-sync"
+        sync.joinpath("mode").write_text("forge-parent-aba", encoding="utf-8")
+        docs = self.forge_runtime / "docs"
+        contracts = docs / "contracts"
+        parked = self.forge_runtime / "docs-parked"
+        before_changes = tuple(
+            path.stat().st_ctime_ns for path in (self.forge_runtime, docs, contracts)
+        )
+        run_output = governance._run_output
+        attacker = None
+        attack_errors = []
+
+        def wait_for(path):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if path.exists():
+                    return
+                time.sleep(0.01)
+            raise AssertionError(f"timed out waiting for {path.name}")
+
+        def attack():
+            try:
+                wait_for(sync / "schema-ready")
+                if os.name == "nt":
+                    identity = (docs.stat().st_dev, docs.stat().st_ino)
+                    with self.assertRaises(PermissionError):
+                        docs.rename(parked)
+                    self.assertEqual((docs.stat().st_dev, docs.stat().st_ino), identity)
+                    sync.joinpath("schema-denied").touch()
+                else:
+                    docs.rename(parked)
+                    replacement = docs / "contracts/goal-run-v0.1.schema.json"
+                    replacement.parent.mkdir(parents=True)
+                    replacement.write_bytes(TEST_FORGE_REPLACEMENT)
+                sync.joinpath("schema-continue").touch()
+                wait_for(sync / "schema-read")
+                if os.name != "nt":
+                    shutil.rmtree(docs)
+                    parked.rename(docs)
+                sync.joinpath("schema-restored").touch()
+            except BaseException as error:
+                attack_errors.append(error)
+                sync.joinpath("schema-continue").touch()
+                sync.joinpath("schema-restored").touch()
+
+        def attack_during_run(arguments, *args, **kwargs):
+            nonlocal attacker
+            if arguments[:2] == ["goal", "validate"]:
+                attacker = threading.Thread(target=attack)
+                attacker.start()
+            try:
+                return run_output(arguments, *args, **kwargs)
+            finally:
+                if attacker is not None:
+                    attacker.join(timeout=6)
+
+        try:
+            with mock.patch.object(
+                governance, "_run_output", side_effect=attack_during_run
+            ):
+                if os.name == "nt":
+                    envelope = issue_witness(
+                        self.claim_path, self.task_text, self.valid_artifacts()
+                    )
+                    self.assertEqual(
+                        json.loads(envelope.read_text(encoding="utf-8"))["state"],
+                        "ready",
+                    )
+                else:
+                    self._assert_code(
+                        "governance-producer-identity-mismatch",
+                        lambda: issue_witness(
+                            self.claim_path, self.task_text, self.valid_artifacts()
+                        ),
+                    )
+            self.assertIsNotNone(attacker)
+            self.assertFalse(attacker.is_alive())
+            if attack_errors:
+                raise attack_errors[0]
+            self.assertTrue(sync.joinpath("schema-read").is_file())
+            self.assertEqual(self.forge_schema.read_bytes(), TEST_FORGE_SCHEMA)
+            if os.name != "nt":
+                after_changes = tuple(
+                    path.stat().st_ctime_ns
+                    for path in (self.forge_runtime, docs, contracts)
+                )
+                self.assertNotEqual(after_changes, before_changes)
+        finally:
+            if parked.exists():
+                if docs.exists():
+                    shutil.rmtree(docs)
+                parked.rename(docs)
 
     def test_issues_closed_detached_authenticated_envelope_from_native_producers(self):
         envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())

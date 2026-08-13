@@ -465,6 +465,9 @@ def _forge_runtime(
         )
         descriptor = schema.descriptors[0]
         initial = os.fstat(descriptor)
+        directory_changes = tuple(
+            os.fstat(directory).st_ctime_ns for directory in runtime.descriptors
+        )
     except (IndexError, OSError, TypeError, ValueError, MissionBridgeError) as error:
         raise MissionBridgeError("mission-identity-mismatch") from error
 
@@ -479,6 +482,12 @@ def _forge_runtime(
                 or opened.st_nlink != 1
                 or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
                 or opened.st_ctime_ns != initial.st_ctime_ns
+                or any(
+                    os.fstat(directory).st_ctime_ns != change
+                    for directory, change in zip(
+                        runtime.descriptors, directory_changes
+                    )
+                )
                 or not hmac.compare_digest(
                     _hash_descriptor(descriptor), FORGE_SCHEMA_SHA256
                 )
