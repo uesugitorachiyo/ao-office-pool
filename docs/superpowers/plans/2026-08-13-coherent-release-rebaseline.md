@@ -8,7 +8,7 @@
 
 **Tech Stack:** Git, Python 3.12 standard library, SHA-256, ZIP/tar archives, PowerShell 5.1, Windows Task Scheduler, existing AO Office Pool tests and SDD evidence scripts.
 
-**Spec:** `docs/superpowers/specs/2026-08-12-task6-governance-witness-design.md`; release authority: `/Users/torachiyouesugi/Documents/canary-test/ao-stack-coherent-binary-release-20260812T063144Z/final-report.md`
+**Spec:** `docs/superpowers/specs/2026-08-12-task6-governance-witness-design.md`; release authority: Task 1's independently verified coherent-binary campaign final report.
 
 ## Global Constraints
 
