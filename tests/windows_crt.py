@@ -9,7 +9,11 @@ O_BINARY = 1 << 29
 
 @contextmanager
 def windows_text_mode():
-    """Emulate the Windows CRT transformations on non-binary os.open fds."""
+    """Use native Windows binary mode or emulate its CRT behavior off-Windows."""
+    if hasattr(os, "O_BINARY"):
+        yield
+        return
+
     real_open = os.open
     real_read = os.read
     real_write = os.write
