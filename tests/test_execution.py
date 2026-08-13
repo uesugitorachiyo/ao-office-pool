@@ -855,12 +855,48 @@ class ExecutionTests(unittest.TestCase):
         hostile = {
             "DYLD_INSERT_LIBRARIES": "/tmp/hostile.dylib",
             "LD_PRELOAD": "/tmp/hostile.so",
+            "PATH": r"C:\hostile",
+            "PATHEXT": ".HOSTILE",
+            "PYTHONHOME": r"C:\hostile-python",
             "PYTHONPATH": "/tmp/hostile-python",
             "AO_TEST_FAKE_AO2_MODE": "wrong-types",
             "AO_TEST_UNRELATED_CONFIG": "hostile",
         }
         with mock.patch.dict(os.environ, hostile):
             execute(self.claim_path, self.envelope)
+            if os.name == "nt":
+                environment = execution_module._execution_environment()
+                self.assertIn("PATH", environment)
+                self.assertNotEqual(environment["PATH"], hostile["PATH"])
+                for name in (
+                    "PATHEXT",
+                    "PYTHONHOME",
+                    "PYTHONPATH",
+                    "AO_TEST_FAKE_AO2_MODE",
+                    "AO_TEST_UNRELATED_CONFIG",
+                ):
+                    self.assertNotIn(name, environment)
+                probe = self.project / "environment-probe.py"
+                probe.write_text(
+                    "import os\n"
+                    "for name in ('PYTHONHOME', 'PYTHONPATH', "
+                    "'AO_TEST_FAKE_AO2_MODE', 'AO_TEST_UNRELATED_CONFIG'):\n"
+                    "    assert name not in os.environ, name\n"
+                    "print('sanitized')\n",
+                    encoding="utf-8",
+                )
+                command = Path(os.environ["SystemRoot"]) / "System32/cmd.exe"
+                child = subprocess.run(
+                    [str(command), "/d", "/c", "python", str(probe)],
+                    cwd=self.project,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(child.stdout.strip(), "sanitized")
         self.assertEqual(
             (self.project / "ao2-environment.txt").read_text(encoding="utf-8"), ""
         )

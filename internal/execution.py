@@ -62,6 +62,9 @@ def _execution_environment() -> dict[str, str]:
         for name in ("SystemRoot", "WINDIR", "TEMP", "TMP"):
             if os.environ.get(name):
                 environment[name] = os.environ[name]
+        environment["PATH"] = os.pathsep.join(
+            (str(Path(environment["SystemRoot"]) / "System32"), str(Path(sys.executable).parent))
+        )
         return environment
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
     if os.environ.get("TMPDIR"):
