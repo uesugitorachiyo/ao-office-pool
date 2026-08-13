@@ -2,7 +2,6 @@ import hashlib
 import hmac
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -20,25 +19,17 @@ from internal.conversation_lifecycle import (
 )
 from internal.pool import Pool
 from internal.mission_bridge import start_or_resume
-from tests.test_mission_bridge import DARWIN_FAKE
+from tests.test_execution import FAKE_AO2
 
 
-MISSION_FAKE = r'''#!/usr/bin/env python3
-import hashlib, json, pathlib, sys
-home = pathlib.Path(sys.argv[sys.argv.index("--home") + 1])
-home.mkdir(parents=True, exist_ok=True)
-if "inspect" in sys.argv:
-    mission_id = sys.argv[sys.argv.index("--mission") + 1]
-    objective_digest = (home / "objective-digest").read_text()
-else:
-    objective_digest = "sha256:" + hashlib.sha256(sys.argv[-1].encode()).hexdigest()
-    (home / "objective-digest").write_text(objective_digest)
-    mission_id = "mission-0123456789abcdef"
-print(json.dumps({"mission_id":mission_id,"objective_digest":objective_digest,
-                  "status":"active","current_route":"ao-blueprint"}))
-'''
-
-
+@unittest.skipIf(
+    os.name == "nt"
+    and not (
+        os.environ.get("AO_TEST_FAKE_MISSION")
+        or os.environ.get("AO_TEST_FAKE_AO2")
+    ),
+    "native fake Mission required",
+)
 class ConversationLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory(
@@ -52,25 +43,29 @@ class ConversationLifecycleTests(unittest.TestCase):
         self.pool.initialize()
         self.chat = "chat-a"
         self.task = "task-a"
-        supplied_fake = os.environ.get("AO_TEST_FAKE_MISSION")
-        if os.name == "nt" and supplied_fake:
-            self.executable = self.base / "ao-mission.exe"
+        supplied_fake = os.environ.get("AO_TEST_FAKE_MISSION") or os.environ.get(
+            "AO_TEST_FAKE_AO2"
+        )
+        self.executable = self.base / (
+            "ao-mission.exe" if os.name == "nt" else "ao-mission"
+        )
+        if os.name == "nt":
             import shutil
 
             shutil.copy2(supplied_fake, self.executable)
-        elif sys.platform == "darwin":
-            self.executable = self.base / "ao-mission"
+        else:
             source = self.base / "fake-mission.c"
-            source.write_text(DARWIN_FAKE, encoding="utf-8")
+            source.write_text(FAKE_AO2, encoding="utf-8")
+            compiler = (
+                ["clang", "-Wno-deprecated-declarations"]
+                if sys.platform == "darwin"
+                else ["cc"]
+            )
             subprocess.run(
-                ["clang", "-Wno-deprecated-declarations", str(source), "-o", str(self.executable)],
+                [*compiler, str(source), "-o", str(self.executable)],
                 check=True,
                 capture_output=True,
             )
-        else:
-            self.executable = self.base / "ao-mission"
-            self.executable.write_text(MISSION_FAKE, encoding="utf-8")
-            self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
         self.lock = self.base / "components.lock.json"
         self.lock.write_text(
             json.dumps(

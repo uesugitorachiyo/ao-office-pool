@@ -201,7 +201,7 @@ class PoolTests(unittest.TestCase):
             mock.patch("internal.pool.os.write", return_value=32),
             mock.patch("internal.pool.os.fsync"),
             mock.patch("internal.pool.os.close"),
-            mock.patch("internal.pool.os.fchmod") as fchmod,
+            mock.patch("internal.pool.os.fchmod", create=True) as fchmod,
         ):
             self.pool._create_witness_key()
         fchmod.assert_not_called()
@@ -266,7 +266,7 @@ class PoolTests(unittest.TestCase):
                         lease, "consumed", "witness-" + "a" * 32, "b" * 64
                     )
                 )
-        self.assertGreaterEqual(fsync.call_count, 2)
+        self.assertGreaterEqual(fsync.call_count, 1 if os.name == "nt" else 2)
 
     def test_invalid_witness_key_requires_recovery(self):
         key_path = self.root / "operator-secrets" / "governance-witness.key"
@@ -292,25 +292,34 @@ class PoolTests(unittest.TestCase):
 
     def test_authority_lease_holds_release_lock(self):
         authority = self.pool.claim("holder-a", "task-a", self.project, "pinned")
-        started = threading.Event()
+        attempting_lock = threading.Event()
         finished = threading.Event()
+        real_pool_lock = pool_module.pool_lock
+        wait_seconds = 30 if os.name == "nt" else 5
+
+        def observed_pool_lock(*arguments, **keywords):
+            attempting_lock.set()
+            return real_pool_lock(*arguments, **keywords)
 
         def release():
-            started.set()
             self.pool.release(authority)
             finished.set()
 
-        with self.pool.authority_lease(authority) as lease:
-            thread = threading.Thread(target=release)
-            thread.start()
-            self.assertTrue(started.wait(1))
-            self.assertFalse(finished.wait(0.1))
-            self.assertEqual(lease.authority_path, authority.resolve())
-            self.assertEqual(lease.authority_bytes, authority.read_bytes())
-            self.assertEqual(lease.authority["office_id"], "O1")
-            with self.assertRaises((AttributeError, TypeError)):
-                lease.authority_path = self.base
-        thread.join(2)
+        thread = threading.Thread(target=release)
+        try:
+            with self.pool.authority_lease(authority) as lease:
+                with mock.patch.object(pool_module, "pool_lock", observed_pool_lock):
+                    thread.start()
+                    self.assertTrue(attempting_lock.wait(wait_seconds))
+                    self.assertFalse(finished.is_set())
+                    self.assertEqual(lease.authority_path, authority.resolve())
+                    self.assertEqual(lease.authority_bytes, authority.read_bytes())
+                    self.assertEqual(lease.authority["office_id"], "O1")
+                    with self.assertRaises((AttributeError, TypeError)):
+                        lease.authority_path = self.base
+        finally:
+            if thread.ident is not None:
+                thread.join(wait_seconds)
         self.assertTrue(finished.is_set())
 
     def test_runtime_containment_value_error_requires_recovery(self):

@@ -7,7 +7,6 @@ import io
 import json
 import os
 import signal
-import stat
 import shutil
 import subprocess
 import sys
@@ -23,150 +22,7 @@ import internal.mission_bridge as mission_bridge
 from internal.mission_bridge import MissionBridgeError, start_or_resume
 from internal.pool import Pool
 from internal.windows_paths import canonical_windows_path
-
-
-FAKE = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time
-mode = os.environ.get("AO_TEST_FAKE_MODE")
-if mode == "slow-large":
-    sys.stdout.write("x" * 70000)
-    sys.stdout.flush()
-    time.sleep(10)
-    raise SystemExit(0)
-home = pathlib.Path(sys.argv[sys.argv.index("--home") + 1])
-home.mkdir(parents=True, exist_ok=True)
-log = home / "fake-arguments.jsonl"
-with log.open("a", encoding="utf-8") as stream:
-    stream.write(json.dumps(sys.argv[1:]) + "\n")
-(home / "fake-cwd").write_text(str(pathlib.Path.cwd()))
-if "inspect" in sys.argv:
-    mission_id = sys.argv[sys.argv.index("--mission") + 1]
-    if mode == "inspect-mismatch":
-        mission_id = "mission-fedcba9876543210"
-    objective_digest = (home / "objective-digest").read_text()
-else:
-    task_text = sys.argv[-1]
-    import hashlib
-    objective_digest = "sha256:" + hashlib.sha256(task_text.encode()).hexdigest()
-    (home / "objective-digest").write_text(objective_digest)
-    mission_id = "mission-0123456789abcdef"
-if mode == "invalid-id":
-    mission_id = "mission-not-valid"
-print(json.dumps({
-    "schema": "ao.mission.record.v0.1",
-    "mission_id": mission_id,
-    "objective_digest": objective_digest,
-    "status": "active",
-    "current_route": "ao-blueprint"
-}))
-'''
-
-DARWIN_FAKE = r'''
-#include <CommonCrypto/CommonDigest.h>
-#include <stdbool.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
-
-#ifndef PAYLOAD
-#define PAYLOAD "benign"
-#endif
-
-static int write_bytes(const char *path, const char *value) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (fd < 0) return -1;
-    size_t size = strlen(value), offset = 0;
-    while (offset < size) {
-        ssize_t count = write(fd, value + offset, size - offset);
-        if (count <= 0) { close(fd); return -1; }
-        offset += (size_t)count;
-    }
-    return close(fd);
-}
-
-static int read_bytes(const char *path, char *value, size_t capacity) {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) return -1;
-    ssize_t count = read(fd, value, capacity - 1);
-    close(fd);
-    if (count < 0) return -1;
-    value[count] = '\0';
-    return 0;
-}
-
-static void digest(const char *value, char output[72]) {
-    unsigned char raw[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(value, (CC_LONG)strlen(value), raw);
-    strcpy(output, "sha256:");
-    for (int index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
-        sprintf(output + 7 + index * 2, "%02x", raw[index]);
-    }
-}
-
-int main(int argc, char **argv) {
-    const char *mode = getenv("AO_TEST_FAKE_MODE");
-    if (mode && strcmp(mode, "slow-large") == 0) {
-        char block[1000]; memset(block, 'x', sizeof(block));
-        for (int index = 0; index < 70; index++) write(STDOUT_FILENO, block, sizeof(block));
-        struct timespec delay = {10, 0}; nanosleep(&delay, NULL); return 0;
-    }
-    if (mode && strcmp(mode, "large") == 0) {
-        char block[1000]; memset(block, 'x', sizeof(block));
-        for (int index = 0; index < 70; index++) write(STDOUT_FILENO, block, sizeof(block));
-        return 0;
-    }
-    const char *home = NULL;
-    for (int index = 1; index + 1 < argc; index++) {
-        if (strcmp(argv[index], "--home") == 0) home = argv[index + 1];
-    }
-    if (!home) return 64;
-    char path[PATH_MAX], cwd[PATH_MAX], objective[128], mission[64];
-    snprintf(path, sizeof(path), "%s/payload-marker", home);
-    if (write_bytes(path, PAYLOAD "\n") != 0) return 65;
-    snprintf(path, sizeof(path), "%s/fake-cwd", home);
-    if (!getcwd(cwd, sizeof(cwd)) || write_bytes(path, cwd) != 0) return 66;
-    snprintf(path, sizeof(path), "%s/fake-arguments.jsonl", home);
-    int log = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
-    if (log < 0) return 67;
-    write(log, "[", 1);
-    for (int index = 1; index < argc; index++) {
-        dprintf(log, "%s\"%s\"", index == 1 ? "" : ",", argv[index]);
-    }
-    write(log, "]\n", 2); close(log);
-    strcpy(mission, "mission-0123456789abcdef");
-    bool inspect = false;
-    for (int index = 1; index < argc; index++) {
-        if (strcmp(argv[index], "inspect") == 0) inspect = true;
-        if (strcmp(argv[index], "--mission") == 0 && index + 1 < argc) {
-            snprintf(mission, sizeof(mission), "%s", argv[index + 1]);
-        }
-    }
-    snprintf(path, sizeof(path), "%s/objective-digest", home);
-    if (inspect) {
-        if (read_bytes(path, objective, sizeof(objective)) != 0) return 68;
-        if (mode && strcmp(mode, "inspect-mismatch") == 0) {
-            strcpy(mission, "mission-fedcba9876543210");
-        }
-    } else {
-        digest(argv[argc - 1], objective);
-        if (write_bytes(path, objective) != 0) return 69;
-    }
-    if (strcmp(PAYLOAD, "malicious") == 0) strcpy(mission, "mission-fedcba9876543210");
-    if (mode && strcmp(mode, "invalid-id") == 0) strcpy(mission, "mission-not-valid");
-    const char *escalation =
-        mode && strcmp(mode, "escalation") == 0 ? ",\"executes_work\":true" : "";
-    dprintf(STDOUT_FILENO,
-        "{\"mission_id\":\"%s\",\"objective_digest\":\"%s\","
-        "\"status\":\"active\",\"current_route\":\"ao-blueprint\"%s}\n",
-        mission, objective, escalation);
-    return 0;
-}
-'''
+from tests.test_execution import FAKE_AO2
 
 
 class WindowsBinaryDescriptorTests(unittest.TestCase):
@@ -190,6 +46,14 @@ class WindowsBinaryDescriptorTests(unittest.TestCase):
         self.assertTrue(all("b" in mode for mode in fdopen_modes))
 
 
+@unittest.skipIf(
+    os.name == "nt"
+    and not (
+        os.environ.get("AO_TEST_FAKE_MISSION")
+        or os.environ.get("AO_TEST_FAKE_AO2")
+    ),
+    "native fake Mission required",
+)
 class MissionBridgeTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory(
@@ -205,24 +69,31 @@ class MissionBridgeTests(unittest.TestCase):
         self.claim_path = self.pool.claim(
             "chat-a", self.task_text, self.project, "conversation"
         )
-        supplied_fake = os.environ.get("AO_TEST_FAKE_MISSION")
-        if os.name == "nt" and supplied_fake:
-            self.executable = self.base / "ao-mission.exe"
+        supplied_fake = os.environ.get("AO_TEST_FAKE_MISSION") or os.environ.get(
+            "AO_TEST_FAKE_AO2"
+        )
+        self.executable = self.base / (
+            "ao-mission.exe" if os.name == "nt" else "ao-mission"
+        )
+        if os.name == "nt":
             shutil.copy2(supplied_fake, self.executable)
-        elif sys.platform == "darwin":
-            self.executable = self.base / "ao-mission"
+        else:
             source = self.base / "fake-mission.c"
-            source.write_text(DARWIN_FAKE, encoding="utf-8")
+            source.write_text(FAKE_AO2, encoding="utf-8")
+            compiler = (
+                ["clang", "-Wno-deprecated-declarations"]
+                if sys.platform == "darwin"
+                else ["cc"]
+            )
             subprocess.run(
-                ["clang", "-Wno-deprecated-declarations", str(source), "-o", str(self.executable)],
+                [*compiler, str(source), "-o", str(self.executable)],
                 check=True,
                 capture_output=True,
             )
             self.malicious_executable = self.base / "malicious-mission"
             subprocess.run(
                 [
-                    "clang",
-                    "-Wno-deprecated-declarations",
+                    *compiler,
                     '-DPAYLOAD="malicious"',
                     str(source),
                     "-o",
@@ -231,10 +102,6 @@ class MissionBridgeTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
-        else:
-            self.executable = self.base / "ao-mission"
-            self.executable.write_text(FAKE, encoding="utf-8")
-            self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
         digest = hashlib.sha256(self.executable.read_bytes()).hexdigest()
         self.lock = self.base / "components.lock.json"
         self.lock.write_text(
@@ -263,10 +130,12 @@ class MissionBridgeTests(unittest.TestCase):
         self.configuration.stop()
         self.temporary_directory.cleanup()
 
-    def _replace_executable(self, body):
+    def _replace_executable(self):
         replacement = self.executable.with_name("replacement-ao-mission")
-        replacement.write_text(body, encoding="utf-8")
-        replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
+        if os.name == "nt":
+            replacement.write_bytes(b"not-a-native-executable")
+        else:
+            shutil.copy2(self.malicious_executable, replacement)
         os.replace(replacement, self.executable)
 
     def _replace_verified_copy(self, verified):
@@ -583,6 +452,7 @@ class MissionBridgeTests(unittest.TestCase):
                     )
                 self.assertEqual(events[-2:], ["terminated", "closed"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX process-group cleanup")
     def test_darwin_waitpid_cleanup_failure_preserves_original_and_closes_streams(self):
         # MUTATION: an unexpected cleanup waitpid error masks the pre-resume failure.
         streams = (io.BytesIO(), io.BytesIO())
@@ -879,20 +749,16 @@ class MissionBridgeTests(unittest.TestCase):
 
     def test_verified_open_executable_survives_path_substitution(self):
         # MUTATION: hashing then reopening the executable launches substituted bytes.
-        malicious = FAKE.replace(
-            'mission_id = "mission-0123456789abcdef"',
-            'mission_id = "mission-fedcba9876543210"',
-        )
         with mission_bridge._open_verified_executable() as verified:
             if os.name == "nt":
                 with self.assertRaises(OSError):
-                    self._replace_executable(malicious)
+                    self._replace_executable()
             elif sys.platform == "darwin":
                 source_replacement = self.executable.with_name("source-replacement")
                 shutil.copy2(self.malicious_executable, source_replacement)
                 os.replace(source_replacement, self.executable)
             else:
-                self._replace_executable(malicious)
+                self._replace_executable()
             if sys.platform == "darwin":
                 with mission_bridge._private_directory(
                     self.project, ".ao", "mission"
@@ -913,14 +779,9 @@ class MissionBridgeTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "descriptor execution is POSIX-specific")
     def test_launch_uses_verified_descriptor_after_private_copy_substitution(self):
         # MUTATION: executing the verified copy pathname reopens attacker replacement bytes.
-        malicious = FAKE.replace(
-            'mission_id = "mission-0123456789abcdef"',
-            'mission_id = "mission-fedcba9876543210"',
-        )
         with mission_bridge._open_verified_executable() as verified:
             replacement = verified.path.with_name("replacement-verified-copy")
-            replacement.write_text(malicious, encoding="utf-8")
-            replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
+            shutil.copy2(self.malicious_executable, replacement)
             os.replace(replacement, verified.path)
             try:
                 value = mission_bridge._run(
@@ -1100,7 +961,7 @@ class MissionBridgeTests(unittest.TestCase):
 
     def test_rejects_executable_digest_mismatch_without_creating_mission_state(self):
         # MUTATION: checking only the executable name accepts substituted bytes.
-        self.executable.write_text(FAKE + "# substitution\n", encoding="utf-8")
+        self.executable.write_bytes(self.executable.read_bytes() + b"\0")
         with self.assertRaises(MissionBridgeError) as raised:
             start_or_resume(self.claim_path, self.task_text)
         self.assertEqual(raised.exception.code, "mission-identity-mismatch")
@@ -1108,23 +969,11 @@ class MissionBridgeTests(unittest.TestCase):
 
     def test_rejects_unbounded_or_authority_escalating_readback(self):
         # MUTATION: accepting arbitrary stdout or true authority flags widens Mission.
-        escalation = FAKE.replace(
-            '"current_route": "ao-blueprint"',
-            '"current_route": "ao-blueprint", "executes_work": True',
-        )
-        for body, code in (
-            (escalation, "mission-authority-escalation"),
-            ('#!/usr/bin/env python3\nprint("x" * 70000)\n', "mission-output-too-large"),
+        for mode, code in (
+            ("escalation", "mission-authority-escalation"),
+            ("large", "mission-output-too-large"),
         ):
             with self.subTest(code=code):
-                mode = "escalation" if code.endswith("escalation") else "large"
-                if os.name != "nt" and sys.platform != "darwin":
-                    self.executable.write_text(body, encoding="utf-8")
-                    self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
-                    digest = hashlib.sha256(self.executable.read_bytes()).hexdigest()
-                    value = json.loads(self.lock.read_text(encoding="utf-8"))
-                    value["components"][0]["sha256"] = digest
-                    self.lock.write_text(json.dumps(value), encoding="utf-8")
                 with mock.patch.dict(os.environ, {"AO_TEST_FAKE_MODE": mode}):
                     with self.assertRaises(MissionBridgeError) as raised:
                         start_or_resume(self.claim_path, self.task_text)
@@ -1132,14 +981,6 @@ class MissionBridgeTests(unittest.TestCase):
 
     def test_terminates_oversized_output_while_process_is_running(self):
         # MUTATION: checking temporary-file size after exit waits for an abusive child.
-        if os.name != "nt" and sys.platform != "darwin":
-            self.executable.write_text(FAKE, encoding="utf-8")
-            self.executable.chmod(self.executable.stat().st_mode | stat.S_IXUSR)
-            value = json.loads(self.lock.read_text(encoding="utf-8"))
-            value["components"][0]["sha256"] = hashlib.sha256(
-                self.executable.read_bytes()
-            ).hexdigest()
-            self.lock.write_text(json.dumps(value), encoding="utf-8")
         started = time.monotonic()
         with mock.patch.dict(os.environ, {"AO_TEST_FAKE_MODE": "slow-large"}):
             with self.assertRaises(MissionBridgeError) as raised:

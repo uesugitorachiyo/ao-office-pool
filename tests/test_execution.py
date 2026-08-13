@@ -23,23 +23,241 @@ from tests import test_governance_witness as witness_tests
 
 FAKE_AO2 = r'''
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#include <direct.h>
 #define environ _environ
 #define task_sleep(seconds) Sleep((seconds) * 1000)
+#define task_getcwd _getcwd
 #else
 #include <unistd.h>
 #define task_sleep(seconds) sleep(seconds)
+#define task_getcwd getcwd
 #endif
 
 #ifndef _WIN32
 extern char **environ;
 #endif
 
+#ifndef PAYLOAD
+#define PAYLOAD "benign"
+#endif
+
+static const char *argument_value(int argc, char **argv, const char *name) {
+  for (int i = 1; i + 1 < argc; i++) {
+    if (strcmp(argv[i], name) == 0) return argv[i + 1];
+  }
+  return NULL;
+}
+
+static int write_bytes(const char *path, const char *value) {
+  FILE *stream = fopen(path, "wb");
+  if (!stream) return -1;
+  size_t size = strlen(value);
+  int written = fwrite(value, 1, size, stream) == size;
+  return fclose(stream) == 0 && written ? 0 : -1;
+}
+
+static int read_bytes(const char *path, char *value, size_t capacity) {
+  FILE *stream = fopen(path, "rb");
+  if (!stream) return -1;
+  size_t count = fread(value, 1, capacity - 1, stream);
+  int failed = ferror(stream);
+  if (fclose(stream) != 0) failed = 1;
+  if (failed) return -1;
+  value[count] = '\0';
+  return 0;
+}
+
+static void write_json_string(FILE *stream, const char *value) {
+  fputc('"', stream);
+  for (const unsigned char *byte = (const unsigned char *)value; *byte; byte++) {
+    switch (*byte) {
+      case '"': fputs("\\\"", stream); break;
+      case '\\': fputs("\\\\", stream); break;
+      case '\b': fputs("\\b", stream); break;
+      case '\f': fputs("\\f", stream); break;
+      case '\n': fputs("\\n", stream); break;
+      case '\r': fputs("\\r", stream); break;
+      case '\t': fputs("\\t", stream); break;
+      default:
+        if (*byte < 0x20) fprintf(stream, "\\u%04x", *byte);
+        else fputc(*byte, stream);
+    }
+  }
+  fputc('"', stream);
+}
+
+typedef struct {
+  uint8_t data[64];
+  uint32_t data_size;
+  uint64_t bit_size;
+  uint32_t state[8];
+} sha256_context;
+
+static const uint32_t sha256_rounds[64] = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+  0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+  0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+  0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+  0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+  0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+  0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+  0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+static uint32_t rotate_right(uint32_t value, uint32_t count) {
+  return (value >> count) | (value << (32 - count));
+}
+
+static void sha256_transform(sha256_context *context, const uint8_t data[64]) {
+  uint32_t words[64], a, b, c, d, e, f, g, h;
+  for (int i = 0, j = 0; i < 16; i++, j += 4) {
+    words[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j + 1] << 16) |
+      ((uint32_t)data[j + 2] << 8) | data[j + 3];
+  }
+  for (int i = 16; i < 64; i++) {
+    uint32_t first = rotate_right(words[i - 15], 7) ^
+      rotate_right(words[i - 15], 18) ^ (words[i - 15] >> 3);
+    uint32_t second = rotate_right(words[i - 2], 17) ^
+      rotate_right(words[i - 2], 19) ^ (words[i - 2] >> 10);
+    words[i] = words[i - 16] + first + words[i - 7] + second;
+  }
+  a = context->state[0]; b = context->state[1]; c = context->state[2];
+  d = context->state[3]; e = context->state[4]; f = context->state[5];
+  g = context->state[6]; h = context->state[7];
+  for (int i = 0; i < 64; i++) {
+    uint32_t choice = (e & f) ^ (~e & g);
+    uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+    uint32_t first = rotate_right(e, 6) ^ rotate_right(e, 11) ^ rotate_right(e, 25);
+    uint32_t second = rotate_right(a, 2) ^ rotate_right(a, 13) ^ rotate_right(a, 22);
+    uint32_t temporary_one = h + first + choice + sha256_rounds[i] + words[i];
+    uint32_t temporary_two = second + majority;
+    h = g; g = f; f = e; e = d + temporary_one;
+    d = c; c = b; b = a; a = temporary_one + temporary_two;
+  }
+  context->state[0] += a; context->state[1] += b; context->state[2] += c;
+  context->state[3] += d; context->state[4] += e; context->state[5] += f;
+  context->state[6] += g; context->state[7] += h;
+}
+
+static void sha256_init(sha256_context *context) {
+  context->data_size = 0;
+  context->bit_size = 0;
+  context->state[0] = 0x6a09e667; context->state[1] = 0xbb67ae85;
+  context->state[2] = 0x3c6ef372; context->state[3] = 0xa54ff53a;
+  context->state[4] = 0x510e527f; context->state[5] = 0x9b05688c;
+  context->state[6] = 0x1f83d9ab; context->state[7] = 0x5be0cd19;
+}
+
+static void sha256_update(sha256_context *context, const uint8_t *data, size_t size) {
+  for (size_t i = 0; i < size; i++) {
+    context->data[context->data_size++] = data[i];
+    if (context->data_size == 64) {
+      sha256_transform(context, context->data);
+      context->bit_size += 512;
+      context->data_size = 0;
+    }
+  }
+}
+
+static void sha256_final(sha256_context *context, uint8_t hash[32]) {
+  uint32_t size = context->data_size;
+  context->data[size++] = 0x80;
+  if (size > 56) {
+    while (size < 64) context->data[size++] = 0;
+    sha256_transform(context, context->data);
+    size = 0;
+  }
+  while (size < 56) context->data[size++] = 0;
+  context->bit_size += (uint64_t)context->data_size * 8;
+  for (int i = 0; i < 8; i++) {
+    context->data[63 - i] = (uint8_t)(context->bit_size >> (i * 8));
+  }
+  sha256_transform(context, context->data);
+  for (int i = 0; i < 4; i++) {
+    for (int state = 0; state < 8; state++) {
+      hash[i + state * 4] = (uint8_t)(context->state[state] >> (24 - i * 8));
+    }
+  }
+}
+
+static int mission_digest(const char *value, char output[72]) {
+  unsigned char raw[32];
+  sha256_context context;
+  sha256_init(&context);
+  sha256_update(&context, (const uint8_t *)value, strlen(value));
+  sha256_final(&context, raw);
+  strcpy(output, "sha256:");
+  for (int i = 0; i < 32; i++) sprintf(output + 7 + i * 2, "%02x", raw[i]);
+  return 0;
+}
+
+static int fake_mission(int argc, char **argv) {
+  const char *mode = getenv("AO_TEST_FAKE_MODE");
+  if (mode && (strcmp(mode, "large") == 0 || strcmp(mode, "slow-large") == 0)) {
+    char block[1000]; memset(block, 'x', sizeof(block));
+    for (int i = 0; i < 70; i++) fwrite(block, 1, sizeof(block), stdout);
+    fflush(stdout);
+    if (strcmp(mode, "slow-large") == 0) task_sleep(10);
+    return 0;
+  }
+  const char *home = argument_value(argc, argv, "--home");
+  if (!home) return 64;
+  char path[4096], cwd[4096], objective[72];
+  char mission[64] = "mission-0123456789abcdef";
+  snprintf(path, sizeof(path), "%s/payload-marker", home);
+  if (write_bytes(path, PAYLOAD "\n") != 0) return 65;
+  snprintf(path, sizeof(path), "%s/fake-cwd", home);
+  if (!task_getcwd(cwd, sizeof(cwd)) || write_bytes(path, cwd) != 0) return 66;
+  snprintf(path, sizeof(path), "%s/fake-arguments.jsonl", home);
+  FILE *log = fopen(path, "ab");
+  if (!log) return 67;
+  fputc('[', log);
+  for (int i = 1; i < argc; i++) {
+    if (i > 1) fputc(',', log);
+    write_json_string(log, argv[i]);
+  }
+  fputs("]\n", log);
+  if (fclose(log) != 0) return 67;
+  int inspect = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "inspect") == 0) inspect = 1;
+    if (strcmp(argv[i], "--mission") == 0 && i + 1 < argc) {
+      snprintf(mission, sizeof(mission), "%s", argv[i + 1]);
+    }
+  }
+  snprintf(path, sizeof(path), "%s/objective-digest", home);
+  if (inspect) {
+    if (read_bytes(path, objective, sizeof(objective)) != 0) return 68;
+    if (mode && strcmp(mode, "inspect-mismatch") == 0) {
+      strcpy(mission, "mission-fedcba9876543210");
+    }
+  } else {
+    if (mission_digest(argv[argc - 1], objective) != 0) return 69;
+    if (write_bytes(path, objective) != 0) return 69;
+  }
+  if (strcmp(PAYLOAD, "malicious") == 0) strcpy(mission, "mission-fedcba9876543210");
+  if (mode && strcmp(mode, "invalid-id") == 0) strcpy(mission, "mission-not-valid");
+  const char *escalation =
+    mode && strcmp(mode, "escalation") == 0 ? ",\"executes_work\":true" : "";
+  printf(
+    "{\"mission_id\":\"%s\",\"objective_digest\":\"%s\","
+    "\"status\":\"active\",\"current_route\":\"ao-blueprint\"%s}\n",
+    mission, objective, escalation
+  );
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argument_value(argc, argv, "--home")) return fake_mission(argc, argv);
   const char *target = NULL, *run = NULL;
   char mode_buffer[64] = {0};
   for (int i = 1; i + 1 < argc; i++) {
