@@ -198,3 +198,18 @@ The staged clean export and base `513079fba08660d8fadb38293c22fa79de59df41` each
 - Policy correlation is set-wise and rejects duplicate IDs, extra events, missing events, value mismatches, and approval-ticket presence mismatches.
 - The qualification runner compares the selected runtime to a fixed release digest and leaves the production trust constant unchanged.
 - The change adds no dependency, upstream mutation, provider call, publication, Windows/SSH work, or Task 7/8 work.
+
+## Fix Round 2
+
+### RED
+
+- The original portable-path RED was an office-pool ancestor A-to-B-to-A swap: Forge reopened attacker GoalRun bytes under its source runtime before Pool sealed the retained bytes.
+- The exact native smoke cannot be rerun from this checkout because no `TASK6_BLUEPRINT_PACK_ARCHIVE` or unpacked Blueprint pack exists in the local qualification support/evidence. The locked local native binary hashes match the recorded macOS values; the exact accepted smoke above remains the Task 3 evidence and Task 4 will rerun it on both platforms.
+
+### GREEN
+
+- `_forge_runtime()` now hashes the bytes read from the already verified source schema against the fixed Forge digest before create-only copying. Existing private copies must be byte-identical.
+- It retains and rechecks the copied schema's complete private directory chain, its file identity/digest, the source schema chain, and the Forge runtime root before launch, at suspended-launch verification, and after Forge. POSIX Forge runs from the retained private runtime with relative producer paths; other producers and Windows retain absolute paths.
+- Covenant policy-event `message` must exactly equal its evidence-decision `reason`.
+- Passed: seven direct Forge-runtime, project-parent portability, and Covenant-correlation tests in 8.613s; fresh Task 3 focused suite (`tests.test_planning_routes`, `tests.test_governance_witness`, `tests.test_execution`) — 95 tests in 75.937s; full discovery — 285 tests in 93.375s, with 11 expected skips; `py_compile` for the two changed modules and native smoke script; `git diff --check`.
+- Clean `git archive HEAD` and clean archive of `cbd7e0468ea20114abfd38427748b2dcfd1d2c0e` each contain exactly the pre-existing `docs/superpowers/plans/2026-08-13-coherent-release-rebaseline.md` scanner finding.

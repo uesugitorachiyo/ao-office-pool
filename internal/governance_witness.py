@@ -68,6 +68,7 @@ _WITNESS = re.compile(r"^witness-[0-9a-f]{32}$")
 _MAX_ARTIFACT = 64 * 1024 * 1024
 _MAX_ENVELOPE = 64 * 1024
 _FORGE_SCHEMA_PARTS = ("docs", "contracts", "goal-run-v0.1.schema.json")
+_FORGE_PRIVATE_RUNTIME_PARTS = (*_PRIVATE_PARTS, "producer-runtime", "ao-forge")
 
 
 class GovernanceError(RuntimeError):
@@ -469,21 +470,84 @@ def _forge_runtime(
         schema = stack.enter_context(
             _open_verified_file(schema_path, FORGE_SCHEMA_SHA256)
         )
-        runtime = stack.enter_context(
+        source_runtime = stack.enter_context(
             _private_directory(FORGE_RUNTIME_ROOT, *_FORGE_SCHEMA_PARTS[:-1])
         )
         descriptor = schema.descriptors[0]
         initial = os.fstat(descriptor)
-        directory_changes = tuple(
-            os.fstat(directory).st_ctime_ns for directory in runtime.descriptors
+        source_directory_changes = tuple(
+            os.fstat(directory).st_ctime_ns
+            for directory in source_runtime.descriptors
         )
+        launch_runtime = source_runtime
+        retained_schema = None
+        private_schema_directory = None
+        private_runtime = None
+        private_schema_directory_changes = ()
+        private_directory_changes = ()
+        if os.name != "nt":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            raw = os.read(descriptor, _MAX_ARTIFACT + 1)
+            if len(raw) > _MAX_ARTIFACT or os.read(descriptor, 1):
+                raise ValueError("Forge runtime schema too large")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if not hmac.compare_digest(_digest_bytes(raw), FORGE_SCHEMA_SHA256):
+                raise ValueError("Forge runtime schema changed")
+            private_schema = _private_file(
+                project,
+                (*_FORGE_PRIVATE_RUNTIME_PARTS, *_FORGE_SCHEMA_PARTS[:-1]),
+                _FORGE_SCHEMA_PARTS[-1],
+            )
+            try:
+                try:
+                    _create_private(private_schema, raw)
+                except FileExistsError:
+                    if _read_private_bytes(private_schema, _MAX_ARTIFACT) != raw:
+                        raise ValueError("Forge private runtime schema mismatch")
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                private_descriptor = os.open(
+                    private_schema.name,
+                    flags,
+                    dir_fd=private_schema.directory.directory_descriptor,
+                )
+                retained_schema = _RetainedFile(
+                    private_schema,
+                    private_descriptor,
+                    os.fstat(private_schema.directory.directory_descriptor).st_ctime_ns,
+                    os.fstat(private_descriptor).st_ctime_ns,
+                    FORGE_SCHEMA_SHA256,
+                )
+            except BaseException:
+                private_schema.close()
+                raise
+            stack.callback(retained_schema.close)
+            private_schema_directory = private_schema.directory
+            private_schema_directory_changes = tuple(
+                os.fstat(directory).st_ctime_ns
+                for directory in private_schema_directory.descriptors
+            )
+            private_runtime = stack.enter_context(
+                _private_directory(project, *_FORGE_PRIVATE_RUNTIME_PARTS)
+            )
+            private_directory_changes = tuple(
+                os.fstat(directory).st_ctime_ns
+                for directory in private_runtime.descriptors
+            )
+            launch_runtime = _PrivateDirectory(
+                private_runtime.path,
+                private_runtime.path,
+                descriptors=(private_runtime.directory_descriptor,),
+                borrowed_root=True,
+            )
     except (IndexError, OSError, TypeError, ValueError, MissionBridgeError) as error:
         raise MissionBridgeError("mission-identity-mismatch") from error
 
     def verify() -> None:
         try:
             project.require_current_paths()
-            runtime.require_current_paths()
+            source_runtime.require_current_paths()
             opened = os.fstat(descriptor)
             current = schema_path.stat(follow_symlinks=False)
             if (
@@ -494,7 +558,7 @@ def _forge_runtime(
                 or any(
                     os.fstat(directory).st_ctime_ns != change
                     for directory, change in zip(
-                        runtime.descriptors, directory_changes
+                        source_runtime.descriptors, source_directory_changes
                     )
                 )
                 or not hmac.compare_digest(
@@ -502,11 +566,36 @@ def _forge_runtime(
                 )
             ):
                 raise ValueError("Forge runtime schema changed")
-        except (OSError, TypeError, ValueError, MissionBridgeError) as error:
+            if private_runtime is not None:
+                private_runtime.require_current_paths()
+                if any(
+                    os.fstat(directory).st_ctime_ns != change
+                    for directory, change in zip(
+                        private_runtime.descriptors, private_directory_changes
+                    )
+                ):
+                    raise ValueError("Forge private runtime changed")
+                private_schema_directory.require_current_paths()
+                if any(
+                    os.fstat(directory).st_ctime_ns != change
+                    for directory, change in zip(
+                        private_schema_directory.descriptors,
+                        private_schema_directory_changes,
+                    )
+                ):
+                    raise ValueError("Forge private runtime schema directory changed")
+                retained_schema.recheck()
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            GovernanceError,
+            MissionBridgeError,
+        ) as error:
             raise MissionBridgeError("mission-identity-mismatch") from error
 
     verify()
-    return runtime, verify
+    return launch_runtime, verify
 
 
 def _producer_path_verifier(*values) -> Callable[[], None]:
@@ -554,28 +643,20 @@ def _run_producer(
     ledger: Path | None = None,
     output = None,
 ) -> dict:
-    arguments = [
-        str(getattr(artifact, "private", artifact).path)
-        if member == "{artifact}"
-        else str(getattr(ledger, "private", ledger).path)
-        if member == "{ledger}"
-        else str(output.path)
-        if member == "{output}"
-        else member
-        for member in _PRODUCERS[name]
-    ]
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
     if os.environ.get("TMPDIR"):
         environment["TMPDIR"] = os.environ["TMPDIR"]
     retained_descriptors = tuple(
-        descriptor
-        for descriptor in (
-            getattr(artifact, "descriptor", None),
-            *(getattr(artifact, "descriptors", ())),
-            getattr(ledger, "descriptor", None),
-            getattr(output, "descriptor", None),
+        dict.fromkeys(
+            descriptor
+            for descriptor in (
+                getattr(artifact, "descriptor", None),
+                *(getattr(artifact, "descriptors", ())),
+                getattr(ledger, "descriptor", None),
+                getattr(output, "descriptor", None),
+            )
+            if descriptor is not None
         )
-        if descriptor is not None
     )
     previous_inheritable = {}
     try:
@@ -593,6 +674,27 @@ def _run_producer(
             retained_verifier = None
             if name == "ao-forge":
                 launch_project, retained_verifier = _forge_runtime(stack, project)
+            def producer_path(value) -> str:
+                private = getattr(value, "private", None)
+                path = (
+                    private.path
+                    if private is not None
+                    else getattr(value, "directory", value).path
+                )
+                if os.name == "nt":
+                    return str(path)
+                return os.path.relpath(path, launch_project.project_path)
+
+            arguments = [
+                producer_path(artifact)
+                if member == "{artifact}"
+                else producer_path(ledger)
+                if member == "{ledger}"
+                else producer_path(output)
+                if member == "{output}"
+                else member
+                for member in _PRODUCERS[name]
+            ]
             path_verifier = _producer_path_verifier(artifact, ledger, output)
             path_verifier()
             try:
@@ -712,6 +814,10 @@ def _validate_covenant_ledger(
             if any(
                 event.get(field) != decision.get(field)
                 for field in ("task_id", "decision", "effect_type", "resource")
+            ) or (
+                not isinstance(event.get("message"), str)
+                or not isinstance(decision.get("reason"), str)
+                or event["message"] != decision["reason"]
             ) or (
                 "approval_ticket_id" in event,
                 event.get("approval_ticket_id"),

@@ -83,6 +83,16 @@ static int starts_object_twice(const char *path) {
   return starts_object(path) && starts_object(path);
 }
 
+static int contains_attacker(const char *path) {
+  char buffer[4096] = {0};
+  FILE *stream = fopen(path, "rb");
+  if (!stream) return 0;
+  size_t count = fread(buffer, 1, sizeof(buffer) - 1, stream);
+  fclose(stream);
+  buffer[count] = '\0';
+  return strstr(buffer, "attacker") != NULL;
+}
+
 static int wait_for_marker(const char *path) {
   for (int i = 0; i < 1000; i++) {
     if (access(path, F_OK) == 0) return 1;
@@ -167,12 +177,18 @@ int main(int argc, char **argv) {
   if (argc > 2 && strcmp(argv[1], "goal") == 0) {
     const char *goal_run = NULL;
     for (int i = 2; i + 1 < argc; i++) if (strcmp(argv[i], "--goal-run") == 0) goal_run = argv[i + 1];
-    if (mode && strcmp(mode, "staged-ancestor-aba") == 0) {
+    int artifact_aba = mode && (
+      strcmp(mode, "staged-ancestor-aba") == 0
+      || strcmp(mode, "project-parent-aba") == 0);
+    if (artifact_aba) {
       if (!create_marker("producer-sync/artifact-ready")
           || !wait_for_marker("producer-sync/artifact-swapped")) return 69;
     }
     if (!goal_run || !starts_object_twice(goal_run)) return 65;
-    if (mode && strcmp(mode, "staged-ancestor-aba") == 0) {
+    if (mode && strcmp(mode, "project-parent-aba") == 0
+        && contains_attacker(goal_run)
+        && !create_marker("producer-sync/attacker-read")) return 69;
+    if (artifact_aba) {
       if (!create_marker("producer-sync/artifact-read")
           || !wait_for_marker("producer-sync/artifact-restored")) return 69;
     }
@@ -285,6 +301,11 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
         self.forge_runtime.joinpath("producer-logs").mkdir()
         self.forge_runtime.joinpath("producer-sync").mkdir()
+        self.private_forge_runtime = self.project.joinpath(
+            ".ao/governance/office-pool/producer-runtime/ao-forge"
+        )
+        self.private_forge_runtime.joinpath("producer-logs").mkdir(parents=True)
+        self.private_forge_runtime.joinpath("producer-sync").mkdir()
         self.bin_dir = self.base / "bin"
         self.bin_dir.mkdir()
         source = self.base / "fake-producer.c"
@@ -684,7 +705,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     def _producer_commands(self):
         commands = {}
-        for root in (self.project, self.forge_runtime):
+        for root in (self.project, self.private_forge_runtime):
             path = root / "producer-logs/commands"
             if path.is_file():
                 for line in path.read_text(encoding="utf-8").splitlines():
@@ -693,7 +714,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     def _producer_environment(self):
         lines = []
-        for root in (self.project, self.forge_runtime):
+        for root in (self.project, self.private_forge_runtime):
             path = root / "producer-logs/environment"
             if path.is_file():
                 lines.extend(path.read_text(encoding="utf-8").splitlines())
@@ -710,7 +731,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.project / "producer-logs/commands"
         ).read_text(encoding="utf-8").splitlines()
         runtime_commands = (
-            self.forge_runtime / "producer-logs/commands"
+            self.private_forge_runtime / "producer-logs/commands"
         ).read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             {line.split("|", 1)[0] for line in project_commands},
@@ -719,7 +740,13 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertEqual(len(runtime_commands), 1)
         self.assertIn("|goal|validate|--goal-run|", runtime_commands[0])
         goal_run = runtime_commands[0].split("|--goal-run|", 1)[1].split("|", 1)[0]
-        self.assertTrue(Path(goal_run).is_absolute())
+        self.assertTrue(self.private_forge_runtime.resolve().is_relative_to(self.project))
+        self.assertFalse(Path(goal_run).is_absolute())
+        self.assertTrue(
+            self.private_forge_runtime.joinpath(goal_run)
+            .resolve()
+            .is_relative_to(self.project)
+        )
 
     def test_missing_forge_runtime_schema_fails_before_forge_launch(self):
         self.forge_schema.unlink()
@@ -792,7 +819,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
 
     def test_forge_runtime_parent_directory_aba_during_launch_fails_closed(self):
-        sync = self.forge_runtime / "producer-sync"
+        sync = self.private_forge_runtime / "producer-sync"
         sync.joinpath("mode").write_text("forge-parent-aba", encoding="utf-8")
         docs = self.forge_runtime / "docs"
         contracts = docs / "contracts"
@@ -826,6 +853,7 @@ class GovernanceWitnessTests(unittest.TestCase):
                     replacement = docs / "contracts/goal-run-v0.1.schema.json"
                     replacement.parent.mkdir(parents=True)
                     replacement.write_bytes(TEST_FORGE_REPLACEMENT)
+                    sync.joinpath("schema-denied").touch()
                 sync.joinpath("schema-continue").touch()
                 wait_for(sync / "schema-read")
                 if os.name != "nt":
@@ -1004,6 +1032,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             "task_id": lambda event: event.update(task_id="other-task"),
             "effect_type": lambda event: event.update(effect_type="process.spawn"),
             "resource": lambda event: event.update(resource="other-resource"),
+            "reason": lambda event: event.update(message="different reason"),
             "approval_ticket": lambda event: event.update(
                 approval_ticket_id="approval-bounded-1"
             ),
@@ -1454,7 +1483,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX ancestor rename race")
     def test_staged_ancestor_a_b_a_during_producer_open_fails_closed(self):
-        sync = self.forge_runtime / "producer-sync"
+        sync = self.private_forge_runtime / "producer-sync"
         sync.joinpath("mode").write_text("staged-ancestor-aba", encoding="utf-8")
         office_pool = self.project / ".ao/governance/office-pool"
         parked = office_pool.with_name("office-pool-parked")
@@ -1485,15 +1514,19 @@ class GovernanceWitnessTests(unittest.TestCase):
                 )
                 office_pool.rename(parked)
                 replacement.rename(office_pool)
-                sync.joinpath("artifact-swapped").touch()
-                wait_for(sync / "artifact-read")
+                parked_sync = parked / "producer-runtime/ao-forge/producer-sync"
+                parked_sync.joinpath("artifact-swapped").touch()
+                wait_for(parked_sync / "artifact-read")
                 office_pool.rename(replacement)
                 parked.rename(office_pool)
                 sync.joinpath("artifact-restored").touch()
             except BaseException as error:
                 attack_errors.append(error)
-                sync.joinpath("artifact-swapped").touch()
-                sync.joinpath("artifact-restored").touch()
+                for root in (parked, office_pool):
+                    candidate = root / "producer-runtime/ao-forge/producer-sync"
+                    if candidate.is_dir():
+                        candidate.joinpath("artifact-swapped").touch()
+                        candidate.joinpath("artifact-restored").touch()
 
         run_output = governance._run_output
 
@@ -1536,6 +1569,105 @@ class GovernanceWitnessTests(unittest.TestCase):
                     path.chmod(0o700 if path.is_dir() else 0o600)
                 replacement.chmod(0o700)
                 shutil.rmtree(replacement)
+
+    @unittest.skipIf(os.name == "nt", "POSIX ancestor rename race")
+    def test_project_parent_a_b_a_keeps_producer_on_retained_project_bytes(self):
+        sync = self.private_forge_runtime / "producer-sync"
+        sync.joinpath("mode").write_text("project-parent-aba", encoding="utf-8")
+        parked = self.base.with_name(self.base.name + "-parked")
+        replacement = self.base.with_name(self.base.name + "-replacement")
+        attacker = None
+        attack_errors = []
+
+        def wait_for(path):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if path.exists():
+                    return
+                time.sleep(0.01)
+            raise AssertionError(f"timed out waiting for {path.name}")
+
+        def remove_tree(path):
+            for child in path.rglob("*"):
+                child.chmod(0o700 if child.is_dir() else 0o600)
+            path.chmod(0o700)
+            shutil.rmtree(path)
+
+        def attack():
+            try:
+                wait_for(sync / "artifact-ready")
+                shutil.copytree(self.base, replacement)
+                staged = tuple(
+                    replacement.joinpath(
+                        "project/.ao/governance/office-pool/producer-input"
+                    ).glob("ao-forge-*")
+                )
+                self.assertEqual(len(staged), 1)
+                value = json.loads(staged[0].read_text(encoding="utf-8"))
+                value["continuation_prompt"] = "attacker replacement bytes"
+                staged[0].chmod(0o600)
+                staged[0].write_text(json.dumps(value), encoding="utf-8")
+
+                self.base.rename(parked)
+                replacement.rename(self.base)
+                parked_sync = parked.joinpath(
+                    "project/.ao/governance/office-pool/producer-runtime/ao-forge/producer-sync"
+                )
+                parked_sync.joinpath("artifact-swapped").touch()
+                wait_for(parked_sync / "artifact-read")
+                self.base.rename(replacement)
+                parked.rename(self.base)
+                sync.joinpath("artifact-restored").touch()
+            except BaseException as error:
+                attack_errors.append(error)
+                for root in (parked, self.base):
+                    candidate = root.joinpath(
+                        "project/.ao/governance/office-pool/producer-runtime/ao-forge/producer-sync"
+                    )
+                    if candidate.is_dir():
+                        candidate.joinpath("artifact-swapped").touch()
+                        candidate.joinpath("artifact-restored").touch()
+
+        run_output = governance._run_output
+
+        def attack_during_run(arguments, *args, **kwargs):
+            nonlocal attacker
+            if arguments[:2] == ["goal", "validate"]:
+                attacker = threading.Thread(target=attack)
+                attacker.start()
+            try:
+                return run_output(arguments, *args, **kwargs)
+            finally:
+                if attacker is not None:
+                    attacker.join(timeout=6)
+
+        try:
+            with mock.patch.object(
+                governance, "_run_output", side_effect=attack_during_run
+            ):
+                envelope = issue_witness(
+                    self.claim_path, self.task_text, self.valid_artifacts()
+                )
+            self.assertIsNotNone(attacker)
+            self.assertFalse(attacker.is_alive())
+            if attack_errors:
+                raise attack_errors[0]
+            self.assertTrue(sync.joinpath("artifact-read").is_file())
+            self.assertFalse(sync.joinpath("attacker-read").exists())
+            self.assertEqual(
+                json.loads(envelope.read_text(encoding="utf-8"))["producer_artifacts"]
+                ["ao-forge"]["artifact_sha256"],
+                hashlib.sha256(self.forge.read_bytes()).hexdigest(),
+            )
+        finally:
+            if parked.exists():
+                if self.base.exists():
+                    if replacement.exists():
+                        remove_tree(replacement)
+                    self.base.rename(replacement)
+                parked.rename(self.base)
+            if replacement.exists():
+                remove_tree(replacement)
 
     def test_staged_candidate_a_b_a_swap_fails_closed(self):
         run_producer = governance._run_producer
