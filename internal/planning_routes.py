@@ -16,6 +16,7 @@ _ROUTES = {
     "ao-atlas": ("ao-atlas", True, True, False),
     "ao-atlas-mutation": ("ao-atlas", True, True, False),
     "ao-atlas-long": ("ao-atlas", True, True, False),
+    "ao-foundry": ("ao-forge", True, True, True),
     "ao-forge": ("ao-forge", True, False, True),
     "blocked": ("blocked", False, False, False),
 }

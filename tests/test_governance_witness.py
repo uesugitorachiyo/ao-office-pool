@@ -28,6 +28,15 @@ from tests.windows_crt import windows_text_mode
 
 TEST_FORGE_SCHEMA = b"test-forge-goal-run-schema\n"
 TEST_FORGE_REPLACEMENT = b"unverified-forge-goal-schema\n"
+NATIVE_COVENANT_LEDGER_SHA256 = (
+    "08ca3faea6377927367ff652d408903d61d6992d189a3ac16ef969158aa2b2fd"
+)
+NATIVE_COVENANT_LEDGER = """{"schema_version":"covenant.event.v1","event_id":"event-000001","sequence":1,"run_id":"run-0123456789abcdef","previous_event_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"15600c28ba513add58d310f1f77e097fb0b79954f586decb01c5a51d15037b6c","type":"run_started","status":"success","message":"governed run started"}
+{"schema_version":"covenant.event.v1","event_id":"event-000002","sequence":2,"run_id":"run-0123456789abcdef","previous_event_hash":"15600c28ba513add58d310f1f77e097fb0b79954f586decb01c5a51d15037b6c","event_hash":"5f376ca9f52ec7a744fb144930afebb2c0a820c874a78e55583ce90e6a6be82a","type":"task_started","task_id":"bounded-task","status":"success","message":"bounded task started"}
+{"schema_version":"covenant.event.v1","event_id":"event-000003","sequence":3,"run_id":"run-0123456789abcdef","previous_event_hash":"5f376ca9f52ec7a744fb144930afebb2c0a820c874a78e55583ce90e6a6be82a","event_hash":"cc2c55bf69085ea0163448b97106498f616789b924c3632d4a39eb007409d845","type":"policy_decided","task_id":"bounded-task","status":"success","message":"bounded read allowed","decision_id":"policy-bounded-1","decision":"allow","effect_type":"file.read","resource":".ao/workflow.yaml"}
+{"schema_version":"covenant.event.v1","event_id":"event-000004","sequence":4,"run_id":"run-0123456789abcdef","previous_event_hash":"cc2c55bf69085ea0163448b97106498f616789b924c3632d4a39eb007409d845","event_hash":"7020feaf562ad793a44e52b6c68710f746aabbd41f62dfc2c67f4bc63f182718","type":"task_finished","task_id":"bounded-task","status":"success","message":"bounded task finished"}
+{"schema_version":"covenant.event.v1","event_id":"event-000005","sequence":5,"run_id":"run-0123456789abcdef","previous_event_hash":"7020feaf562ad793a44e52b6c68710f746aabbd41f62dfc2c67f4bc63f182718","event_hash":"ca601d701cc1b732f3ae2043c8f4cbbffec537bf1d7efaa4a984c9836ee510b2","type":"run_finished","status":"success","message":"governed run completed"}
+"""
 
 
 FAKE_PRODUCER = r'''
@@ -60,6 +69,18 @@ static int create_marker(const char *path) {
   if (!marker) return 0;
   fclose(marker);
   return 1;
+}
+
+static int starts_object(const char *path) {
+  FILE *stream = fopen(path, "rb");
+  if (!stream) return 0;
+  int first = fgetc(stream);
+  fclose(stream);
+  return first == '{';
+}
+
+static int starts_object_twice(const char *path) {
+  return starts_object(path) && starts_object(path);
 }
 
 static int wait_for_marker(const char *path) {
@@ -137,10 +158,16 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc > 2 && strcmp(argv[1], "workgraph") == 0) {
+    const char *workgraph = NULL;
+    for (int i = 2; i + 1 < argc; i++) if (strcmp(argv[i], "--workgraph") == 0) workgraph = argv[i + 1];
+    if (!workgraph || !starts_object(workgraph)) return 65;
     puts("status=valid");
     return 0;
   }
   if (argc > 2 && strcmp(argv[1], "goal") == 0) {
+    const char *goal_run = NULL;
+    for (int i = 2; i + 1 < argc; i++) if (strcmp(argv[i], "--goal-run") == 0) goal_run = argv[i + 1];
+    if (!goal_run || !starts_object_twice(goal_run)) return 65;
     const char *expected = "test-forge-goal-run-schema\n";
     if (mode && strcmp(mode, "forge-parent-aba") == 0) {
       if (!create_marker("producer-sync/schema-ready")
@@ -158,13 +185,13 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc > 1 && strcmp(argv[1], "verify") == 0) {
-    int ledger = 0, evidence = 0;
+    const char *ledger = NULL, *evidence = NULL;
     for (int i = 2; i < argc; i++) {
-      if (strcmp(argv[i], "--ledger") == 0 && i + 1 < argc) ledger = 1;
-      if (strcmp(argv[i], "--evidence") == 0 && i + 1 < argc) evidence = 1;
+      if (strcmp(argv[i], "--ledger") == 0 && i + 1 < argc) ledger = argv[i + 1];
+      if (strcmp(argv[i], "--evidence") == 0 && i + 1 < argc) evidence = argv[i + 1];
     }
-    if (!ledger || !evidence) return 64;
-    puts("{\"schema_version\":\"covenant.verify-result.v1\",\"verified\":true,\"run_id\":\"run-0123456789abcdef\",\"event_count\":1,\"artifact_count\":0,\"input_snapshot_count\":0,\"failure_count\":0,\"failures\":[],\"policy_explanations\":[],\"ledger_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"last_event_hash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}");
+    if (!ledger || !evidence || !starts_object(ledger) || !starts_object_twice(evidence)) return 64;
+    puts("{\"schema_version\":\"covenant.verify-result.v1\",\"verified\":true,\"run_id\":\"run-0123456789abcdef\",\"event_count\":5,\"artifact_count\":0,\"input_snapshot_count\":0,\"failure_count\":0,\"failures\":[],\"policy_explanations\":[{\"decision_id\":\"policy-bounded-1\",\"task_id\":\"bounded-task\",\"effect_type\":\"file.read\",\"resource\":\".ao/workflow.yaml\",\"decision\":\"allow\",\"reason\":\"bounded read allowed\",\"summary\":\"allow file.read on .ao/workflow.yaml\",\"detail\":\"bounded read allowed\"}],\"ledger_digest\":\"08ca3faea6377927367ff652d408903d61d6992d189a3ac16ef969158aa2b2fd\",\"last_event_hash\":\"ca601d701cc1b732f3ae2043c8f4cbbffec537bf1d7efaa4a984c9836ee510b2\"}");
     return 0;
   }
   return 64;
@@ -174,10 +201,17 @@ int main(int argc, char **argv) {
 
 COMMITS = {
     "ao-blueprint": "a581a22af7d06483287a1b7590709e4c4d3739b8",
-    "ao-atlas": "e19acf2619588b6257b37ebd0fcf7219645284f3",
-    "ao-forge": "4bf267bc7cbd9d6289728ebcaefa939135ddfb00",
-    "ao-covenant": "7d2af0d3446757f096ebf3ce51e0918716daf7ff",
-    "ao2": "c00f78a3e1d0036205d1ac7b4c94ba2ce6dab7f0",
+    "ao-atlas": "2bf243ce8d8c71d845754398238b14d1ab77d0e6",
+    "ao-forge": "e104b47c2e14b6c0927b885e137907ad227aeb5c",
+    "ao-covenant": "2fd72a0426a747868826581612fa1dc9727b53b9",
+    "ao2": "8307795b3434af920f6cef088e56ca8fcc76775b",
+}
+VERSIONS = {
+    "ao-blueprint": "git-a581a22af7d0",
+    "ao-atlas": "v0.2.0",
+    "ao-forge": "v0.1.4",
+    "ao-covenant": "v0.1.1",
+    "ao2": "v0.5.11",
 }
 ASSETS = {
     "ao-blueprint": "ao-blueprint",
@@ -197,6 +231,20 @@ class ForgeRuntimePackageTests(unittest.TestCase):
         expected = "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
         self.assertEqual(governance.FORGE_SCHEMA_SHA256, expected)
         self.assertEqual(hashlib.sha256(schema.read_bytes()).hexdigest(), expected)
+
+    def test_witness_uses_the_released_component_lock_identities(self):
+        expected = {
+            "ao-blueprint": ("git-a581a22af7d0", "a581a22af7d06483287a1b7590709e4c4d3739b8"),
+            "ao-atlas": ("v0.2.0", "2bf243ce8d8c71d845754398238b14d1ab77d0e6"),
+            "ao-forge": ("v0.1.4", "e104b47c2e14b6c0927b885e137907ad227aeb5c"),
+            "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9"),
+            "ao2": ("v0.5.11", "8307795b3434af920f6cef088e56ca8fcc76775b"),
+        }
+        components = governance._locked_components()
+        self.assertEqual(
+            {name: (value["version"], value["commit"]) for name, value in components.items()},
+            expected,
+        )
 
 
 class GovernanceWitnessTests(unittest.TestCase):
@@ -270,7 +318,7 @@ class GovernanceWitnessTests(unittest.TestCase):
         commit = COMMITS[name]
         return {
             "name": name,
-            "version": "git-" + commit[:12],
+            "version": VERSIONS[name],
             "repository": "https://example.invalid/" + name,
             "commit": commit,
             "asset": ASSETS[name],
@@ -323,7 +371,30 @@ class GovernanceWitnessTests(unittest.TestCase):
                     "target_instance": self.authority["project_path"],
                     "mission_id": self.mission_id,
                     "objective_digest": "sha256:" + self.authority["task_digest"],
-                    "nodes": [{"id": "node", "status": "ready"}],
+                    "nodes": [
+                        {
+                            "id": "node",
+                            "status": "ready",
+                            "dependencies": [],
+                            "blockers": [],
+                            "stitch_task": False,
+                            "factory_task": {
+                                "contract_version": "ao.atlas.factory-task.v0.1",
+                                "id": "bounded-task",
+                                OBJECTIVE_FIELD: self.task_text,
+                                "target_factory_repo": "project",
+                                "factory_folder": "factory/bounded-task",
+                                "acceptance_criteria": ["bounded"],
+                                "non_goals": ["no publication"],
+                                "write_scope": ["."],
+                                "verification_commands": ["provider-free-check"],
+                                "required_evidence": ["bounded-evidence"],
+                                "safety_limits": ["no provider calls"],
+                                "dependency_refs": [],
+                                "context_pack_refs": [],
+                            },
+                        }
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -358,28 +429,10 @@ class GovernanceWitnessTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        workflow_digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()
         self.covenant = self._root("ao-covenant") / "evidence.json"
         self.covenant_ledger = self._root("ao-covenant") / "ledger.jsonl"
-        self.covenant_ledger.write_text('{"event":"authorized"}\n', encoding="utf-8")
-        self.covenant.write_text(
-            json.dumps(
-                {
-                    "schema_version": "covenant.governance-evidence.v1",
-                    "decision": "authorized",
-                    "scope": self.authority["project_path"],
-                    "expires_at": "2099-01-01T00:00:00Z",
-                    "revoked": False,
-                    "mission_id": self.mission_id,
-                    "objective_digest": "sha256:" + self.authority["task_digest"],
-                    "target_path": self.authority["project_path"],
-                    "workflow_sha256": workflow_digest,
-                    "run_id": self.run_id,
-                    "ao2_sha256": self.ao2_digest,
-                }
-            ),
-            encoding="utf-8",
-        )
+        self._write_native_covenant()
+
         requirements_raw = governance.REQUIREMENTS_MANIFEST.read_bytes()
         requirements_value = json.loads(requirements_raw)
         bindings = {
@@ -396,6 +449,74 @@ class GovernanceWitnessTests(unittest.TestCase):
                         json.dumps(bindings, sort_keys=True, separators=(",", ":")).encode()
                     ).hexdigest(),
                     "requirement_ids": [f"B{number:02d}" for number in range(1, 20)],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _write_native_covenant(self):
+        self.covenant_ledger.write_text(NATIVE_COVENANT_LEDGER, encoding="utf-8")
+        self.covenant.write_text(
+            json.dumps(
+                {
+                    "schema_version": "covenant.evidence-pack.v1",
+                    "run_id": self.run_id,
+                    "contract_digest": "c" * 64,
+                    "ledger_digest": NATIVE_COVENANT_LEDGER_SHA256,
+                    "run_status": "success",
+                    "artifact_manifest": [],
+                    "input_snapshots": [],
+                    "policy_decisions": [
+                        {
+                            "schema_version": "covenant.policy-decision.v1",
+                            "decision_id": "policy-bounded-1",
+                            "task_id": "bounded-task",
+                            "effect_type": "file.read",
+                            "resource": ".ao/workflow.yaml",
+                            "decision": "allow",
+                            "reason": "bounded read allowed",
+                        }
+                    ],
+                    "failures": [],
+                    "closure_matrix": {
+                        "schema_version": "covenant.closure-matrix.v1",
+                        "run_id": self.run_id,
+                        "contract_digest": "c" * 64,
+                        "status": "accepted",
+                        "rows": [
+                            {
+                                "obligation_id": "bounded-obligation",
+                                "required": True,
+                                "status": "closed",
+                                "task_ids": ["bounded-task"],
+                                "artifact_ids": [],
+                                "policy_decision_ids": ["policy-bounded-1"],
+                                "reason": "bounded policy evidence verified",
+                            }
+                        ],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _write_legacy_covenant(self):
+        workflow_digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()
+        self.covenant_ledger.write_text('{"event":"authorized"}\n', encoding="utf-8")
+        self.covenant.write_text(
+            json.dumps(
+                {
+                    "schema_version": "covenant.governance-evidence.v1",
+                    "decision": "authorized",
+                    "scope": self.authority["project_path"],
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "revoked": False,
+                    "mission_id": self.mission_id,
+                    "objective_digest": "sha256:" + self.authority["task_digest"],
+                    "target_path": self.authority["project_path"],
+                    "workflow_sha256": workflow_digest,
+                    "run_id": self.run_id,
+                    "ao2_sha256": self.ao2_digest,
                 }
             ),
             encoding="utf-8",
@@ -428,8 +549,8 @@ class GovernanceWitnessTests(unittest.TestCase):
             json.loads(self.forge.read_text(encoding="utf-8"))["repo"], canonical
         )
         covenant = json.loads(self.covenant.read_text(encoding="utf-8"))
-        self.assertEqual(covenant["scope"], canonical)
-        self.assertEqual(covenant["target_path"], canonical)
+        self.assertNotIn("scope", covenant)
+        self.assertNotIn("target_path", covenant)
 
     def _consume(self, envelope):
         with self.pool.authority_lease(self.claim_path) as lease:
@@ -666,6 +787,98 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertIn("|verify|--ledger|", commands["covenant"])
         self.assertIn("|--evidence|", commands["covenant"])
         self.assertTrue(commands["covenant"].endswith("|--json"))
+
+    def test_native_covenant_pack_and_ledger_are_bound_after_locked_verification(self):
+        start = datetime(2026, 8, 13, tzinfo=timezone.utc)
+        with mock.patch.object(governance, "_now", return_value=start):
+            envelope = issue_witness(
+                self.claim_path,
+                self.task_text,
+                self.valid_artifacts(),
+                lifetime_seconds=37,
+            )
+        value = json.loads(envelope.read_text(encoding="utf-8"))
+        self.assertEqual(value["covenant"]["expires_at"], "2026-08-13T00:00:37Z")
+        self.assertEqual(value["covenant"]["expires_at"], value["expires_at"])
+        self.assertEqual(
+            value["producer_artifacts"]["ao-covenant"]["artifact_sha256"],
+            hashlib.sha256(self.covenant.read_bytes()).hexdigest(),
+        )
+
+    def test_legacy_covenant_authority_object_is_not_native_evidence(self):
+        self._write_legacy_covenant()
+        self._assert_code(
+            "governance-relationship-mismatch",
+            lambda: issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            ),
+        )
+
+    def test_synthetic_one_line_ledger_cannot_qualify_as_native_evidence(self):
+        self.covenant_ledger.write_text('{"event":"authorized"}\n', encoding="utf-8")
+        self._assert_code(
+            "governance-relationship-mismatch",
+            lambda: issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            ),
+        )
+
+    def test_covenant_native_success_policy_and_closure_are_required(self):
+        def failed(value):
+            value["failures"] = [{"failure_id": "failure-000001"}]
+
+        def denied(value):
+            value["policy_decisions"][0]["decision"] = "deny"
+
+        def rejected(value):
+            value["closure_matrix"]["status"] = "rejected"
+
+        def open_required(value):
+            value["closure_matrix"]["rows"][0]["status"] = "open"
+
+        original = json.loads(self.covenant.read_text(encoding="utf-8"))
+        for mutate in (failed, denied, rejected, open_required):
+            value = json.loads(json.dumps(original))
+            mutate(value)
+            self.covenant.write_text(json.dumps(value), encoding="utf-8")
+            with self.subTest(mutate=mutate.__name__):
+                self._assert_code(
+                    "governance-relationship-mismatch",
+                    lambda: issue_witness(
+                        self.claim_path, self.task_text, self.valid_artifacts()
+                    ),
+                )
+        self.covenant.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_covenant_native_readback_requires_verified_success(self):
+        valid = {
+            "schema_version": "covenant.verify-result.v1",
+            "verified": True,
+            "run_id": self.run_id,
+            "event_count": 5,
+            "artifact_count": 0,
+            "input_snapshot_count": 0,
+            "failure_count": 0,
+            "failures": [],
+            "policy_explanations": [],
+            "ledger_digest": NATIVE_COVENANT_LEDGER_SHA256,
+            "last_event_hash": "c" * 64,
+        }
+        for field, replacement in (
+            ("verified", False),
+            ("event_count", 0),
+            ("failure_count", 1),
+            ("failures", [{"failure_id": "failure-000001"}]),
+        ):
+            value = dict(valid)
+            value[field] = replacement
+            with self.subTest(field=field):
+                self._assert_code(
+                    "governance-producer-readback",
+                    lambda value=value: governance._readback(
+                        "ao-covenant", json.dumps(value).encode()
+                    ),
+                )
 
     def test_arbitrary_envelope_sealer_and_forged_lease_are_rejected(self):
         self.assertFalse(hasattr(governance, "_seal"))
@@ -940,12 +1153,9 @@ class GovernanceWitnessTests(unittest.TestCase):
         cases = (
             (self.forge, "repo", str(self.base)),
             (self.forge, OBJECTIVE_FIELD, "different"),
-            (self.covenant, "mission_id", "mission-fedcba9876543210"),
-            (self.covenant, "objective_digest", "sha256:" + "0" * 64),
-            (self.covenant, "target_path", str(self.base)),
-            (self.covenant, "workflow_sha256", "0" * 64),
             (self.covenant, "run_id", "run-fedcba9876543210"),
-            (self.covenant, "ao2_sha256", "0" * 64),
+            (self.covenant, "ledger_digest", "0" * 64),
+            (self.covenant, "run_status", "failed"),
         )
         for path, field, replacement in cases:
             original = path.read_text(encoding="utf-8")

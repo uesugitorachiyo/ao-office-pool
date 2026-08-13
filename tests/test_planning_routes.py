@@ -26,6 +26,13 @@ class PlanningRouteTests(unittest.TestCase):
         self.assertFalse(decision.atlas_required)
         self.assertTrue(decision.execution_candidate)
 
+    def test_foundry_continuation_routes_to_forge_with_atlas(self):
+        decision = select_route(mission("ao-foundry"))
+        self.assertEqual(decision.route, "ao-forge")
+        self.assertTrue(decision.blueprint_required)
+        self.assertTrue(decision.atlas_required)
+        self.assertTrue(decision.execution_candidate)
+
     def test_underspecified_work_stays_at_blueprint(self):
         decision = select_route(mission("ao-blueprint"))
         self.assertEqual(decision.route, "ao-blueprint")

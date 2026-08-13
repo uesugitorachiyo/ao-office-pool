@@ -49,11 +49,11 @@ _PRODUCERS = {
     "ao-covenant": ("verify", "--ledger", "{ledger}", "--evidence", "{artifact}", "--json"),
 }
 _PINNED = {
-    "ao-blueprint": ("a581a22af7d06483287a1b7590709e4c4d3739b8", "ao-blueprint"),
-    "ao-atlas": ("e19acf2619588b6257b37ebd0fcf7219645284f3", "ao-atlas"),
-    "ao-forge": ("4bf267bc7cbd9d6289728ebcaefa939135ddfb00", "forge"),
-    "ao-covenant": ("7d2af0d3446757f096ebf3ce51e0918716daf7ff", "covenant"),
-    "ao2": ("c00f78a3e1d0036205d1ac7b4c94ba2ce6dab7f0", "ao2"),
+    "ao-blueprint": ("git-a581a22af7d0", "a581a22af7d06483287a1b7590709e4c4d3739b8", "ao-blueprint"),
+    "ao-atlas": ("v0.2.0", "2bf243ce8d8c71d845754398238b14d1ab77d0e6", "ao-atlas"),
+    "ao-forge": ("v0.1.4", "e104b47c2e14b6c0927b885e137907ad227aeb5c", "forge"),
+    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "covenant"),
+    "ao2": ("v0.5.11", "8307795b3434af920f6cef088e56ca8fcc76775b", "ao2"),
 }
 _ROOTS = {
     "ao-blueprint": (".ao", "evidence", "ao-blueprint"),
@@ -293,7 +293,7 @@ def _locked_components() -> dict[str, dict]:
         ):
             raise ValueError("wrong component lock")
         result = {}
-        for name, (commit, asset) in _PINNED.items():
+        for name, (version, commit, asset) in _PINNED.items():
             matches = [
                 item
                 for item in value["components"]
@@ -304,7 +304,7 @@ def _locked_components() -> dict[str, dict]:
             item = matches[0]
             if (
                 item.get("commit") != commit
-                or item.get("version") != "git-" + commit[:12]
+                or item.get("version") != version
                 or item.get("asset") != asset
                 or not _DIGEST.fullmatch(item.get("sha256", ""))
             ):
@@ -443,8 +443,17 @@ def _readback(name: str, raw: bytes) -> dict:
         if name == "ao-covenant" and (
             value.get("schema_version") != "covenant.verify-result.v1"
             or value.get("verified") is not True
+            or type(value.get("event_count")) is not int
+            or value.get("event_count", 0) < 1
+            or type(value.get("artifact_count")) is not int
+            or value.get("artifact_count", -1) < 0
+            or type(value.get("input_snapshot_count")) is not int
+            or value.get("input_snapshot_count", -1) < 0
             or value.get("failure_count") != 0
             or value.get("failures") != []
+            or not isinstance(value.get("policy_explanations"), list)
+            or not _DIGEST.fullmatch(value.get("ledger_digest", ""))
+            or not _DIGEST.fullmatch(value.get("last_event_hash", ""))
         ):
             raise ValueError("invalid Covenant readback")
         return value
@@ -509,9 +518,9 @@ def _run_producer(
     output = None,
 ) -> dict:
     arguments = [
-        str(artifact.path)
+        str(getattr(artifact, "private", artifact).path)
         if member == "{artifact}"
-        else str(ledger.path)
+        else str(getattr(ledger, "private", ledger).path)
         if member == "{ledger}"
         else str(output.path)
         if member == "{output}"
@@ -623,8 +632,8 @@ def _validate_relationships(
     artifacts: GovernanceArtifacts,
     native: dict[str, dict],
     readbacks: dict[str, dict],
-    workflow_digest: str,
-    ao2: dict,
+    ledger_digest: str,
+    expires_at: datetime,
     task_text: str,
 ) -> dict:
     blueprint = native["ao-blueprint"]
@@ -666,23 +675,62 @@ def _validate_relationships(
     ):
         raise GovernanceError("governance-relationship-mismatch")
     covenant = native["ao-covenant"]
-    required = {
-        "decision": "authorized",
-        "scope": authority["project_path"],
-        "revoked": False,
-        "mission_id": mission.mission_id,
-        "objective_digest": mission.objective_digest,
-        "target_path": authority["project_path"],
-        "workflow_sha256": workflow_digest,
-        "run_id": artifacts.run_id,
-        "ao2_sha256": ao2["sha256"],
-    }
-    if any(covenant.get(name) != value for name, value in required.items()):
-        raise GovernanceError("governance-relationship-mismatch")
-    if readbacks["ao-covenant"].get("run_id") != artifacts.run_id:
-        raise GovernanceError("governance-relationship-mismatch")
-    expires_at = _parse_time(covenant.get("expires_at"))
-    if expires_at <= _now():
+    artifact_manifest = covenant.get("artifact_manifest")
+    input_snapshots = covenant.get("input_snapshots")
+    decisions = covenant.get("policy_decisions")
+    closure = covenant.get("closure_matrix")
+    rows = closure.get("rows") if isinstance(closure, dict) else None
+    verification = readbacks["ao-covenant"]
+    if any(
+        (
+            covenant.get("schema_version") != "covenant.evidence-pack.v1",
+            covenant.get("run_id") != artifacts.run_id,
+            covenant.get("run_status") != "success",
+            covenant.get("failures") != [],
+            covenant.get("ledger_digest") != ledger_digest,
+            not isinstance(covenant.get("contract_digest"), str)
+            or not _DIGEST.fullmatch(covenant["contract_digest"]),
+            not isinstance(artifact_manifest, list),
+            not isinstance(input_snapshots, list),
+            not isinstance(decisions, list) or not decisions,
+            isinstance(decisions, list)
+            and any(
+                not isinstance(decision, dict)
+                or decision.get("decision") != "allow"
+                for decision in decisions
+            ),
+            not isinstance(closure, dict),
+            isinstance(closure, dict)
+            and (
+                closure.get("schema_version") != "covenant.closure-matrix.v1"
+                or closure.get("run_id") != artifacts.run_id
+                or closure.get("contract_digest") != covenant.get("contract_digest")
+                or closure.get("status") != "accepted"
+            ),
+            not isinstance(rows, list) or not rows,
+            isinstance(rows, list)
+            and (
+                not any(isinstance(row, dict) and row.get("required") is True for row in rows)
+                or any(
+                    not isinstance(row, dict)
+                    or (row.get("required") is True and row.get("status") != "closed")
+                    for row in rows
+                )
+            ),
+            verification.get("run_id") != artifacts.run_id,
+            verification.get("ledger_digest") != ledger_digest,
+            verification.get("artifact_count")
+            != (len(artifact_manifest) if isinstance(artifact_manifest, list) else -1),
+            verification.get("input_snapshot_count")
+            != (len(input_snapshots) if isinstance(input_snapshots, list) else -1),
+            len(verification.get("policy_explanations", ())) != len(decisions or ()),
+            any(
+                not isinstance(explanation, dict)
+                or explanation.get("decision") != "allow"
+                for explanation in verification.get("policy_explanations", ())
+            ),
+        )
+    ):
         raise GovernanceError("governance-relationship-mismatch")
     return {
         "decision": "authorized",
@@ -1028,7 +1076,6 @@ def issue_witness(
                     _ROOTS["ao-covenant"],
                     "ao-covenant-ledger",
                 )
-                del ledger_digest
                 for retained in staged_paths.values():
                     if isinstance(retained, _RetainedFile):
                         retained.refresh_parent_identity()
@@ -1075,6 +1122,8 @@ def issue_witness(
                     "asset": ao2_component["asset"],
                     "sha256": ao2_component["sha256"],
                 }
+                created = _now().replace(microsecond=0)
+                expires = created + timedelta(seconds=lifetime_seconds)
                 covenant = _validate_relationships(
                     mission,
                     route,
@@ -1082,8 +1131,8 @@ def issue_witness(
                     artifacts,
                     native,
                     readbacks,
-                    workflow_digest,
-                    ao2,
+                    ledger_digest,
+                    expires,
                     objective,
                 )
                 staged_blueprint.recheck(project)
@@ -1120,7 +1169,6 @@ def issue_witness(
                     )
                     for name in _PRODUCERS
                 }
-                created = _now().replace(microsecond=0)
                 route_digest = route.as_record()["decision_digest"]
                 request = {
                     "authority_digest": _digest_bytes(lease.authority_bytes),
@@ -1166,7 +1214,7 @@ def issue_witness(
                     "requirements_evidence_digest": requirements_digest,
                     "ao2": ao2,
                     "created_at": _time(created),
-                    "expires_at": _time(created + timedelta(seconds=lifetime_seconds)),
+                    "expires_at": _time(expires),
                     "payload_digest": "0" * 64,
                 }
                 envelope["payload_digest"] = _digest_value(

@@ -435,9 +435,6 @@ class ExecutionTests(unittest.TestCase):
             if component["name"] == "ao2":
                 component["sha256"] = self.executable_digest
         self.harness._write_lock()
-        covenant = json.loads(self.harness.covenant.read_text(encoding="utf-8"))
-        covenant["ao2_sha256"] = self.executable_digest
-        self.harness.covenant.write_text(json.dumps(covenant), encoding="utf-8")
         self.malicious = self.base / ("malicious.exe" if os.name == "nt" else "malicious")
         if supplied:
             shutil.copy2(supplied, self.malicious)
