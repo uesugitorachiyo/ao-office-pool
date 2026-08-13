@@ -668,7 +668,7 @@ def _requirements(project: _PrivateDirectory, path: Path) -> tuple[dict, str]:
 
 def _create_private(path, data: bytes) -> None:
     descriptor = path.directory.directory_descriptor
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     opened = None
@@ -734,7 +734,7 @@ def _stage_file(
                 raise GovernanceError("governance-artifact-changed")
         if _read_private_bytes(staged, _MAX_ARTIFACT) != raw:
             raise GovernanceError("governance-artifact-changed")
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = (
@@ -784,7 +784,7 @@ def _stage_directory(
                     if _read_private_bytes(retained, _MAX_ARTIFACT) != raw:
                         retained.close()
                         raise GovernanceError("governance-artifact-changed")
-                flags = os.O_RDONLY
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
                 descriptor = (
@@ -848,7 +848,7 @@ def _retained_output(project: _PrivateDirectory) -> _RetainedFile:
     )
     try:
         _create_private(output, b"")
-        flags = os.O_RDWR
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = (

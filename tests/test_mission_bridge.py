@@ -1,3 +1,4 @@
+import ast
 import ctypes
 import errno
 import hashlib
@@ -166,6 +167,27 @@ int main(int argc, char **argv) {
     return 0;
 }
 '''
+
+
+class WindowsBinaryDescriptorTests(unittest.TestCase):
+    def test_native_handle_conversions_and_fd_wrappers_are_binary(self):
+        # MUTATION: omitting O_BINARY/text mode corrupts Windows byte descriptors.
+        roots = Path(mission_bridge.__file__).parent
+        handle_flags = []
+        fdopen_modes = []
+        for name in ("mission_bridge.py", "execution.py", "transactions.py"):
+            tree = ast.parse(roots.joinpath(name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr == "open_osfhandle":
+                    handle_flags.append(ast.unparse(node.args[1]))
+                elif node.func.attr == "fdopen":
+                    fdopen_modes.append(ast.literal_eval(node.args[1]))
+        self.assertEqual(len(handle_flags), 5)
+        self.assertTrue(all("O_BINARY" in flags for flags in handle_flags))
+        self.assertEqual(len(fdopen_modes), 3)
+        self.assertTrue(all("b" in mode for mode in fdopen_modes))
 
 
 class MissionBridgeTests(unittest.TestCase):

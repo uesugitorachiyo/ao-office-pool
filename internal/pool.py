@@ -170,7 +170,7 @@ class Pool:
         path = self._governance_marker_path(
             lease, kind, witness_id, authority_digest
         )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
@@ -200,7 +200,7 @@ class Pool:
     def _validate_witness_key(self) -> None:
         descriptor = None
         try:
-            flags = os.O_RDONLY
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(self._witness_key_path, flags)
@@ -226,7 +226,7 @@ class Pool:
             raise InjectedCrash(name)
 
     def _create_witness_key(self) -> None:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(self._witness_key_path, flags, 0o600)
@@ -886,7 +886,7 @@ class Pool:
                     raise PoolError("unauthorized")
                 descriptor = None
                 try:
-                    flags = os.O_RDONLY
+                    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
                     if hasattr(os, "O_NOFOLLOW"):
                         flags |= os.O_NOFOLLOW
                     descriptor = os.open(self._witness_key_path, flags)

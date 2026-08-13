@@ -23,6 +23,7 @@ from internal.governance_witness import (
     revoke_witness,
 )
 from internal.pool import AuthorityLease, Pool, PoolError
+from tests.windows_crt import windows_text_mode
 
 
 FAKE_PRODUCER = r'''
@@ -935,6 +936,136 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertNotEqual(envelope, second)
         self.assertEqual(staged.stat().st_ino, inode)
         self.assertEqual(staged.read_bytes(), self.workflow.read_bytes())
+
+    def test_windows_create_private_and_workflow_preserve_physical_bytes(self):
+        # MUTATION: text-mode create expands both LF and the LF in CRLF.
+        payload = b"\x00\xffLF\nCRLF\r\nCTRL-Z\x1aEND\rTAIL"
+        digest = hashlib.sha256(payload).hexdigest()
+        project = mission_bridge._receipt_project_root(self.authority)
+        candidate = mission_bridge._private_file(
+            project, (*governance._PRIVATE_PARTS, "producer-input"), "binary-private"
+        )
+        try:
+            with windows_text_mode():
+                governance._create_private(candidate, payload)
+            physical = candidate.path.read_bytes()
+            self.assertEqual(physical, payload)
+            self.assertEqual(len(physical), len(payload))
+            self.assertEqual(hashlib.sha256(physical).hexdigest(), digest)
+
+            with (
+                windows_text_mode(),
+                mock.patch.object(governance, "_read_file", return_value=payload),
+                mock.patch.object(
+                    governance,
+                    "_read_private_bytes",
+                    side_effect=lambda path, _limit: path.path.read_bytes(),
+                ),
+            ):
+                self.assertEqual(governance._stage_workflow(project, self.workflow), digest)
+            workflow = project.joinpath(
+                *governance._PRIVATE_PARTS, "workflows", digest
+            )
+            physical = workflow.read_bytes()
+            self.assertEqual(physical, payload)
+            self.assertEqual(len(physical), len(payload))
+            self.assertEqual(hashlib.sha256(physical).hexdigest(), digest)
+        finally:
+            candidate.close()
+            project.close()
+
+    def test_windows_retained_file_and_directory_staging_preserve_bytes(self):
+        # MUTATION: retained staging descriptors read CRLF/Ctrl-Z in text mode.
+        payload = b"\x00\xffLF\nCRLF\r\nCTRL-Z\x1aEND\rTAIL"
+        digest = hashlib.sha256(payload).hexdigest()
+        project = mission_bridge._receipt_project_root(self.authority)
+        retained_file = retained_directory = None
+        try:
+            staged = mission_bridge._private_file(
+                project,
+                (*governance._PRIVATE_PARTS, "producer-input"),
+                f"binary-{digest}",
+            )
+            staged.path.write_bytes(payload)
+            staged.close()
+            with (
+                windows_text_mode(),
+                mock.patch.object(governance, "_read_file", return_value=payload),
+                mock.patch.object(
+                    governance,
+                    "_read_private_bytes",
+                    side_effect=lambda path, _limit: path.path.read_bytes(),
+                ),
+            ):
+                retained_file, staged_digest = governance._stage_file(
+                    project, self.forge, governance._ROOTS["ao-forge"], "binary"
+                )
+                readback = retained_file.read(governance._MAX_ARTIFACT)
+            self.assertEqual(staged_digest, digest)
+            self.assertEqual(readback, payload)
+            self.assertEqual(len(readback), len(payload))
+            self.assertEqual(hashlib.sha256(readback).hexdigest(), digest)
+            self.assertEqual(retained_file.private.path.read_bytes(), payload)
+
+            source = self._root("binary-directory") / "payload.bin"
+            source.write_bytes(payload)
+            directory_digest = "d" * 64
+            destination = (
+                self.project
+                / ".ao/governance/office-pool/producer-input/blueprint"
+                / directory_digest
+            )
+            destination.mkdir(parents=True)
+            destination.joinpath(source.name).write_bytes(payload)
+            with (
+                windows_text_mode(),
+                mock.patch.object(governance, "_directory_digest", return_value=directory_digest),
+                mock.patch.object(governance, "_read_file", return_value=payload),
+                mock.patch.object(
+                    governance,
+                    "_read_private_bytes",
+                    side_effect=lambda path, _limit: path.path.read_bytes(),
+                ),
+            ):
+                retained_directory, observed_digest = governance._stage_directory(
+                    project, source.parent, (".ao", "evidence", "binary-directory")
+                )
+                child_readback = retained_directory.children[0].read(
+                    governance._MAX_ARTIFACT
+                )
+            self.assertEqual(observed_digest, directory_digest)
+            self.assertEqual(child_readback, payload)
+            self.assertEqual(len(child_readback), len(payload))
+            self.assertEqual(hashlib.sha256(child_readback).hexdigest(), digest)
+            self.assertEqual(retained_directory.children[0].private.path.read_bytes(), payload)
+        finally:
+            if retained_directory is not None:
+                retained_directory.close()
+            if retained_file is not None:
+                retained_file.close()
+            project.close()
+
+    def test_windows_retained_producer_output_preserves_physical_bytes(self):
+        # MUTATION: a text-mode producer-output descriptor expands and truncates bytes.
+        payload = b"\x00\xffLF\nCRLF\r\nCTRL-Z\x1aEND\rTAIL"
+        digest = hashlib.sha256(payload).hexdigest()
+        project = mission_bridge._receipt_project_root(self.authority)
+        retained = None
+        try:
+            with windows_text_mode():
+                retained = governance._retained_output(project)
+                self.assertEqual(os.write(retained.descriptor, payload), len(payload))
+                os.fsync(retained.descriptor)
+                readback = retained.read(governance._MAX_ARTIFACT)
+            physical = retained.private.path.read_bytes()
+            self.assertEqual(physical, payload)
+            self.assertEqual(len(physical), len(payload))
+            self.assertEqual(hashlib.sha256(physical).hexdigest(), digest)
+            self.assertEqual(readback, payload)
+        finally:
+            if retained is not None:
+                retained.close()
+            project.close()
 
     def test_mismatched_preexisting_workflow_copy_fails_closed(self):
         digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()

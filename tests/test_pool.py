@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ from unittest import mock
 
 import internal.pool as pool_module
 from internal.pool import AuthorityLease, Pool, PoolError
+from tests.windows_crt import windows_text_mode
 
 
 def _claim_worker(arguments):
@@ -203,6 +205,57 @@ class PoolTests(unittest.TestCase):
         ):
             self.pool._create_witness_key()
         fchmod.assert_not_called()
+
+    def test_windows_witness_key_creation_preserves_physical_bytes(self):
+        # MUTATION: omitting O_BINARY expands LF bytes in a create-only key.
+        key = b"\x00\xff\n\r\n\x1a" + b"K" * 26
+        key_path = self.root / "operator-secrets/governance-witness.key"
+        key_path.unlink()
+        with (
+            windows_text_mode(),
+            mock.patch.object(pool_module.secrets, "token_bytes", return_value=key),
+        ):
+            self.pool._create_witness_key()
+        physical = key_path.read_bytes()
+        self.assertEqual(physical, key)
+        self.assertEqual(len(physical), 32)
+        self.assertEqual(hashlib.sha256(physical).digest(), hashlib.sha256(key).digest())
+
+    def test_windows_witness_key_reads_and_hmac_preserve_all_bytes(self):
+        # MUTATION: a text-mode key read normalizes CRLF or stops at Ctrl-Z.
+        authority = self.pool.claim("binary-holder", "binary-task", self.project, "pinned")
+        key = b"\x00\xff\n\r\n\x1a" + b"K" * 26
+        payload = b"\x00\xffLF\nCRLF\r\nCTRL-Z\x1aEND\rTAIL"
+        key_path = self.root / "operator-secrets/governance-witness.key"
+        key_path.write_bytes(key)
+        expected = hmac.new(key, payload, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+        with windows_text_mode():
+            self.pool._validate_witness_key()
+            with self.pool.authority_lease(authority) as lease:
+                self.assertEqual(lease.sign_witness(payload), expected)
+                self.assertTrue(lease.verify_witness(payload, expected))
+        physical = key_path.read_bytes()
+        self.assertEqual(physical, key)
+        self.assertEqual(len(physical), 32)
+        self.assertEqual(hashlib.sha256(physical).digest(), hashlib.sha256(key).digest())
+
+    def test_windows_governance_marker_preserves_physical_lf(self):
+        # MUTATION: text-mode marker creation writes CRLF to disk.
+        authority = self.pool.claim("marker-holder", "marker-task", self.project, "pinned")
+        with self.pool.authority_lease(authority) as lease:
+            marker = self.pool._governance_marker_path(
+                lease, "consumed", "witness-" + "a" * 32, "b" * 64
+            )
+            with windows_text_mode():
+                self.assertTrue(
+                    self.pool._create_governance_marker(
+                        lease, "consumed", "witness-" + "a" * 32, "b" * 64
+                    )
+                )
+        physical = marker.read_bytes()
+        self.assertEqual(physical, b"1\n")
+        self.assertEqual(len(physical), 2)
+        self.assertEqual(hashlib.sha256(physical).digest(), hashlib.sha256(b"1\n").digest())
 
     def test_authoritative_marker_fsyncs_file_and_parent_directory(self):
         authority = self.pool.claim("marker-holder", "marker-task", self.project, "pinned")

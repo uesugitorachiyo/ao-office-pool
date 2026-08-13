@@ -824,24 +824,26 @@ class WindowsRecordCreationTests(unittest.TestCase):
         import internal.windows_identity as windows_identity
 
         fake_msvcrt = types.SimpleNamespace(
-            open_osfhandle=mock.Mock(return_value=44), O_RDWR=2, O_BINARY=0
+            open_osfhandle=mock.Mock(return_value=44), O_RDWR=2, O_BINARY=0x8000
         )
 
         with (
             mock.patch.object(execution_module.os, "name", "nt"),
+            mock.patch.object(execution_module.os, "O_BINARY", 0x8000, create=True),
             mock.patch.object(windows_identity, "_kernel32", return_value=library),
             mock.patch.object(windows_identity, "_final_path", side_effect=final_path),
             mock.patch.object(windows_identity, "_native_path", return_value="native"),
             mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
         ):
             descriptor = execution_module._create_record_descriptor(record)
-        return descriptor, calls
+        return descriptor, calls, fake_msvcrt.open_osfhandle
 
     def test_windows_create_is_bound_to_retained_parent_before_write(self):
         # MUTATION: pathname creation with write/delete sharing can redirect or replace.
         parent = PureWindowsPath("C:/project/.ao/evidence/office-pool")
-        descriptor, calls = self._create_record(parent)
+        descriptor, calls, open_osfhandle = self._create_record(parent)
         self.assertEqual(descriptor, 44)
+        open_osfhandle.assert_called_once_with(33, 2 | 0x8000)
         self.assertEqual(calls[0][1], 0x80000000 | 0x40000000)
         self.assertEqual(calls[0][2], 1)
         self.assertEqual(calls[0][4], 1)
@@ -903,9 +905,11 @@ class BoundedStreamCleanupTests(unittest.TestCase):
             wait_calls += 1
             if wait_calls == 1:
                 deadline = time.monotonic() + 5
-                while not child_pid_path.exists() and time.monotonic() < deadline:
+                while time.monotonic() < deadline:
+                    if child_pid_path.exists() and child_pid_path.stat().st_size:
+                        break
                     time.sleep(0.01)
-                if not child_pid_path.exists():
+                if not child_pid_path.exists() or not child_pid_path.stat().st_size:
                     raise AssertionError("descendant was not created")
                 raise RuntimeError("unexpected wait failure")
             return leader.wait(timeout=5)
