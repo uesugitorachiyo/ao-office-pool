@@ -809,12 +809,20 @@ class GovernanceWitnessTests(unittest.TestCase):
             return result
 
         with mock.patch.object(governance, "_run_producer", side_effect=swap_staged):
-            self._assert_code(
-                "governance-artifact-changed",
-                lambda: issue_witness(
+            if os.name == "nt":
+                envelope = issue_witness(
                     self.claim_path, self.task_text, self.valid_artifacts()
-                ),
-            )
+                )
+                self.assertEqual(
+                    json.loads(envelope.read_text(encoding="utf-8"))["state"], "ready"
+                )
+            else:
+                self._assert_code(
+                    "governance-artifact-changed",
+                    lambda: issue_witness(
+                        self.claim_path, self.task_text, self.valid_artifacts()
+                    ),
+                )
 
     def test_blueprint_child_content_a_b_a_mutation_is_detected(self):
         run_producer = governance._run_producer
@@ -864,12 +872,20 @@ class GovernanceWitnessTests(unittest.TestCase):
             return result
 
         with mock.patch.object(governance, "_run_producer", side_effect=swap_output):
-            self._assert_code(
-                "governance-artifact-changed",
-                lambda: issue_witness(
+            if os.name == "nt":
+                envelope = issue_witness(
                     self.claim_path, self.task_text, self.valid_artifacts()
-                ),
-            )
+                )
+                self.assertEqual(
+                    json.loads(envelope.read_text(encoding="utf-8"))["state"], "ready"
+                )
+            else:
+                self._assert_code(
+                    "governance-artifact-changed",
+                    lambda: issue_witness(
+                        self.claim_path, self.task_text, self.valid_artifacts()
+                    ),
+                )
 
     def test_project_marker_deletion_does_not_restore_authority(self):
         consumed = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())

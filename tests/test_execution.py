@@ -211,6 +211,15 @@ class ExecutionTests(unittest.TestCase):
 
     def _assert_child_dead(self) -> None:
         child = int((self.project / "ao2-child-pid").read_text(encoding="utf-8"))
+        if os.name == "nt":
+            import ctypes
+
+            library = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = library.OpenProcess(0x1000, False, child)
+            if handle:
+                library.CloseHandle(handle)
+                self.fail(f"descendant {child} survived cleanup")
+            return
         try:
             with self.assertRaises(ProcessLookupError):
                 os.kill(child, 0)
@@ -240,6 +249,17 @@ class ExecutionTests(unittest.TestCase):
 
         with mock.patch.object(execution_module.os, "read", mutate_then_read):
             yield
+
+    def _assert_accepted_completed_record(self, result) -> None:
+        record = json.loads(result.record.read_text(encoding="utf-8"))
+        self.assertEqual(result.status, "accepted")
+        self.assertEqual(record["phase"], "completed")
+        self.assertEqual(record["request_digest"], result.request_digest)
+        self.assertEqual(record["ao2_sha256"], self.executable_digest)
+        self.assertEqual(
+            record["authority_digest"],
+            hashlib.sha256(self.harness.authority_raw).hexdigest(),
+        )
 
     def test_executes_only_envelope_bound_objects_and_relative_target(self):
         # MUTATION: reopening caller paths exposes absolute workflow/target pathnames.
@@ -560,7 +580,6 @@ class ExecutionTests(unittest.TestCase):
             (self.project / "ao2-environment.txt").read_text(encoding="utf-8"), ""
         )
 
-    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_timeout_kills_complete_process_tree(self):
         # MUTATION: killing only the AO2 leader leaves its child alive.
         self._set_ao2_mode("child-timeout")
@@ -570,7 +589,6 @@ class ExecutionTests(unittest.TestCase):
         self._assert_child_dead()
         self.assertEqual(json.loads(raised.exception.record.read_text())["phase"], "failed")
 
-    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_output_overflow_kills_complete_process_tree(self):
         # MUTATION: killing only the AO2 leader on overflow leaves its child alive.
         self._set_ao2_mode("child-large")
@@ -711,7 +729,8 @@ class ExecutionTests(unittest.TestCase):
 
         if os.name == "nt":
             with self._during_record_readback(add_whitespace):
-                execute(self.claim_path, self.envelope)
+                result = execute(self.claim_path, self.envelope)
+            self._assert_accepted_completed_record(result)
         else:
             with (
                 self._during_record_readback(add_whitespace),
@@ -742,7 +761,8 @@ class ExecutionTests(unittest.TestCase):
 
         if os.name == "nt":
             with self._during_record_readback(replace_digest):
-                execute(self.claim_path, self.envelope)
+                result = execute(self.claim_path, self.envelope)
+            self._assert_accepted_completed_record(result)
         else:
             with (
                 self._during_record_readback(replace_digest),
@@ -772,7 +792,8 @@ class ExecutionTests(unittest.TestCase):
 
         if os.name == "nt":
             with self._during_record_readback(replace_path):
-                execute(self.claim_path, self.envelope)
+                result = execute(self.claim_path, self.envelope)
+            self._assert_accepted_completed_record(result)
         else:
             with (
                 self._during_record_readback(replace_path),
@@ -802,7 +823,8 @@ class ExecutionTests(unittest.TestCase):
 
         if os.name == "nt":
             with self._during_record_readback(replace_path):
-                execute(self.claim_path, self.envelope)
+                result = execute(self.claim_path, self.envelope)
+            self._assert_accepted_completed_record(result)
         else:
             with (
                 self._during_record_readback(replace_path),
