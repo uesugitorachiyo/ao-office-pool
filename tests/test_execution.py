@@ -601,7 +601,7 @@ class ExecutionTests(unittest.TestCase):
         # MUTATION: killing only the AO2 leader leaves its child alive.
         self._set_ao2_mode("child-timeout")
         with self.assertRaises(ExecutionError) as raised:
-            execute(self.claim_path, self.envelope, timeout_seconds=1)
+            execute(self.claim_path, self.envelope, timeout_seconds=10 if os.name == "nt" else 1)
         self.assertEqual(raised.exception.code, "execution-timeout")
         self._assert_child_dead()
         self.assertEqual(json.loads(raised.exception.record.read_text())["phase"], "failed")
