@@ -69,11 +69,14 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     STARTUPINFOA startup;
     PROCESS_INFORMATION child;
-    char command[] = "cmd.exe /d /c timeout /t 30 /nobreak >NUL";
+    char executable[MAX_PATH];
+    char command[] = "ping.exe -n 31 127.0.0.1";
     ZeroMemory(&startup, sizeof(startup));
     ZeroMemory(&child, sizeof(child));
     startup.cb = sizeof(startup);
-    if (!CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 71;
+    if (!GetSystemDirectoryA(executable, sizeof(executable)) || strlen(executable) + strlen("\\ping.exe") >= sizeof(executable)) return 71;
+    strcat(executable, "\\ping.exe");
+    if (!CreateProcessA(executable, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 71;
     FILE *pid_file = fopen("ao2-child-pid", "wb");
     if (pid_file) { fprintf(pid_file, "%lu", (unsigned long)child.dwProcessId); fclose(pid_file); }
     CloseHandle(child.hThread);
@@ -212,13 +215,26 @@ class ExecutionTests(unittest.TestCase):
     def _assert_child_dead(self) -> None:
         child = int((self.project / "ao2-child-pid").read_text(encoding="utf-8"))
         if os.name == "nt":
-            import ctypes
+            from ctypes import wintypes
 
             library = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = library.OpenProcess(0x1000, False, child)
+            library.OpenProcess.argtypes = (
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            )
+            library.OpenProcess.restype = wintypes.HANDLE
+            library.CloseHandle.argtypes = (wintypes.HANDLE,)
+            library.CloseHandle.restype = wintypes.BOOL
+            handle = library.OpenProcess(0x00100000, False, child)
             if handle:
-                library.CloseHandle(handle)
+                self.assertTrue(library.CloseHandle(handle))
                 self.fail(f"descendant {child} survived cleanup")
+            self.assertEqual(
+                ctypes.get_last_error(),
+                87,
+                f"descendant {child} lookup failed unexpectedly",
+            )
             return
         try:
             with self.assertRaises(ProcessLookupError):
