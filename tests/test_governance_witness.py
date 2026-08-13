@@ -306,6 +306,9 @@ class GovernanceWitnessTests(unittest.TestCase):
         )
         self.private_forge_runtime.joinpath("producer-logs").mkdir(parents=True)
         self.private_forge_runtime.joinpath("producer-sync").mkdir()
+        self.forge_launch_runtime = (
+            self.forge_runtime if os.name == "nt" else self.private_forge_runtime
+        )
         self.bin_dir = self.base / "bin"
         self.bin_dir.mkdir()
         source = self.base / "fake-producer.c"
@@ -705,7 +708,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     def _producer_commands(self):
         commands = {}
-        for root in (self.project, self.private_forge_runtime):
+        for root in (self.project, self.forge_launch_runtime):
             path = root / "producer-logs/commands"
             if path.is_file():
                 for line in path.read_text(encoding="utf-8").splitlines():
@@ -714,7 +717,7 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     def _producer_environment(self):
         lines = []
-        for root in (self.project, self.private_forge_runtime):
+        for root in (self.project, self.forge_launch_runtime):
             path = root / "producer-logs/environment"
             if path.is_file():
                 lines.extend(path.read_text(encoding="utf-8").splitlines())
@@ -731,7 +734,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.project / "producer-logs/commands"
         ).read_text(encoding="utf-8").splitlines()
         runtime_commands = (
-            self.private_forge_runtime / "producer-logs/commands"
+            self.forge_launch_runtime / "producer-logs/commands"
         ).read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             {line.split("|", 1)[0] for line in project_commands},
@@ -740,13 +743,22 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.assertEqual(len(runtime_commands), 1)
         self.assertIn("|goal|validate|--goal-run|", runtime_commands[0])
         goal_run = runtime_commands[0].split("|--goal-run|", 1)[1].split("|", 1)[0]
-        self.assertTrue(self.private_forge_runtime.resolve().is_relative_to(self.project))
-        self.assertFalse(Path(goal_run).is_absolute())
-        self.assertTrue(
-            self.private_forge_runtime.joinpath(goal_run)
-            .resolve()
-            .is_relative_to(self.project)
-        )
+        if os.name == "nt":
+            self.assertFalse(
+                self.forge_launch_runtime.resolve().is_relative_to(self.project)
+            )
+            self.assertTrue(Path(goal_run).is_absolute())
+            self.assertTrue(Path(goal_run).resolve().is_relative_to(self.project))
+        else:
+            self.assertTrue(
+                self.forge_launch_runtime.resolve().is_relative_to(self.project)
+            )
+            self.assertFalse(Path(goal_run).is_absolute())
+            self.assertTrue(
+                self.forge_launch_runtime.joinpath(goal_run)
+                .resolve()
+                .is_relative_to(self.project)
+            )
 
     def test_missing_forge_runtime_schema_fails_before_forge_launch(self):
         self.forge_schema.unlink()
@@ -819,7 +831,7 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.forge_schema.write_bytes(TEST_FORGE_SCHEMA)
 
     def test_forge_runtime_parent_directory_aba_during_launch_fails_closed(self):
-        sync = self.private_forge_runtime / "producer-sync"
+        sync = self.forge_launch_runtime / "producer-sync"
         sync.joinpath("mode").write_text("forge-parent-aba", encoding="utf-8")
         docs = self.forge_runtime / "docs"
         contracts = docs / "contracts"
