@@ -167,7 +167,15 @@ int main(int argc, char **argv) {
   if (argc > 2 && strcmp(argv[1], "goal") == 0) {
     const char *goal_run = NULL;
     for (int i = 2; i + 1 < argc; i++) if (strcmp(argv[i], "--goal-run") == 0) goal_run = argv[i + 1];
+    if (mode && strcmp(mode, "staged-ancestor-aba") == 0) {
+      if (!create_marker("producer-sync/artifact-ready")
+          || !wait_for_marker("producer-sync/artifact-swapped")) return 69;
+    }
     if (!goal_run || !starts_object_twice(goal_run)) return 65;
+    if (mode && strcmp(mode, "staged-ancestor-aba") == 0) {
+      if (!create_marker("producer-sync/artifact-read")
+          || !wait_for_marker("producer-sync/artifact-restored")) return 69;
+    }
     const char *expected = "test-forge-goal-run-schema\n";
     if (mode && strcmp(mode, "forge-parent-aba") == 0) {
       if (!create_marker("producer-sync/schema-ready")
@@ -500,6 +508,114 @@ class GovernanceWitnessTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_covenant_events(self, event_fields, *, trailing_newline=True):
+        previous = "0" * 64
+        encoded = []
+        final_hash = None
+        for ordinal, source_fields in enumerate(event_fields, 1):
+            fields = dict(source_fields)
+            sequence = fields.pop("_sequence", ordinal)
+            event_id = fields.pop("_event_id", f"event-{ordinal:06d}")
+            hash_payload = {
+                "schema_version": "covenant.event.v1",
+                "event_id": event_id,
+                "sequence": sequence,
+                "run_id": self.run_id,
+                "previous_event_hash": previous,
+                **fields,
+            }
+            final_hash = hashlib.sha256(
+                json.dumps(hash_payload, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            event = {
+                "schema_version": "covenant.event.v1",
+                "event_id": event_id,
+                "sequence": sequence,
+                "run_id": self.run_id,
+                "previous_event_hash": previous,
+                "event_hash": final_hash,
+                **fields,
+            }
+            encoded.append(
+                json.dumps(event, separators=(",", ":")).encode("utf-8")
+            )
+            previous = final_hash
+        raw = b"\n".join(encoded) + (b"\n" if trailing_newline else b"")
+        self.covenant_ledger.write_bytes(raw)
+        covenant = json.loads(self.covenant.read_text(encoding="utf-8"))
+        covenant["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+        self.covenant.write_text(json.dumps(covenant), encoding="utf-8")
+        return raw, final_hash
+
+    def _native_success_events(self):
+        return [
+            {
+                "type": "run_started",
+                "status": "success",
+                "message": "governed run started",
+            },
+            {
+                "type": "task_started",
+                "task_id": "bounded-task",
+                "status": "success",
+                "message": "bounded task started",
+            },
+            {
+                "type": "policy_decided",
+                "task_id": "bounded-task",
+                "status": "success",
+                "message": "bounded read allowed",
+                "decision_id": "policy-bounded-1",
+                "decision": "allow",
+                "effect_type": "file.read",
+                "resource": ".ao/workflow.yaml",
+            },
+            {
+                "type": "task_finished",
+                "task_id": "bounded-task",
+                "status": "success",
+                "message": "bounded task finished",
+            },
+            {
+                "type": "run_finished",
+                "status": "success",
+                "message": "governed run completed",
+            },
+        ]
+
+    def _assert_ledger_rejected_after_verified_readback(
+        self, event_fields, *, transform=None, trailing_newline=True
+    ):
+        raw, final_hash = self._write_covenant_events(
+            event_fields, trailing_newline=trailing_newline
+        )
+        if transform is not None:
+            raw = transform(raw)
+            self.covenant_ledger.write_bytes(raw)
+            covenant = json.loads(self.covenant.read_text(encoding="utf-8"))
+            covenant["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+            self.covenant.write_text(json.dumps(covenant), encoding="utf-8")
+        run_producer = governance._run_producer
+
+        def verified_readback(name, *arguments):
+            result = run_producer(name, *arguments)
+            if name == "ao-covenant":
+                result = dict(result)
+                result["event_count"] = len(event_fields)
+                result["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+                result["last_event_hash"] = final_hash
+            return result
+
+        with mock.patch.object(
+            governance, "_run_producer", side_effect=verified_readback
+        ):
+            self._assert_code(
+                "governance-relationship-mismatch",
+                lambda: issue_witness(
+                    self.claim_path, self.task_text, self.valid_artifacts()
+                ),
+            )
+
     def _write_legacy_covenant(self):
         workflow_digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()
         self.covenant_ledger.write_text('{"event":"authorized"}\n', encoding="utf-8")
@@ -563,6 +679,8 @@ class GovernanceWitnessTests(unittest.TestCase):
 
     def _mode(self, value):
         (self.project / "producer-sync/mode").write_text(value, encoding="utf-8")
+        if "descendant" in value:
+            (self.project / "producer-child-pid").touch()
 
     def _producer_commands(self):
         commands = {}
@@ -878,6 +996,71 @@ class GovernanceWitnessTests(unittest.TestCase):
                     lambda value=value: governance._readback(
                         "ao-covenant", json.dumps(value).encode()
                     ),
+                )
+
+    def test_covenant_policy_events_exactly_match_pack_decisions(self):
+        mutations = {
+            "decision": lambda event: event.update(decision="deny"),
+            "task_id": lambda event: event.update(task_id="other-task"),
+            "effect_type": lambda event: event.update(effect_type="process.spawn"),
+            "resource": lambda event: event.update(resource="other-resource"),
+            "approval_ticket": lambda event: event.update(
+                approval_ticket_id="approval-bounded-1"
+            ),
+        }
+        for name, mutate in mutations.items():
+            events = self._native_success_events()
+            mutate(events[2])
+            with self.subTest(field=name):
+                self._assert_ledger_rejected_after_verified_readback(events)
+
+    def test_covenant_ledger_requires_successful_terminal_and_no_failed_events(self):
+        cases = {}
+        failed_task = self._native_success_events()
+        failed_task[3]["status"] = "failed"
+        cases["failed_event"] = failed_task
+        failed_terminal = self._native_success_events()
+        failed_terminal[-1]["status"] = "failed"
+        cases["failed_terminal"] = failed_terminal
+        missing_terminal = self._native_success_events()
+        missing_terminal[-1]["type"] = "task_finished"
+        missing_terminal[-1]["task_id"] = "bounded-task"
+        cases["missing_terminal"] = missing_terminal
+        after_terminal = self._native_success_events()
+        after_terminal.append(
+            {
+                "type": "task_finished",
+                "task_id": "bounded-task",
+                "status": "success",
+                "message": "event after terminal",
+            }
+        )
+        cases["event_after_terminal"] = after_terminal
+        for name, events in cases.items():
+            with self.subTest(case=name):
+                self._assert_ledger_rejected_after_verified_readback(events)
+
+    def test_covenant_ledger_requires_strict_ndjson_and_sequential_unique_events(self):
+        missing_newline = self._native_success_events()
+        duplicate_identity = self._native_success_events()
+        duplicate_identity[3]["_sequence"] = 3
+        duplicate_identity[3]["_event_id"] = "event-000003"
+        cases = (
+            ("missing_final_newline", missing_newline, None, False),
+            (
+                "blank_line",
+                self._native_success_events(),
+                lambda raw: raw.replace(b"\n", b"\n\n", 1),
+                True,
+            ),
+            ("duplicate_identity", duplicate_identity, None, True),
+        )
+        for name, events, transform, trailing_newline in cases:
+            with self.subTest(case=name):
+                self._assert_ledger_rejected_after_verified_readback(
+                    events,
+                    transform=transform,
+                    trailing_newline=trailing_newline,
                 )
 
     def test_arbitrary_envelope_sealer_and_forged_lease_are_rejected(self):
@@ -1268,6 +1451,91 @@ class GovernanceWitnessTests(unittest.TestCase):
             envelope = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
         self.assertNotIn(str(self.forge), "\n".join(self._producer_commands().values()))
         self.assertTrue(envelope.is_file())
+
+    @unittest.skipIf(os.name == "nt", "POSIX ancestor rename race")
+    def test_staged_ancestor_a_b_a_during_producer_open_fails_closed(self):
+        sync = self.forge_runtime / "producer-sync"
+        sync.joinpath("mode").write_text("staged-ancestor-aba", encoding="utf-8")
+        office_pool = self.project / ".ao/governance/office-pool"
+        parked = office_pool.with_name("office-pool-parked")
+        replacement = office_pool.with_name("office-pool-replacement")
+        attacker = None
+        attack_errors = []
+
+        def wait_for(path):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if path.exists():
+                    return
+                time.sleep(0.01)
+            raise AssertionError(f"timed out waiting for {path.name}")
+
+        def attack():
+            try:
+                wait_for(sync / "artifact-ready")
+                shutil.copytree(office_pool, replacement)
+                staged = tuple(
+                    replacement.joinpath("producer-input").glob("ao-forge-*")
+                )
+                self.assertEqual(len(staged), 1)
+                staged[0].chmod(0o600)
+                staged[0].write_text(
+                    '{"schema_version":"ao.forge.goal-run.v0.1","goal_id":"attacker"}',
+                    encoding="utf-8",
+                )
+                office_pool.rename(parked)
+                replacement.rename(office_pool)
+                sync.joinpath("artifact-swapped").touch()
+                wait_for(sync / "artifact-read")
+                office_pool.rename(replacement)
+                parked.rename(office_pool)
+                sync.joinpath("artifact-restored").touch()
+            except BaseException as error:
+                attack_errors.append(error)
+                sync.joinpath("artifact-swapped").touch()
+                sync.joinpath("artifact-restored").touch()
+
+        run_output = governance._run_output
+
+        def attack_during_run(arguments, *args, **kwargs):
+            nonlocal attacker
+            if arguments[:2] == ["goal", "validate"]:
+                attacker = threading.Thread(target=attack)
+                attacker.start()
+            try:
+                return run_output(arguments, *args, **kwargs)
+            finally:
+                if attacker is not None:
+                    attacker.join(timeout=6)
+
+        try:
+            with mock.patch.object(
+                governance, "_run_output", side_effect=attack_during_run
+            ):
+                self._assert_code(
+                    "governance-artifact-changed",
+                    lambda: issue_witness(
+                        self.claim_path, self.task_text, self.valid_artifacts()
+                    ),
+                )
+            self.assertIsNotNone(attacker)
+            self.assertFalse(attacker.is_alive())
+            if attack_errors:
+                raise attack_errors[0]
+            self.assertTrue(sync.joinpath("artifact-read").is_file())
+        finally:
+            if parked.exists():
+                if office_pool.exists():
+                    for path in office_pool.rglob("*"):
+                        path.chmod(0o700 if path.is_dir() else 0o600)
+                    office_pool.chmod(0o700)
+                    shutil.rmtree(office_pool)
+                parked.rename(office_pool)
+            if replacement.exists():
+                for path in replacement.rglob("*"):
+                    path.chmod(0o700 if path.is_dir() else 0o600)
+                replacement.chmod(0o700)
+                shutil.rmtree(replacement)
 
     def test_staged_candidate_a_b_a_swap_fails_closed(self):
         run_producer = governance._run_producer

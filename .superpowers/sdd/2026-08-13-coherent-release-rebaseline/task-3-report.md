@@ -140,3 +140,61 @@ docs/superpowers/plans/2026-08-13-coherent-release-rebaseline.md  content  priva
 ```
 
 An export of base `513079fba08660d8fadb38293c22fa79de59df41` reports the same path, rule, and detail. Task 3 introduced no new clean-export finding. The pre-existing plan contains a private campaign-path literal and remains unchanged to preserve scope and provenance. This concern is deferred to avoid editing an approved plan outside Task 3.
+
+## Fix Round 1
+
+Review found three authorization-boundary gaps:
+
+1. Producers opened absolute staged pathnames, while the post-run check covered the retained file and immediate parent only. A POSIX `office-pool` ancestor A-to-B-to-A swap let Forge read attacker bytes before Pool sealed the original retained digest.
+2. Pool accepted pack/readback success without correlating native ledger semantics. Released Covenant validates the chain and consumes policy events by `decision_id`, so a hash-valid failed run or mismatched policy event could accompany an allow/success pack.
+3. The qualification runner calculated the Forge schema digest from a caller-selected runtime and patched Pool's trust constant to that digest.
+
+### RED
+
+- The real ancestor race replaced `office-pool`, let Forge open the replacement staged GoalRun, restored the original ancestor, and minted a witness instead of raising `governance-artifact-changed`.
+- Five policy-field mismatches, four failed/terminal-order cases, and three NDJSON/identity cases all reached witness issuance after a simulated verified native readback.
+- The exact native qualification command returned `status=accepted` and `record_phase=completed` with an altered Forge schema.
+
+### Correction
+
+- `_producer_path_verifier()` reuses each retained `_PrivateDirectory` descriptor chain. It calls `require_current_paths()` and compares every retained directory ctime immediately before and after each producer launch, including failed launches. The existing retained-file identity and digest checks remain in place.
+- `_validate_covenant_ledger()` parses the post-verification staged ledger with the existing 64 MiB bound and strict newline-delimited JSON objects. It requires sequential native event IDs/sequences, one leading `run_started`, one successful trailing `run_finished`, no failed event, native event count and final hash agreement, and an exact policy decision/event set match across `decision_id`, `task_id`, `decision`, `effect_type`, `resource`, and approval-ticket presence/value. Locked Covenant remains responsible for schema, hash-chain, and provenance verification.
+- Native qualification requires the packaged Forge schema to equal fixed SHA-256 `68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c` before fixture setup. It no longer patches `FORGE_SCHEMA_SHA256`.
+
+### GREEN
+
+```text
+$ python3.12 -m unittest tests.test_planning_routes tests.test_governance_witness tests.test_execution -v
+Ran 94 tests in 69.817s
+
+OK
+
+$ python3.12 -m unittest discover -s tests
+Ran 284 tests in 87.939s
+
+OK (skipped=11)
+
+$ python3.12 -m py_compile internal/governance_witness.py tests/test_governance_witness.py .superpowers/sdd/2026-08-12-task6-governance-witness-correction/qualification-support/native-smoke-current.py
+exit 0
+
+$ git diff --check
+exit 0
+```
+
+Fresh exact released macOS integration smoke:
+
+```json
+{"ao2_sha256":"6cba9a1ded758506bb0a4b6d6377687e29b9d35950c799c2a0b4efb51c6f1bd7","producer_sha256":{"ao-atlas":"e6968aeeb11bc19eb77fe3f87ca71414697dc92736556e726abe89c74f874bea","ao-blueprint":"f86f221351069bbece0bd2afacdf964c812081018d71a94286bb0103927cafec","ao-covenant":"9a5ca7c6920c44b6e120d6c5bd8baf190b66e188d43485639c6fc5355190868e","ao-forge":"823ee61771608c7893287532c00929710ee1ff1149e06c13d40ff7296e937ba1"},"record_phase":"completed","record_sha256":"c7858727ddeded862c91d5e1a04d9bd0cb3ea923ec91e2e95b1d2469e08e897f","request_digest":"5692b20ea940ecd11339db283fbb272725d70183fa62fb74345d54f5e127c6e7","run_id":"run-0123456789abcdef","status":"accepted"}
+```
+
+The altered-schema qualification now exits before fixture setup with `RuntimeError: Forge schema digest mismatch`.
+
+The staged clean export and base `513079fba08660d8fadb38293c22fa79de59df41` each report only the pre-existing plan finding recorded above.
+
+### Self-review
+
+- The path verifier retains and checks existing directory handles; it adds no new path or trust abstraction. The check covers all project-to-staged-file ancestors and runs after output collection on success or failure.
+- Pool parses ledger semantics only after locked Covenant returns a verified readback. It does not duplicate Covenant's schema or hash-chain implementation.
+- Policy correlation is set-wise and rejects duplicate IDs, extra events, missing events, value mismatches, and approval-ticket presence mismatches.
+- The qualification runner compares the selected runtime to a fixed release digest and leaves the production trust constant unchanged.
+- The change adds no dependency, upstream mutation, provider call, publication, Windows/SSH work, or Task 7/8 work.

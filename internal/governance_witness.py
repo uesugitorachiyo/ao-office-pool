@@ -509,6 +509,43 @@ def _forge_runtime(
     return runtime, verify
 
 
+def _producer_path_verifier(*values) -> Callable[[], None]:
+    directories = []
+    for value in values:
+        if isinstance(value, _RetainedDirectory):
+            candidates = (value.directory, *value.child_directories)
+        else:
+            private = getattr(value, "private", None)
+            directory = getattr(private, "directory", None)
+            candidates = (directory,) if directory is not None else ()
+        for directory in candidates:
+            if all(directory is not retained for retained in directories):
+                directories.append(directory)
+    try:
+        for directory in directories:
+            directory.require_current_paths()
+        changes = tuple(
+            tuple(os.fstat(descriptor).st_ctime_ns for descriptor in directory.descriptors)
+            for directory in directories
+        )
+    except (OSError, MissionBridgeError) as error:
+        raise GovernanceError("governance-artifact-changed") from error
+
+    def verify() -> None:
+        try:
+            for directory, expected in zip(directories, changes):
+                directory.require_current_paths()
+                if tuple(
+                    os.fstat(descriptor).st_ctime_ns
+                    for descriptor in directory.descriptors
+                ) != expected:
+                    raise ValueError("producer path ancestor changed")
+        except (OSError, ValueError, MissionBridgeError) as error:
+            raise GovernanceError("governance-artifact-changed") from error
+
+    return verify
+
+
 def _run_producer(
     name: str,
     component: dict,
@@ -556,15 +593,20 @@ def _run_producer(
             retained_verifier = None
             if name == "ao-forge":
                 launch_project, retained_verifier = _forge_runtime(stack, project)
-            raw = _run_output(
-                arguments,
-                launch_project,
-                executable,
-                timeout_seconds=10,
-                environment=environment,
-                retained_descriptors=retained_descriptors,
-                retained_verifier=retained_verifier,
-            )
+            path_verifier = _producer_path_verifier(artifact, ledger, output)
+            path_verifier()
+            try:
+                raw = _run_output(
+                    arguments,
+                    launch_project,
+                    executable,
+                    timeout_seconds=10,
+                    environment=environment,
+                    retained_descriptors=retained_descriptors,
+                    retained_verifier=retained_verifier,
+                )
+            finally:
+                path_verifier()
             if retained_verifier is not None:
                 retained_verifier()
     except MissionBridgeError as error:
@@ -585,6 +627,102 @@ def _run_producer(
             raise GovernanceError("governance-producer-readback") from error
         return _readback(name, authorization)
     return _readback(name, raw)
+
+
+def _strict_json_object(raw: bytes) -> dict:
+    def unique_object(pairs):
+        value = {}
+        for name, member in pairs:
+            if name in value:
+                raise ValueError("duplicate JSON field")
+            value[name] = member
+        return value
+
+    value = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(value, dict):
+        raise ValueError("ledger event is not an object")
+    return value
+
+
+def _validate_covenant_ledger(
+    ledger: _RetainedFile,
+    covenant: dict,
+    verification: dict,
+    run_id: str,
+) -> tuple[dict, ...]:
+    try:
+        raw = ledger.read(_MAX_ARTIFACT)
+        if not raw or not raw.endswith(b"\n"):
+            raise ValueError("ledger must end with a newline")
+        lines = raw[:-1].split(b"\n")
+        if not lines or any(not line for line in lines):
+            raise ValueError("ledger contains an empty event line")
+        events = tuple(_strict_json_object(line) for line in lines)
+        for sequence, event in enumerate(events, 1):
+            if (
+                event.get("schema_version") != "covenant.event.v1"
+                or type(event.get("sequence")) is not int
+                or event.get("sequence") != sequence
+                or event.get("event_id") != f"event-{sequence:06d}"
+                or event.get("run_id") != run_id
+                or event.get("status") != "success"
+                or not _DIGEST.fullmatch(event.get("event_hash", ""))
+            ):
+                raise ValueError("invalid authorized ledger event")
+        if (
+            events[0].get("type") != "run_started"
+            or [
+                index
+                for index, event in enumerate(events)
+                if event.get("type") == "run_started"
+            ]
+            != [0]
+            or [
+                index
+                for index, event in enumerate(events)
+                if event.get("type") == "run_finished"
+            ]
+            != [len(events) - 1]
+            or verification.get("event_count") != len(events)
+            or verification.get("last_event_hash") != events[-1].get("event_hash")
+        ):
+            raise ValueError("ledger is not a successful completed run")
+
+        decisions = covenant.get("policy_decisions")
+        if not isinstance(decisions, list):
+            raise ValueError("invalid policy decisions")
+        decisions_by_id = {}
+        for decision in decisions:
+            decision_id = decision.get("decision_id") if isinstance(decision, dict) else None
+            if not isinstance(decision_id, str) or decision_id in decisions_by_id:
+                raise ValueError("duplicate policy decision")
+            decisions_by_id[decision_id] = decision
+        events_by_id = {}
+        for event in events:
+            if event.get("type") != "policy_decided":
+                continue
+            decision_id = event.get("decision_id")
+            if not isinstance(decision_id, str) or decision_id in events_by_id:
+                raise ValueError("duplicate policy event")
+            events_by_id[decision_id] = event
+        if set(events_by_id) != set(decisions_by_id):
+            raise ValueError("policy event set mismatch")
+        for decision_id, decision in decisions_by_id.items():
+            event = events_by_id[decision_id]
+            if any(
+                event.get(field) != decision.get(field)
+                for field in ("task_id", "decision", "effect_type", "resource")
+            ) or (
+                "approval_ticket_id" in event,
+                event.get("approval_ticket_id"),
+            ) != (
+                "approval_ticket_id" in decision,
+                decision.get("approval_ticket_id"),
+            ):
+                raise ValueError("policy event does not match evidence decision")
+        return events
+    except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise GovernanceError("governance-relationship-mismatch") from error
 
 
 def _mission_route(
@@ -1111,6 +1249,12 @@ def issue_witness(
                     _, confirmed = _json_retained(path)
                     if not hmac.compare_digest(confirmed, artifact_digests[name]):
                         raise GovernanceError("governance-artifact-changed")
+                _validate_covenant_ledger(
+                    staged_ledger,
+                    native["ao-covenant"],
+                    readbacks["ao-covenant"],
+                    artifacts.run_id,
+                )
                 requirements, requirements_digest = _requirements(
                     project, artifacts.evidence_set
                 )

@@ -17,6 +17,9 @@ from internal.governance_witness import issue_witness
 from tests.test_governance_witness import ASSETS, GovernanceWitnessTests
 
 
+RELEASED_FORGE_SCHEMA_SHA256 = (
+    "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
+)
 EXPECTED = {
     "posix": {
         "ao-blueprint": "f86f221351069bbece0bd2afacdf964c812081018d71a94286bb0103927cafec",
@@ -50,8 +53,14 @@ def main() -> None:
     forge_schema_sha256 = sha256(
         forge_runtime / "docs/contracts/goal-run-v0.1.schema.json"
     )
+    if (
+        forge_schema_sha256 != RELEASED_FORGE_SCHEMA_SHA256
+        or governance.FORGE_SCHEMA_SHA256 != RELEASED_FORGE_SCHEMA_SHA256
+    ):
+        raise RuntimeError("Forge schema digest mismatch")
     harness = GovernanceWitnessTests("test_consumption_is_atomic_and_one_use")
     harness.setUp()
+    harness.configuration.stop()
     try:
         for name in ("ao-blueprint", "ao-atlas", "ao-forge", "ao-covenant"):
             source = native / (ASSETS[name] + suffix)
@@ -156,7 +165,6 @@ def main() -> None:
             COMPONENT_LOCK=harness.lock,
             BIN_DIR=harness.bin_dir,
             FORGE_RUNTIME_ROOT=forge_runtime,
-            FORGE_SCHEMA_SHA256=forge_schema_sha256,
         ):
             envelope = issue_witness(
                 harness.claim_path,
