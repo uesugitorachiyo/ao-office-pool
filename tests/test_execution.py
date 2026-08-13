@@ -215,6 +215,7 @@ class ExecutionTests(unittest.TestCase):
     def _assert_child_dead(self) -> None:
         child = int((self.project / "ao2-child-pid").read_text(encoding="utf-8"))
         if os.name == "nt":
+            import ctypes
             from ctypes import wintypes
 
             library = ctypes.WinDLL("kernel32", use_last_error=True)
