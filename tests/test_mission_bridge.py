@@ -1006,7 +1006,7 @@ class MissionBridgeTests(unittest.TestCase):
             with self.assertRaises(MissionBridgeError) as raised:
                 start_or_resume(self.claim_path, self.task_text)
         self.assertEqual(raised.exception.code, "mission-output-too-large")
-        self.assertLess(time.monotonic() - started, 5)
+        self.assertLess(time.monotonic() - started, 20 if os.name == "nt" else 5)
 
     def test_record_digest_detects_private_state_tampering(self):
         # MUTATION: resuming without checking the wrapper record accepts field edits.

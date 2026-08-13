@@ -252,7 +252,13 @@ static int fake_mission(int argc, char **argv) {
     char block[1000]; memset(block, 'x', sizeof(block));
     for (int i = 0; i < 70; i++) fwrite(block, 1, sizeof(block), stdout);
     fflush(stdout);
-    if (strcmp(mode, "slow-large") == 0) task_sleep(10);
+    if (strcmp(mode, "slow-large") == 0) task_sleep(
+#ifdef _WIN32
+      30
+#else
+      10
+#endif
+    );
     return 0;
   }
   const char *home = argument_value(argc, argv, "--home");
