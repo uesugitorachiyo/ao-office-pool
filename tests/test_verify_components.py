@@ -77,15 +77,16 @@ class VerifyLockTests(unittest.TestCase):
 
     def test_tracked_lock_repins_coherent_release_without_changing_unreleased_objects(self):
         lock_path = Path(__file__).parents[1] / "manifests/components.lock.json"
-        components = {component["name"]: component for component in json.loads(lock_path.read_text())["components"]}
+        lock_bytes = lock_path.read_bytes()
+        components = {component["name"]: component for component in json.loads(lock_bytes)["components"]}
         actual_released = {
             name: tuple(components[name][field] for field in ("version", "commit", "asset", "sha256"))
             for name in RELEASED_LOCK_VALUES
         }
         raw_objects = {
-            json.loads(line.rstrip(",\n"))["name"]: line.encode()
-            for line in lock_path.read_text().splitlines(keepends=True)
-            if line.lstrip().startswith('{"name":')
+            json.loads(line.rstrip(b"\r\n").removesuffix(b","))["name"]: line
+            for line in lock_bytes.splitlines(keepends=True)
+            if line.lstrip().startswith(b'{"name":')
         }
 
         self.assertEqual(actual_released, RELEASED_LOCK_VALUES)

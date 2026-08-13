@@ -92,4 +92,3 @@
 - [ ] Retrieve and hash every stdout/stderr/cmd/result file before cleanup.
 - [ ] Require expected test counts, native smoke pass, NTFS identity tests, zero bound/named AO/Cargo/Rust processes, then remove only the exact scheduled task and scratch.
 - [ ] Update the Task 6 final review package and require `Spec compliance: PASS` plus `Code quality: APPROVED` before Task 7 dispatch.
-
