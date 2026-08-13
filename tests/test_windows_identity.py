@@ -94,7 +94,10 @@ class WindowsIdentityPhysicalTests(unittest.TestCase):
         target = self.outside / "target.txt"
         link = self.root / "link.txt"
         target.write_text("outside", encoding="utf-8")
-        os.symlink(target, link)
+        try:
+            os.symlink(target, link)
+        except OSError as error:
+            self.skipTest(str(error))
         identity = open_identity(link)
         self.assertTrue(identity.traversed_reparse_point)
         with self.assertRaises(ValueError):
@@ -122,7 +125,10 @@ class WindowsIdentityPhysicalTests(unittest.TestCase):
         link = self.root / "reparse"
         target.mkdir()
         target.joinpath("target.txt").write_text("outside", encoding="utf-8")
-        os.symlink(target, link, target_is_directory=True)
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(str(error))
         identity = open_identity(link / "target.txt")
         self.assertTrue(identity.traversed_reparse_point)
         with self.assertRaises(ValueError):
