@@ -630,20 +630,30 @@ class PoolTests(unittest.TestCase):
             if path.is_file() and path != lock
         }
         swapped = False
+        swap_signature = None
         if os.name == "nt":
             from internal import windows_identity
 
             real_kernel32 = windows_identity._kernel32
             library = real_kernel32()
+            native_lock = windows_identity._native_path(
+                windows_identity.canonical_windows_path(str(lock))
+            )
 
             class SwapLibrary:
                 def __getattr__(self, name):
                     return getattr(library, name)
 
                 def CreateFileW(self, *arguments):
-                    nonlocal swapped
-                    if not swapped:
+                    nonlocal swapped, swap_signature
+                    if (
+                        arguments[0] == native_lock
+                        and arguments[1] == 0xC0000000
+                        and arguments[4] == 4
+                        and not swapped
+                    ):
                         swapped = True
+                        swap_signature = arguments[1], arguments[4]
                         lock.unlink()
                         lock.symlink_to(outside)
                     return library.CreateFileW(*arguments)
@@ -667,6 +677,8 @@ class PoolTests(unittest.TestCase):
             with self.assertRaises(PoolError) as raised:
                 pool.claim("holder", "task", self.project, "pinned")
         self.assertTrue(swapped)
+        if os.name == "nt":
+            self.assertEqual(swap_signature, (0xC0000000, 4))
         self.assertEqual(raised.exception.code, "recovery-required")
         self.assertEqual(outside.read_bytes(), b"outside-race-original")
         after = {
