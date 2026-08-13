@@ -484,7 +484,7 @@ class GovernanceWitnessTests(unittest.TestCase):
         )
 
     def _write_native_covenant(self):
-        self.covenant_ledger.write_text(NATIVE_COVENANT_LEDGER, encoding="utf-8")
+        self.covenant_ledger.write_bytes(NATIVE_COVENANT_LEDGER.encode("utf-8"))
         self.covenant.write_text(
             json.dumps(
                 {
