@@ -9,6 +9,7 @@ from internal.windows_paths import canonical_windows_path
 
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_READ_DATA = 0x0001  # FILE_LIST_DIRECTORY for directories
 _FILE_SHARE_READ = 1
 _FILE_SHARE_WRITE = 2
 _FILE_SHARE_DELETE = 4
@@ -146,6 +147,7 @@ def _open_handle(
     path: PureWindowsPath,
     *,
     open_reparse_point: bool = False,
+    desired_access: int = 0,
     share_mode: int | None = None,
 ):
     library = _kernel32()
@@ -156,7 +158,7 @@ def _open_handle(
         share_mode = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
     handle = library.CreateFileW(
         _native_path(path),
-        0,
+        desired_access,
         share_mode,
         None,
         _OPEN_EXISTING,
@@ -259,7 +261,11 @@ def open_retained_identity(path: Path) -> RetainedIdentity:
     if not isinstance(path, Path):
         raise TypeError("path must be a pathlib.Path")
     canonical = canonical_windows_path(str(path))
-    library, handle = _open_handle(canonical, share_mode=_FILE_SHARE_READ)
+    library, handle = _open_handle(
+        canonical,
+        desired_access=_FILE_READ_DATA,
+        share_mode=_FILE_SHARE_READ,
+    )
     try:
         identity = _identity_from_handle(path, canonical, library, handle)
         return RetainedIdentity(identity, library, handle)

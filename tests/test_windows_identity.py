@@ -74,13 +74,14 @@ class RetainedWindowsIdentityTests(unittest.TestCase):
         path = Path("C:/fixture/candidate.json")
         identity = self._identity(path, 7)
         library = mock.Mock()
+        library.CreateFileW.return_value = 41
         library.CloseHandle.return_value = 1
         with (
             mock.patch("internal.windows_identity._require_windows"),
             mock.patch(
-                "internal.windows_identity._open_handle",
-                return_value=(library, 41),
-            ) as opened,
+                "internal.windows_identity._kernel32",
+                return_value=library,
+            ),
             mock.patch(
                 "internal.windows_identity._identity_from_handle",
                 return_value=identity,
@@ -89,11 +90,51 @@ class RetainedWindowsIdentityTests(unittest.TestCase):
             with open_retained_identity(path) as retained:
                 self.assertEqual(retained.identity, identity)
 
-        opened.assert_called_once_with(
-            PureWindowsPath("C:/fixture/candidate.json"),
-            share_mode=windows_identity._FILE_SHARE_READ,
+        library.CreateFileW.assert_called_once_with(
+            "\\\\?\\c:\\fixture\\candidate.json",
+            0x0001,
+            windows_identity._FILE_SHARE_READ,
+            None,
+            windows_identity._OPEN_EXISTING,
+            windows_identity._FILE_FLAG_BACKUP_SEMANTICS,
+            None,
         )
         library.CloseHandle.assert_called_once_with(41)
+
+    def test_observation_handle_keeps_zero_access_and_full_sharing(self):
+        # MUTATION: broadening observation opens imposes needless read ACLs and locks.
+        path = Path("C:/fixture/candidate.json")
+        identity = self._identity(path, 8)
+        library = mock.Mock()
+        library.CreateFileW.return_value = 42
+        library.CloseHandle.return_value = 1
+        with (
+            mock.patch("internal.windows_identity._require_windows"),
+            mock.patch(
+                "internal.windows_identity._kernel32",
+                return_value=library,
+            ),
+            mock.patch(
+                "internal.windows_identity._identity_from_handle",
+                return_value=identity,
+            ),
+        ):
+            self.assertEqual(open_identity(path), identity)
+
+        library.CreateFileW.assert_called_once_with(
+            "\\\\?\\c:\\fixture\\candidate.json",
+            0,
+            (
+                windows_identity._FILE_SHARE_READ
+                | windows_identity._FILE_SHARE_WRITE
+                | windows_identity._FILE_SHARE_DELETE
+            ),
+            None,
+            windows_identity._OPEN_EXISTING,
+            windows_identity._FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        library.CloseHandle.assert_called_once_with(42)
 
     def test_identity_failure_closes_the_new_native_handle(self):
         # MUTATION: an exception during identity capture leaks the blocking handle.
@@ -402,6 +443,82 @@ class WindowsIdentityPhysicalTests(unittest.TestCase):
         child.write_text("replacement", encoding="utf-8")
         with self.assertRaises(ValueError):
             require_within(open_identity(child), stale_root)
+
+    def test_retained_identities_deny_file_and_directory_mutations(self):
+        # MUTATION: an access-zero retained handle allows write/delete/rename on NTFS.
+        before = b"member-before"
+
+        def assert_same_identity(path, expected):
+            current = open_identity(path)
+            self.assertEqual(current.key, expected.key)
+            self.assertEqual(current.final_path, expected.final_path)
+            self.assertEqual(current.link_count, expected.link_count)
+
+        control_root = self.base / "retained-control"
+        control_root.mkdir()
+        control_member = control_root / "member.bin"
+        control_member.write_bytes(before)
+        with retain_identities(control_root, (control_member,)) as (
+            final_root,
+            final_members,
+        ):
+            self.assertEqual(final_root, control_root.resolve(strict=True))
+            self.assertEqual(final_members, (control_member.resolve(strict=True),))
+            self.assertEqual(final_members[0].read_bytes(), before)
+            self.assertEqual({path.name for path in final_root.iterdir()}, {"member.bin"})
+            self.assertEqual(open_identity(final_members[0]), open_identity(control_member))
+
+        file_actions = (
+            ("write", lambda member, _destination: member.write_bytes(b"member-after")),
+            ("unlink", lambda member, _destination: member.unlink()),
+            ("rename", lambda member, destination: os.replace(member, destination)),
+        )
+        for name, action in file_actions:
+            with self.subTest(object="file", action=name):
+                root = self.base / f"retained-file-{name}"
+                root.mkdir()
+                member = root / "member.bin"
+                destination = root / "destination.bin"
+                member.write_bytes(before)
+                expected = open_identity(member)
+                with retain_identities(root, (member,)):
+                    with self.assertRaises(OSError):
+                        action(member, destination)
+                    self.assertEqual(member.read_bytes(), before)
+                    self.assertFalse(destination.exists())
+                    assert_same_identity(member, expected)
+                action(member, destination)
+                if name == "write":
+                    self.assertEqual(member.read_bytes(), b"member-after")
+                elif name == "unlink":
+                    self.assertFalse(member.exists())
+                else:
+                    self.assertFalse(member.exists())
+                    self.assertEqual(destination.read_bytes(), before)
+
+        directory_actions = (
+            ("unlink", lambda root, _destination: root.rmdir()),
+            ("rename", lambda root, destination: os.replace(root, destination)),
+        )
+        for name, action in directory_actions:
+            with self.subTest(object="directory", action=name):
+                root = self.base / f"retained-directory-{name}"
+                destination = self.base / f"retained-directory-{name}-destination"
+                root.mkdir()
+                expected = open_identity(root)
+                with retain_identities(root, ()) as (final_root, final_members):
+                    self.assertEqual(final_root, root.resolve(strict=True))
+                    self.assertEqual(final_members, ())
+                    self.assertEqual(tuple(final_root.iterdir()), ())
+                    with self.assertRaises(OSError):
+                        action(root, destination)
+                    self.assertTrue(root.is_dir())
+                    self.assertFalse(destination.exists())
+                    assert_same_identity(root, expected)
+                action(root, destination)
+                self.assertFalse(root.exists())
+                if name == "rename":
+                    self.assertTrue(destination.is_dir())
 
     def test_retained_workflow_handle_blocks_write_and_delete(self):
         # MUTATION: write/delete sharing permits pathname substitution before AO2 opens it.
