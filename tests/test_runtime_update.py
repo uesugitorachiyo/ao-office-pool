@@ -253,7 +253,12 @@ class RuntimeUpdateTests(unittest.TestCase):
         # MUTATION: resolving first erases a junction-bearing ancestor before
         # Windows identity validation receives the caller's spelling.
         alias = self.base / "candidate-parent-alias"
-        alias.symlink_to(self.candidate.parent, target_is_directory=True)
+        try:
+            alias.symlink_to(self.candidate.parent, target_is_directory=True)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                self.skipTest(str(error))
+            raise
         original = alias / self.candidate.name
         expected = (
             original,
@@ -391,7 +396,12 @@ class RuntimeUpdateTests(unittest.TestCase):
         # junction-bearing staged-package ancestor before identity validation.
         RuntimeUpdate(self.root).stage(self.candidate)
         alias = self.base / "pool-root-alias"
-        alias.symlink_to(self.root, target_is_directory=True)
+        try:
+            alias.symlink_to(self.root, target_is_directory=True)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                self.skipTest(str(error))
+            raise
         original = alias / "components" / "ao2" / "v2"
         expected = (
             original,

@@ -500,7 +500,12 @@ class QualificationTests(unittest.TestCase):
         # MUTATION: resolving first erases a junction-bearing evidence ancestor
         # before retained identity validation receives the caller's spelling.
         alias = self.base / "evidence-parent-alias"
-        alias.symlink_to(self.evidence.parent, target_is_directory=True)
+        try:
+            alias.symlink_to(self.evidence.parent, target_is_directory=True)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                self.skipTest(str(error))
+            raise
         original = alias / self.evidence.name
         member_names = tuple(
             sorted({*qualification_module._INPUTS, "semantic-inputs.json"})
@@ -855,7 +860,7 @@ class QualificationTests(unittest.TestCase):
             / "runtime"
             / "versions"
             / version
-            / "ao2"
+            / ("ao2.exe" if os.name == "nt" else "ao2")
         )
         runtime_raw = office_runtime.read_bytes()
         office_runtime.write_bytes(b"tampered finalizer bytes\n")
