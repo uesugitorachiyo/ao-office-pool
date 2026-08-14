@@ -181,7 +181,8 @@ class PoolTests(unittest.TestCase):
         created = key.read_bytes()
         self.assertEqual(len(created), 32)
         self.assertEqual(
-            {path.name for path in governance_state.iterdir()}, {"consumed", "revoked"}
+            {path.name for path in governance_state.iterdir()},
+            {"consumed", "issued", "revoked"},
         )
         self.pool.initialize()
         self.assertEqual(key.read_bytes(), created)
@@ -222,18 +223,31 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(len(physical), 32)
         self.assertEqual(hashlib.sha256(physical).digest(), hashlib.sha256(key).digest())
 
-    def test_windows_witness_key_reads_and_hmac_preserve_all_bytes(self):
+    def test_windows_witness_key_reads_and_hmac_preserve_issuance_bytes(self):
         # MUTATION: a text-mode key read normalizes CRLF or stops at Ctrl-Z.
         authority = self.pool.claim("binary-holder", "binary-task", self.project, "pinned")
         key = b"\x00\xff\n\r\n\x1a" + b"K" * 26
-        payload = b"\x00\xffLF\nCRLF\r\nCTRL-Z\x1aEND\rTAIL"
         key_path = self.root / "operator-secrets/governance-witness.key"
         key_path.write_bytes(key)
-        expected = hmac.new(key, payload, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+        witness_id = "witness-" + "a" * 32
+        commitment = {
+            "schema_version": 1,
+            "witness_id": witness_id,
+            "authority_digest": hashlib.sha256(authority.read_bytes()).hexdigest(),
+            "artifact_sha256": "b" * 64,
+        }
+        raw = (json.dumps(commitment, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        issuance = self.root / "runtime/governance/issued" / (
+            commitment["authority_digest"] + "-" + witness_id
+        )
+        issuance.write_bytes(raw)
+        expected = hmac.new(key, raw, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
         with windows_text_mode():
             self.pool._validate_witness_key()
             with self.pool.authority_lease(authority) as lease:
-                self.assertEqual(self.pool._witness_tag(lease, payload), expected)
+                self.assertEqual(
+                    self.pool._governance_witness_tag(lease, witness_id), expected
+                )
         physical = key_path.read_bytes()
         self.assertEqual(physical, key)
         self.assertEqual(len(physical), 32)

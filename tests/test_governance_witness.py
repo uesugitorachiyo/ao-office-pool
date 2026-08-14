@@ -1,6 +1,5 @@
 import dataclasses
 import hashlib
-import hmac
 import json
 import os
 import shutil
@@ -1123,6 +1122,22 @@ class GovernanceWitnessTests(unittest.TestCase):
         with self.pool.authority_lease(self.claim_path) as lease:
             governed = _consume_witness(lease, issued)
             governed.target.close()
+        issued_value = json.loads(issued.read_bytes())
+        commitment = (
+            self.pool_root
+            / "runtime/governance/issued"
+            / (hashlib.sha256(self.authority_raw).hexdigest() + "-" + issued_value["witness_id"])
+        )
+        self.assertEqual(
+            json.loads(commitment.read_bytes()),
+            {
+                "schema_version": 1,
+                "witness_id": issued_value["witness_id"],
+                "authority_digest": hashlib.sha256(self.authority_raw).hexdigest(),
+                "artifact_sha256": hashlib.sha256(issued.read_bytes()).hexdigest(),
+            },
+        )
+        self.assertFalse(issued.with_suffix(".issued").exists())
 
         forged = json.loads(issued.read_bytes())
         forged["witness_id"] = "witness-" + "f" * 32
@@ -1130,20 +1145,35 @@ class GovernanceWitnessTests(unittest.TestCase):
             {name: value for name, value in forged.items() if name != "payload_digest"}
         )
         raw = governance._canonical_bytes(forged)
-        external = issued.with_name(forged["witness_id"] + ".json")
-        external.write_bytes(raw)
-        external.with_suffix(".hmac").write_bytes(
-            hmac.new(
-                (self.pool_root / "operator-secrets/governance-witness.key").read_bytes(),
-                raw,
-                hashlib.sha256,
-            ).hexdigest().encode("ascii")
-            + b"\n"
-        )
-        with self.pool.authority_lease(self.claim_path) as lease:
-            with self.assertRaises(GovernanceError) as raised:
-                _consume_witness(lease, external)
-        self.assertEqual(raised.exception.code, "governance-envelope-mismatch")
+        attacker_pool = governance._pool(self.claim_path)
+        with attacker_pool.authority_lease(self.claim_path) as lease:
+            project = governance._receipt_project_root(lease.authority)
+            record = seal = issuance = None
+            try:
+                record = governance._private_file(
+                    project, governance._PRIVATE_PARTS, forged["witness_id"] + ".json"
+                )
+                seal = governance._private_file(
+                    project, governance._PRIVATE_PARTS, forged["witness_id"] + ".hmac"
+                )
+                issuance = governance._private_file(
+                    project, governance._PRIVATE_PARTS, forged["witness_id"] + ".issued"
+                )
+                with self.assertRaises(PoolError):
+                    attacker_pool.issue_governance_witness(lease, raw, issuance)
+                governance._create_private(record, raw)
+                governance._create_private(seal, issued.with_suffix(".hmac").read_bytes())
+                with self.assertRaises(GovernanceError) as raised:
+                    _consume_witness(lease, record.path)
+                self.assertEqual(raised.exception.code, "governance-envelope-mismatch")
+            finally:
+                if record is not None:
+                    record.close()
+                if seal is not None:
+                    seal.close()
+                if issuance is not None:
+                    issuance.close()
+                project.close()
 
     def test_blueprint_authorization_is_created_by_the_pinned_producer(self):
         forged = self.blueprint / "build-authorization.json"

@@ -9,7 +9,7 @@ import stat
 import sys
 import uuid
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1263,6 +1263,8 @@ def issue_witness(
     artifacts: GovernanceArtifacts,
     *,
     lifetime_seconds: int = 60,
+    _lease: AuthorityLease | None = None,
+    _authenticate=None,
 ) -> Path:
     if (
         not isinstance(receipt, Path)
@@ -1275,8 +1277,17 @@ def issue_witness(
     ):
         raise GovernanceError("governance-invalid-request")
     pool = _pool(receipt)
+    if _lease is None:
+        try:
+            return pool.issue_governance_witness(
+                receipt, objective, artifacts, lifetime_seconds=lifetime_seconds
+            )
+        except PoolError as error:
+            raise GovernanceError("governance-unauthorized") from error
+    if type(_lease) is not AuthorityLease or not callable(_authenticate):
+        raise GovernanceError("governance-invalid-request")
     try:
-        with pool.authority_lease(receipt) as lease:
+        with nullcontext(_lease) as lease:
             if lease.authority.get("task_digest") != _digest_bytes(
                 objective.encode("utf-8")
             ):
@@ -1483,30 +1494,37 @@ def issue_witness(
                     raw = _canonical_bytes(envelope)
                     record = _private_file(project, _PRIVATE_PARTS, identifier + ".json")
                     seal = _private_file(project, _PRIVATE_PARTS, identifier + ".hmac")
-                    issuance = _private_file(
-                        project, _PRIVATE_PARTS, identifier + ".issued"
-                    )
-                    created = []
+                    created_record = False
                     try:
                         try:
-                            tag = pool.issue_governance_witness(
-                                lease, raw, issuance
-                            )
-                            created.append(issuance)
-                            for path, data in ((seal, tag), (record, raw)):
-                                _create_private(path, data)
-                                created.append(path)
+                            _create_private(record, raw)
+                            created_record = True
+                            commitment = {
+                                "schema_version": 1,
+                                "witness_id": identifier,
+                                "authority_digest": envelope["authority_digest"],
+                                "artifact_sha256": _digest_bytes(raw),
+                            }
+
+                            def validated():
+                                return commitment
+
+                            tag = _authenticate(validated)
+                            if tag is None:
+                                _unlink_private(record)
+                                created_record = False
+                                continue
+                            _create_private(seal, tag)
                         except FileExistsError:
-                            for path in reversed(created):
-                                _unlink_private(path)
+                            if created_record:
+                                _unlink_private(record)
                             continue
                         except BaseException:
-                            for path in reversed(created):
-                                _unlink_private(path)
+                            if created_record:
+                                _unlink_private(record)
                             raise
                         return record.path
                     finally:
-                        issuance.close()
                         seal.close()
                         record.close()
                 raise GovernanceError("governance-envelope-collision")
@@ -1539,7 +1557,7 @@ def _load_envelope(
     except PoolError as error:
         raise GovernanceError("governance-unauthorized") from error
     project = _receipt_project_root(lease.authority)
-    record = seal = issuance = None
+    record = seal = None
     try:
         name = envelope_path.name
         if (
@@ -1550,7 +1568,6 @@ def _load_envelope(
             raise GovernanceError("governance-envelope-mismatch")
         record = _private_file(project, _PRIVATE_PARTS, name)
         seal = _private_file(project, _PRIVATE_PARTS, envelope_path.stem + ".hmac")
-        issuance = _private_file(project, _PRIVATE_PARTS, envelope_path.stem + ".issued")
         raw = _read_private_bytes(record, _MAX_ENVELOPE)
         supplied = _read_private_bytes(seal, 65)
         value = json.loads(raw)
@@ -1563,7 +1580,9 @@ def _load_envelope(
         digest = payload.pop("payload_digest")
         if not hmac.compare_digest(digest, _digest_value(payload)):
             raise ValueError("payload digest")
-        if not pool.consume_governance_witness(lease, raw, issuance, supplied):
+        if not pool.consume_governance_witness(
+            lease, value["witness_id"], _digest_bytes(raw), supplied
+        ):
             raise ValueError("authentication")
         authority_expected = {
             "authority_digest": _digest_bytes(lease.authority_bytes),
@@ -1683,8 +1702,6 @@ def _load_envelope(
             record.close()
         if seal is not None:
             seal.close()
-        if issuance is not None:
-            issuance.close()
 
 
 def revoke_witness(receipt: Path, envelope: Path) -> None:

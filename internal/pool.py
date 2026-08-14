@@ -35,6 +35,9 @@ FREE_STATE_FIELDS = frozenset({"schema_version", "office_id", "generation", "sta
 OCCUPIED_STATE_FIELDS = (
     AUTHORITY_FIELDS - {"authority_id"}
 ) | {"status", "authority_name", "authority_digest"}
+GOVERNANCE_ISSUANCE_FIELDS = frozenset(
+    {"schema_version", "witness_id", "authority_digest", "artifact_sha256"}
+)
 
 
 class PoolError(RuntimeError):
@@ -132,7 +135,7 @@ class Pool:
         self, lease: AuthorityLease, kind: str, witness_id: str, authority_digest: str
     ) -> Path:
         lease.require_active()
-        if kind not in {"consumed", "revoked"}:
+        if kind not in {"consumed", "issued", "revoked"}:
             raise PoolError("unauthorized")
         if (
             len(authority_digest) != 64
@@ -213,11 +216,61 @@ class Pool:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def _witness_tag(self, lease: AuthorityLease, payload: bytes) -> bytes:
-        if type(lease) is not AuthorityLease:
-            raise PoolError("unauthorized")
-        lease.require_active()
-        if not isinstance(payload, bytes) or len(payload) > 64 * 1024:
+    def _governance_issuance(
+        self, lease: AuthorityLease, witness_id: str
+    ) -> tuple[bytes, dict] | None:
+        authority_digest = _bytes_digest(lease.authority_bytes)
+        path = self._governance_marker_path(
+            lease, "issued", witness_id, authority_digest
+        )
+        descriptor = None
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            information = os.fstat(descriptor)
+            raw = os.read(descriptor, 513)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_nlink != 1
+                or len(raw) > 512
+            ):
+                raise ValueError("unsafe governance issuance")
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        try:
+            value = json.loads(raw)
+            expected = {
+                "schema_version": 1,
+                "witness_id": witness_id,
+                "authority_digest": authority_digest,
+                "artifact_sha256": value["artifact_sha256"],
+            }
+            if (
+                not isinstance(value, dict)
+                or set(value) != GOVERNANCE_ISSUANCE_FIELDS
+                or value != expected
+                or not isinstance(value["artifact_sha256"], str)
+                or len(value["artifact_sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in value["artifact_sha256"])
+                or raw != (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            ):
+                raise ValueError("invalid governance issuance")
+        except (KeyError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+            raise PoolError("recovery-required") from error
+        return raw, value
+
+    def _governance_witness_tag(
+        self, lease: AuthorityLease, witness_id: str
+    ) -> bytes:
+        issuance = self._governance_issuance(lease, witness_id)
+        if issuance is None:
             raise PoolError("unauthorized")
         descriptor = None
         try:
@@ -234,7 +287,7 @@ class Pool:
                 or len(key) != 32
             ):
                 raise ValueError("unsafe witness key")
-            return hmac.new(key, payload, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+            return hmac.new(key, issuance[0], hashlib.sha256).hexdigest().encode("ascii") + b"\n"
         except (OSError, ValueError) as error:
             raise PoolError("recovery-required") from error
         finally:
@@ -242,26 +295,90 @@ class Pool:
                 os.close(descriptor)
 
     def issue_governance_witness(
-        self, lease: AuthorityLease, witness: bytes, issuance
-    ) -> bytes:
-        from internal.governance_witness import _create_private
+        self, receipt: Path, objective: str, artifacts, *, lifetime_seconds: int = 60
+    ):
+        from internal.governance_witness import issue_witness
 
-        tag = self._witness_tag(lease, witness)
-        _create_private(issuance, witness)
-        return tag
+        if not isinstance(receipt, Path):
+            raise PoolError("unauthorized")
+        with self.authority_lease(receipt) as lease:
+            def authenticate(validated) -> bytes | None:
+                if not callable(validated):
+                    raise PoolError("unauthorized")
+                value = validated()
+                authority_digest = _bytes_digest(lease.authority_bytes)
+                if (
+                    not isinstance(value, dict)
+                    or set(value) != GOVERNANCE_ISSUANCE_FIELDS
+                    or value.get("schema_version") != 1
+                    or value.get("authority_digest") != authority_digest
+                    or not isinstance(value.get("witness_id"), str)
+                    or not isinstance(value.get("artifact_sha256"), str)
+                    or len(value["artifact_sha256"]) != 64
+                    or any(character not in "0123456789abcdef" for character in value["artifact_sha256"])
+                ):
+                    raise PoolError("unauthorized")
+                raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                path = self._governance_marker_path(
+                    lease, "issued", value["witness_id"], authority_digest
+                )
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                try:
+                    descriptor = os.open(path, flags, 0o600)
+                except FileExistsError:
+                    return None
+                except OSError as error:
+                    raise PoolError("recovery-required") from error
+                try:
+                    if os.name != "nt":
+                        os.fchmod(descriptor, 0o600)
+                    view = memoryview(raw)
+                    while view:
+                        count = os.write(descriptor, view)
+                        if count <= 0:
+                            raise OSError("governance issuance write made no progress")
+                        view = view[count:]
+                    os.fsync(descriptor)
+                except BaseException:
+                    os.close(descriptor)
+                    path.unlink(missing_ok=True)
+                    raise
+                os.close(descriptor)
+                if os.name != "nt":
+                    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(parent)
+                    finally:
+                        os.close(parent)
+                return self._governance_witness_tag(lease, value["witness_id"])
+
+            return issue_witness(
+                receipt,
+                objective,
+                artifacts,
+                lifetime_seconds=lifetime_seconds,
+                _lease=lease,
+                _authenticate=authenticate,
+            )
 
     def consume_governance_witness(
-        self, lease: AuthorityLease, witness: bytes, issuance, tag: bytes
+        self, lease: AuthorityLease, witness_id: str, artifact_sha256: str, tag: bytes
     ) -> bool:
-        from internal.governance_witness import _MAX_ENVELOPE, _read_private_bytes
-
-        if not isinstance(witness, bytes) or not isinstance(tag, bytes) or len(tag) != 65:
-            return False
-        if not hmac.compare_digest(
-            witness, _read_private_bytes(issuance, _MAX_ENVELOPE)
+        if (
+            not isinstance(witness_id, str)
+            or not isinstance(artifact_sha256, str)
+            or not isinstance(tag, bytes)
+            or len(tag) != 65
         ):
             return False
-        return hmac.compare_digest(self._witness_tag(lease, witness), tag)
+        issuance = self._governance_issuance(lease, witness_id)
+        if issuance is None or not hmac.compare_digest(
+            issuance[1]["artifact_sha256"], artifact_sha256
+        ):
+            return False
+        return hmac.compare_digest(tag, self._governance_witness_tag(lease, witness_id))
 
     def _checkpoint(self, name: str) -> None:
         if self.crash_after == name:
@@ -294,12 +411,15 @@ class Pool:
             if (
                 not self._governance_state.is_dir()
                 or {path.name for path in self._governance_state.iterdir()}
-                != {"consumed", "revoked"}
+                not in ({"consumed", "revoked"}, {"consumed", "issued", "revoked"})
             ):
                 raise PoolError("recovery-required")
+            if not (self._governance_state / "issued").exists():
+                (self._governance_state / "issued").mkdir()
         else:
             self._governance_state.mkdir()
             (self._governance_state / "consumed").mkdir()
+            (self._governance_state / "issued").mkdir()
             (self._governance_state / "revoked").mkdir()
         if self._witness_key_path.exists() or self._witness_key_path.is_symlink():
             self._validate_witness_key()
@@ -356,6 +476,7 @@ class Pool:
             (self._runtime / "recovery").mkdir(exist_ok=True)
             self._governance_state.mkdir(exist_ok=True)
             (self._governance_state / "consumed").mkdir(exist_ok=True)
+            (self._governance_state / "issued").mkdir(exist_ok=True)
             (self._governance_state / "revoked").mkdir(exist_ok=True)
             operator = self.root / "operator-secrets"
             operator.mkdir(exist_ok=True)
@@ -528,12 +649,13 @@ class Pool:
                 f"{office_id}.json" for office_id in OFFICE_IDS
             },
             self._governance_state / "consumed": self._valid_governance_marker,
+            self._governance_state / "issued": self._valid_governance_marker,
             self._governance_state / "revoked": self._valid_governance_marker,
         }
         if (
             not self._governance_state.is_dir()
             or {path.name for path in self._governance_state.iterdir()}
-            != {"consumed", "revoked"}
+            != {"consumed", "issued", "revoked"}
         ):
             raise PoolError("recovery-required")
         for directory, accepted in rules.items():
