@@ -209,9 +209,14 @@ class ReadbackTests(unittest.TestCase):
             sentinel = b"replacement owned by another writer\n"
             replacement.write_bytes(sentinel)
             record = support_record(self.root, self.status, self.qualification, [])
+            denied = []
 
             def replace_then_fail(_descriptor, _data):
-                os.replace(replacement, destination)
+                try:
+                    os.replace(replacement, destination)
+                except PermissionError as error:
+                    denied.append(error)
+                    raise
                 raise OSError("injected write failure")
 
             with mock.patch(
@@ -221,7 +226,13 @@ class ReadbackTests(unittest.TestCase):
                 with self.assertRaises(SupportBundleError):
                     write_support_bundle(self.root, destination, record)
 
-            self.assertEqual(destination.read_bytes(), sentinel)
+            if os.name == "nt":
+                self.assertEqual([error.winerror for error in denied], [5])
+                self.assertEqual(destination.read_bytes(), b"")
+                self.assertEqual(replacement.read_bytes(), sentinel)
+            else:
+                self.assertEqual(denied, [])
+                self.assertEqual(destination.read_bytes(), sentinel)
 
     def test_support_bundle_success_requires_retained_path_identity(self):
         # MUTATION: successful descriptor writes do not prove the pathname still names it.
@@ -233,12 +244,17 @@ class ReadbackTests(unittest.TestCase):
             record = support_record(self.root, self.status, self.qualification, [])
             real_write = os.write
             replaced = False
+            denied = []
 
             def replace_after_write(descriptor, data):
                 nonlocal replaced
                 count = real_write(descriptor, data)
                 if not replaced:
-                    os.replace(replacement, destination)
+                    try:
+                        os.replace(replacement, destination)
+                    except PermissionError as error:
+                        denied.append(error)
+                        raise
                     replaced = True
                 return count
 
@@ -249,7 +265,19 @@ class ReadbackTests(unittest.TestCase):
                 with self.assertRaises(SupportBundleError):
                     write_support_bundle(self.root, destination, record)
 
-            self.assertEqual(destination.read_bytes(), sentinel)
+            if os.name == "nt":
+                self.assertEqual([error.winerror for error in denied], [5])
+                self.assertEqual(
+                    destination.read_bytes(),
+                    (
+                        json.dumps(record, sort_keys=True, separators=(",", ":"))
+                        + "\n"
+                    ).encode(),
+                )
+                self.assertEqual(replacement.read_bytes(), sentinel)
+            else:
+                self.assertEqual(denied, [])
+                self.assertEqual(destination.read_bytes(), sentinel)
 
     def test_support_bundle_failure_retains_its_exact_partial_created_file(self):
         # MUTATION: identity-check then pathname-unlink can delete a replacement

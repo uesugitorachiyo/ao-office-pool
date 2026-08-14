@@ -44,6 +44,10 @@ FAKE_PRODUCER = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 static const char *base(const char *path) {
   const char *slash = strrchr(path, '/');
@@ -102,6 +106,9 @@ static int wait_for_marker(const char *path) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 72;
+#endif
   FILE *log = fopen("producer-logs/commands", "ab");
   if (!log) return 70;
   fprintf(log, "%s", base(argv[0]));

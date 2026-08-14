@@ -22,10 +22,7 @@ def _canonical(value: dict) -> bytes:
 
 def _write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    path.write_bytes(_canonical(value))
 
 
 def _abrupt_activation(root: str) -> None:
