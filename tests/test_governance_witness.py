@@ -1847,6 +1847,82 @@ class GovernanceWitnessTests(unittest.TestCase):
                     ),
                 )
 
+    def test_blueprint_project_owned_output_cannot_change_accepted_bytes(self):
+        # MUTATION: a caller-owned output pathname permits post-producer overwrite.
+        accept = governance._RetainedFile.accept_producer_write
+        expected = []
+        changed = []
+
+        def overwrite_output(output):
+            expected.append(
+                hashlib.sha256(output.read(governance._MAX_ENVELOPE)).hexdigest()
+            )
+            if output.private.path.is_relative_to(self.project):
+                output.private.path.write_bytes(
+                    b'{"schema":"ao.blueprint.build-authorization.v0.1",'
+                    b'"project_id":"attacker","status":"ready",'
+                    b'"approved_by_user":true,"blocking_assumptions":[],'
+                    b'"next_allowed_action":"ao-forge"}\n'
+                )
+                changed.append(True)
+            return accept(output)
+
+        with mock.patch.object(
+            governance._RetainedFile,
+            "accept_producer_write",
+            autospec=True,
+            side_effect=overwrite_output,
+        ):
+            envelope = issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            )
+        value = json.loads(envelope.read_text(encoding="utf-8"))
+        self.assertEqual(
+            value["producer_artifacts"]["ao-blueprint"]["artifact_sha256"],
+            expected[0],
+        )
+        self.assertEqual(changed, [])
+
+    def test_blueprint_pool_output_ignores_project_lookalike_and_cleans_up(self):
+        # MUTATION: a project-local lookalike must not replace private producer bytes.
+        run_producer = governance._run_producer
+        expected = []
+        outputs = []
+
+        def write_lookalike(name, component, artifact, project, *rest):
+            result = run_producer(name, component, artifact, project, *rest)
+            if name == "ao-blueprint":
+                output = rest[1]
+                expected.append(
+                    hashlib.sha256(output.read(governance._MAX_ENVELOPE)).hexdigest()
+                )
+                outputs.append(output.private.path)
+                lookalike = (
+                    self.project
+                    / ".ao/governance/office-pool/producer-output"
+                    / output.private.name
+                )
+                lookalike.parent.mkdir(parents=True, exist_ok=True)
+                lookalike.write_bytes(b"project-owned lookalike")
+            return result
+
+        with mock.patch.object(
+            governance, "_run_producer", side_effect=write_lookalike
+        ):
+            envelope = issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            )
+        value = json.loads(envelope.read_text(encoding="utf-8"))
+        self.assertEqual(
+            value["producer_artifacts"]["ao-blueprint"]["artifact_sha256"],
+            expected[0],
+        )
+        self.assertEqual(
+            outputs[0].parent,
+            self.pool_root / "offices" / self.authority["office_id"] / "work",
+        )
+        self.assertFalse(outputs[0].exists())
+
     def test_project_marker_deletion_does_not_restore_authority(self):
         consumed = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
         governed = self._consume(consumed)
@@ -2063,14 +2139,14 @@ class GovernanceWitnessTests(unittest.TestCase):
         # MUTATION: a text-mode producer-output descriptor expands and truncates bytes.
         payload = b"\x00\xffLF\nCRLF\r\nCTRL-Z\x1aEND\rTAIL"
         digest = hashlib.sha256(payload).hexdigest()
-        project = mission_bridge._receipt_project_root(self.authority)
         retained = None
         try:
-            with windows_text_mode():
-                retained = governance._retained_output(project)
-                self.assertEqual(os.write(retained.descriptor, payload), len(payload))
-                os.fsync(retained.descriptor)
-                readback = retained.read(governance._MAX_ARTIFACT)
+            with self.pool.authority_lease(self.claim_path) as lease:
+                with windows_text_mode():
+                    retained = governance._retained_output(self.pool, lease)
+                    self.assertEqual(os.write(retained.descriptor, payload), len(payload))
+                    os.fsync(retained.descriptor)
+                    readback = retained.read(governance._MAX_ARTIFACT)
             physical = retained.private.path.read_bytes()
             self.assertEqual(physical, payload)
             self.assertEqual(len(physical), len(payload))
@@ -2078,8 +2154,13 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.assertEqual(readback, payload)
         finally:
             if retained is not None:
-                retained.close()
-            project.close()
+                private = retained.private
+                if os.name == "nt":
+                    retained.close()
+                    private.path.unlink()
+                else:
+                    governance._unlink_private(private)
+                    retained.close()
 
     def test_mismatched_preexisting_workflow_copy_fails_closed(self):
         digest = hashlib.sha256(self.workflow.read_bytes()).hexdigest()

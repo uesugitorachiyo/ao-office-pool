@@ -1196,10 +1196,10 @@ def _stage_directory(
         raise
 
 
-def _retained_output(project: _PrivateDirectory) -> _RetainedFile:
+def _retained_output(pool: Pool, lease: AuthorityLease) -> _RetainedFile:
     output = _private_file(
-        project,
-        (*_PRIVATE_PARTS, "producer-output"),
+        pool._office(lease.authority["office_id"]),
+        ("work",),
         f"blueprint-{uuid.uuid4().hex}.json",
     )
     try:
@@ -1335,7 +1335,7 @@ def issue_witness(
                     if isinstance(retained, _RetainedFile):
                         retained.refresh_parent_identity()
                 staged_ledger.refresh_parent_identity()
-                authorization = _retained_output(project)
+                authorization = _retained_output(pool, lease)
                 readbacks = {}
                 readbacks["ao-blueprint"] = _run_producer(
                     "ao-blueprint",
@@ -1529,7 +1529,23 @@ def issue_witness(
                         record.close()
                 raise GovernanceError("governance-envelope-collision")
             finally:
-                for retained_name in ("authorization", "staged_ledger", "staged_blueprint"):
+                authorization = locals().get("authorization")
+                if authorization is not None:
+                    try:
+                        authorization.recheck()
+                        if os.name == "nt":
+                            private = authorization.private
+                            authorization.close()
+                            authorization = None
+                            _unlink_private(private)
+                        else:
+                            _unlink_private(authorization.private)
+                    except (OSError, MissionBridgeError) as error:
+                        raise GovernanceError("governance-artifact-changed") from error
+                    finally:
+                        if authorization is not None:
+                            authorization.close()
+                for retained_name in ("staged_ledger", "staged_blueprint"):
                     retained = locals().get(retained_name)
                     if retained is not None:
                         retained.close()
