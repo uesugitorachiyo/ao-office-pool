@@ -1481,25 +1481,32 @@ def issue_witness(
                         {name: value for name, value in envelope.items() if name != "payload_digest"}
                     )
                     raw = _canonical_bytes(envelope)
-                    tag = lease.sign_witness(raw)
                     record = _private_file(project, _PRIVATE_PARTS, identifier + ".json")
                     seal = _private_file(project, _PRIVATE_PARTS, identifier + ".hmac")
-                    created_seal = False
+                    issuance = _private_file(
+                        project, _PRIVATE_PARTS, identifier + ".issued"
+                    )
+                    created = []
                     try:
                         try:
-                            _create_private(seal, tag)
-                            created_seal = True
-                            _create_private(record, raw)
+                            tag = pool.issue_governance_witness(
+                                lease, raw, issuance
+                            )
+                            created.append(issuance)
+                            for path, data in ((seal, tag), (record, raw)):
+                                _create_private(path, data)
+                                created.append(path)
                         except FileExistsError:
-                            if created_seal:
-                                _unlink_private(seal)
+                            for path in reversed(created):
+                                _unlink_private(path)
                             continue
                         except BaseException:
-                            if created_seal:
-                                _unlink_private(seal)
+                            for path in reversed(created):
+                                _unlink_private(path)
                             raise
                         return record.path
                     finally:
+                        issuance.close()
                         seal.close()
                         record.close()
                 raise GovernanceError("governance-envelope-collision")
@@ -1532,7 +1539,7 @@ def _load_envelope(
     except PoolError as error:
         raise GovernanceError("governance-unauthorized") from error
     project = _receipt_project_root(lease.authority)
-    record = seal = None
+    record = seal = issuance = None
     try:
         name = envelope_path.name
         if (
@@ -1543,6 +1550,7 @@ def _load_envelope(
             raise GovernanceError("governance-envelope-mismatch")
         record = _private_file(project, _PRIVATE_PARTS, name)
         seal = _private_file(project, _PRIVATE_PARTS, envelope_path.stem + ".hmac")
+        issuance = _private_file(project, _PRIVATE_PARTS, envelope_path.stem + ".issued")
         raw = _read_private_bytes(record, _MAX_ENVELOPE)
         supplied = _read_private_bytes(seal, 65)
         value = json.loads(raw)
@@ -1555,7 +1563,7 @@ def _load_envelope(
         digest = payload.pop("payload_digest")
         if not hmac.compare_digest(digest, _digest_value(payload)):
             raise ValueError("payload digest")
-        if not lease.verify_witness(raw, supplied):
+        if not pool.consume_governance_witness(lease, raw, issuance, supplied):
             raise ValueError("authentication")
         authority_expected = {
             "authority_digest": _digest_bytes(lease.authority_bytes),
@@ -1675,6 +1683,8 @@ def _load_envelope(
             record.close()
         if seal is not None:
             seal.close()
+        if issuance is not None:
+            issuance.close()
 
 
 def revoke_witness(receipt: Path, envelope: Path) -> None:

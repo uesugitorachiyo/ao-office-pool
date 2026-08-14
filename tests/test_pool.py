@@ -162,15 +162,15 @@ class PoolTests(unittest.TestCase):
         with self.pool.authority_lease(authority) as active:
             with self.assertRaises(PoolError):
                 AuthorityLease(active.authority_path, active.authority_bytes, active.authority)
-            tag = active.sign_witness(b"payload")
-            self.assertTrue(active.verify_witness(b"payload", tag))
+            self.assertFalse(hasattr(active, "sign_witness"))
+            self.assertFalse(hasattr(active, "verify_witness"))
             forged = object.__new__(AuthorityLease)
-            for name in ("authority_path", "authority_bytes", "authority", "_checker", "_signer", "_verifier"):
+            for name in ("authority_path", "authority_bytes", "authority", "_checker"):
                 object.__setattr__(forged, name, getattr(active, name))
             with self.assertRaises(PoolError):
-                forged.sign_witness(b"payload")
+                forged.require_active()
         with self.assertRaises(PoolError):
-            active.sign_witness(b"payload")
+            active.require_active()
 
     def test_legacy_pool_migrates_governance_storage_once_without_rotation(self):
         key = self.root / "operator-secrets/governance-witness.key"
@@ -233,8 +233,7 @@ class PoolTests(unittest.TestCase):
         with windows_text_mode():
             self.pool._validate_witness_key()
             with self.pool.authority_lease(authority) as lease:
-                self.assertEqual(lease.sign_witness(payload), expected)
-                self.assertTrue(lease.verify_witness(payload, expected))
+                self.assertEqual(self.pool._witness_tag(lease, payload), expected)
         physical = key_path.read_bytes()
         self.assertEqual(physical, key)
         self.assertEqual(len(physical), 32)

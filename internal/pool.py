@@ -59,12 +59,6 @@ class AuthorityLease:
     def require_active(self) -> None:
         self._checker(self)
 
-    def sign_witness(self, payload: bytes) -> bytes:
-        return self._signer(self, payload)
-
-    def verify_witness(self, payload: bytes, tag: bytes) -> bool:
-        return self._verifier(self, payload, tag)
-
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -218,6 +212,56 @@ class Pool:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+
+    def _witness_tag(self, lease: AuthorityLease, payload: bytes) -> bytes:
+        if type(lease) is not AuthorityLease:
+            raise PoolError("unauthorized")
+        lease.require_active()
+        if not isinstance(payload, bytes) or len(payload) > 64 * 1024:
+            raise PoolError("unauthorized")
+        descriptor = None
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self._witness_key_path, flags)
+            information = os.fstat(descriptor)
+            key = os.read(descriptor, 33)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_nlink != 1
+                or (os.name != "nt" and stat.S_IMODE(information.st_mode) != 0o600)
+                or len(key) != 32
+            ):
+                raise ValueError("unsafe witness key")
+            return hmac.new(key, payload, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
+        except (OSError, ValueError) as error:
+            raise PoolError("recovery-required") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def issue_governance_witness(
+        self, lease: AuthorityLease, witness: bytes, issuance
+    ) -> bytes:
+        from internal.governance_witness import _create_private
+
+        tag = self._witness_tag(lease, witness)
+        _create_private(issuance, witness)
+        return tag
+
+    def consume_governance_witness(
+        self, lease: AuthorityLease, witness: bytes, issuance, tag: bytes
+    ) -> bool:
+        from internal.governance_witness import _MAX_ENVELOPE, _read_private_bytes
+
+        if not isinstance(witness, bytes) or not isinstance(tag, bytes) or len(tag) != 65:
+            return False
+        if not hmac.compare_digest(
+            witness, _read_private_bytes(issuance, _MAX_ENVELOPE)
+        ):
+            return False
+        return hmac.compare_digest(self._witness_tag(lease, witness), tag)
 
     def _checkpoint(self, name: str) -> None:
         if self.crash_after == name:
@@ -880,44 +924,7 @@ class Pool:
                 if not active or candidate is not lease:
                     raise PoolError("unauthorized")
 
-            def witness_tag(candidate, payload: bytes) -> bytes:
-                require(candidate)
-                if not isinstance(payload, bytes) or len(payload) > 64 * 1024:
-                    raise PoolError("unauthorized")
-                descriptor = None
-                try:
-                    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-                    if hasattr(os, "O_NOFOLLOW"):
-                        flags |= os.O_NOFOLLOW
-                    descriptor = os.open(self._witness_key_path, flags)
-                    information = os.fstat(descriptor)
-                    key = os.read(descriptor, 33)
-                    if (
-                        not stat.S_ISREG(information.st_mode)
-                        or information.st_nlink != 1
-                        or (os.name != "nt" and stat.S_IMODE(information.st_mode) != 0o600)
-                        or len(key) != 32
-                    ):
-                        raise ValueError("unsafe witness key")
-                    return hmac.new(key, payload, hashlib.sha256).hexdigest().encode("ascii") + b"\n"
-                except (OSError, ValueError) as error:
-                    raise PoolError("recovery-required") from error
-                finally:
-                    if descriptor is not None:
-                        os.close(descriptor)
-
-            def sign(candidate, payload: bytes) -> bytes:
-                return witness_tag(candidate, payload)
-
-            def verify(candidate, payload: bytes, tag: bytes) -> bool:
-                require(candidate)
-                if not isinstance(tag, bytes) or len(tag) != 65:
-                    return False
-                return hmac.compare_digest(witness_tag(candidate, payload), tag)
-
             object.__setattr__(lease, "_checker", require)
-            object.__setattr__(lease, "_signer", sign)
-            object.__setattr__(lease, "_verifier", verify)
             try:
                 yield lease
             finally:

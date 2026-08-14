@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -1111,6 +1112,38 @@ class GovernanceWitnessTests(unittest.TestCase):
         with self.pool.authority_lease(self.claim_path) as real:
             with self.assertRaises(PoolError):
                 AuthorityLease(real.authority_path, real.authority_bytes, real.authority)
+
+    def test_authority_lease_cannot_transform_arbitrary_witness_bytes(self):
+        with self.pool.authority_lease(self.claim_path) as lease:
+            self.assertFalse(hasattr(lease, "sign_witness"))
+            self.assertFalse(hasattr(lease, "verify_witness"))
+
+    def test_only_pool_issued_witness_pairs_are_consumed(self):
+        issued = issue_witness(self.claim_path, self.task_text, self.valid_artifacts())
+        with self.pool.authority_lease(self.claim_path) as lease:
+            governed = _consume_witness(lease, issued)
+            governed.target.close()
+
+        forged = json.loads(issued.read_bytes())
+        forged["witness_id"] = "witness-" + "f" * 32
+        forged["payload_digest"] = governance._digest_value(
+            {name: value for name, value in forged.items() if name != "payload_digest"}
+        )
+        raw = governance._canonical_bytes(forged)
+        external = issued.with_name(forged["witness_id"] + ".json")
+        external.write_bytes(raw)
+        external.with_suffix(".hmac").write_bytes(
+            hmac.new(
+                (self.pool_root / "operator-secrets/governance-witness.key").read_bytes(),
+                raw,
+                hashlib.sha256,
+            ).hexdigest().encode("ascii")
+            + b"\n"
+        )
+        with self.pool.authority_lease(self.claim_path) as lease:
+            with self.assertRaises(GovernanceError) as raised:
+                _consume_witness(lease, external)
+        self.assertEqual(raised.exception.code, "governance-envelope-mismatch")
 
     def test_blueprint_authorization_is_created_by_the_pinned_producer(self):
         forged = self.blueprint / "build-authorization.json"
