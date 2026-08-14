@@ -118,6 +118,7 @@ class RuntimeUpdate:
     ):
         if not isinstance(root, Path):
             raise TypeError("root must be a pathlib.Path")
+        self._original_root = root
         self.root = root.resolve(strict=False)
         self.crash_after = crash_after
         self.abrupt_crash = abrupt_crash
@@ -158,20 +159,22 @@ class RuntimeUpdate:
 
     def _package(self, candidate: Path) -> tuple[dict, bytes, bytes]:
         try:
-            if not isinstance(candidate, Path) or candidate.is_symlink():
+            if not isinstance(candidate, Path):
                 raise ValueError("unsafe candidate")
-            candidate = candidate.resolve(strict=True)
-            members = (candidate / _MANIFEST, candidate / _ASSET)
-            retained = (
-                retain_identities(candidate, members)
-                if os.name == "nt"
-                else nullcontext()
-            )
-            with retained:
+            if os.name == "nt":
+                members = (candidate / _MANIFEST, candidate / _ASSET)
+                retained = retain_identities(candidate, members)
+            else:
+                if candidate.is_symlink():
+                    raise ValueError("unsafe candidate")
+                candidate = candidate.resolve(strict=True)
+                members = (candidate / _MANIFEST, candidate / _ASSET)
+                retained = nullcontext((candidate, members))
+            with retained as (candidate, members):
                 if not candidate.is_dir() or {path.name for path in candidate.iterdir()} != {_MANIFEST, _ASSET}:
                     raise ValueError("unexpected package members")
-                manifest_raw = _read_regular(candidate / _MANIFEST, 64 * 1024)
-                asset_raw = _read_regular(candidate / _ASSET, _MAX_ASSET)
+                manifest_raw = _read_regular(members[0], 64 * 1024)
+                asset_raw = _read_regular(members[1], _MAX_ASSET)
             manifest = _strict_object(manifest_raw)
             _validate_schema(manifest, RUNTIME_SCHEMA)
             validate_segment(manifest["version"])
@@ -292,21 +295,24 @@ class RuntimeUpdate:
     def _staged(self, version: str) -> tuple[dict, bytes, bytes]:
         try:
             version = validate_segment(version)
-            target = self.root / "components" / "ao2" / version
-            members = tuple(
-                target / name for name in (_MANIFEST, _ASSET, _ANCHOR)
-            )
-            retained = (
-                retain_identities(target, members)
-                if os.name == "nt"
-                else nullcontext()
-            )
-            with retained:
+            if os.name == "nt":
+                target = self._original_root / "components" / "ao2" / version
+                members = tuple(
+                    target / name for name in (_MANIFEST, _ASSET, _ANCHOR)
+                )
+                retained = retain_identities(target, members)
+            else:
+                target = self.root / "components" / "ao2" / version
+                members = tuple(
+                    target / name for name in (_MANIFEST, _ASSET, _ANCHOR)
+                )
+                retained = nullcontext((target, members))
+            with retained as (target, members):
                 if target.is_symlink() or not target.is_dir() or {path.name for path in target.iterdir()} != {_MANIFEST, _ASSET, _ANCHOR}:
                     raise ValueError("missing staged package")
-                manifest_raw = _read_regular(target / _MANIFEST, 64 * 1024)
-                asset_raw = _read_regular(target / _ASSET, _MAX_ASSET)
-                anchor_raw = _read_regular(target / _ANCHOR, 2048)
+                manifest_raw = _read_regular(members[0], 64 * 1024)
+                asset_raw = _read_regular(members[1], _MAX_ASSET)
+                anchor_raw = _read_regular(members[2], 2048)
             manifest = _strict_object(manifest_raw)
             _validate_schema(manifest, RUNTIME_SCHEMA)
             anchor = _strict_object(anchor_raw)

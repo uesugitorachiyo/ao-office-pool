@@ -156,6 +156,133 @@ class RetainedWindowsIdentityTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         require_path_identity(retained)
 
+    def test_original_handles_precede_resolution_and_both_chains_span_read(self):
+        # MUTATION: resolving before retaining erases original ancestors; closing
+        # either chain before the read reopens identity and replacement races.
+        original_root = Path("C:/junction/package")
+        original_member = original_root / "member.json"
+        final_root = Path("C:/target/package")
+        final_member = final_root / "member.json"
+        identities = {
+            original_root: self._identity(original_root, 21, directory=True),
+            original_member: self._identity(original_member, 22),
+            final_root: self._identity(final_root, 21, directory=True),
+            final_member: self._identity(final_member, 22),
+        }
+        resolved = {
+            original_root: final_root,
+            original_member: final_member,
+        }
+        library = mock.Mock()
+        library.CloseHandle.return_value = 1
+        retained = []
+        events = []
+
+        def open_fake(path):
+            events.append(("open", path))
+            value = RetainedIdentity(
+                identities[path],
+                library,
+                100 + len(retained),
+            )
+            retained.append(value)
+            return value
+
+        def resolve_fake(path, *, strict=False):
+            self.assertTrue(strict)
+            events.append(("resolve", path))
+            return resolved[path]
+
+        with (
+            mock.patch("internal.windows_identity._require_windows"),
+            mock.patch(
+                "internal.windows_identity.open_retained_identity",
+                side_effect=open_fake,
+            ),
+            mock.patch("internal.windows_identity.require_retained_within"),
+            mock.patch("internal.windows_identity.require_path_identity"),
+            mock.patch(
+                "internal.windows_identity._require_open",
+                side_effect=lambda value: value.identity,
+            ),
+            mock.patch("pathlib.Path.resolve", autospec=True, side_effect=resolve_fake),
+        ):
+            with retain_identities(
+                original_root,
+                (original_member,),
+            ) as final_paths:
+                self.assertEqual(final_paths, (final_root, (final_member,)))
+                self.assertEqual(len(retained), 4)
+                self.assertTrue(all(value._handle is not None for value in retained))
+
+        self.assertTrue(all(value._handle is None for value in retained))
+        self.assertEqual(
+            events,
+            [
+                ("open", original_root),
+                ("open", original_member),
+                ("resolve", original_root),
+                ("resolve", original_member),
+                ("open", final_root),
+                ("open", final_member),
+            ],
+        )
+
+    def test_resolved_identity_mismatch_closes_both_handle_chains(self):
+        # MUTATION: trusting resolved text without comparing handle identities
+        # lets resolution switch one named member to a different file.
+        original_root = Path("C:/junction/package")
+        original_member = original_root / "member.json"
+        final_root = Path("C:/target/package")
+        final_member = final_root / "member.json"
+        identities = {
+            original_root: self._identity(original_root, 31, directory=True),
+            original_member: self._identity(original_member, 32),
+            final_root: self._identity(final_root, 31, directory=True),
+            final_member: self._identity(final_member, 33),
+        }
+        resolved = {
+            original_root: final_root,
+            original_member: final_member,
+        }
+        library = mock.Mock()
+        library.CloseHandle.return_value = 1
+        retained = []
+
+        def open_fake(path):
+            value = RetainedIdentity(
+                identities[path],
+                library,
+                200 + len(retained),
+            )
+            retained.append(value)
+            return value
+
+        with (
+            mock.patch("internal.windows_identity._require_windows"),
+            mock.patch(
+                "internal.windows_identity.open_retained_identity",
+                side_effect=open_fake,
+            ),
+            mock.patch("internal.windows_identity.require_retained_within"),
+            mock.patch("internal.windows_identity.require_path_identity"),
+            mock.patch(
+                "internal.windows_identity._require_open",
+                side_effect=lambda value: value.identity,
+            ),
+            mock.patch(
+                "pathlib.Path.resolve",
+                autospec=True,
+                side_effect=lambda path, *, strict=False: resolved[path],
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                with retain_identities(original_root, (original_member,)):
+                    self.fail("mismatched resolved identity was accepted")
+
+        self.assertEqual(len(retained), 4)
+        self.assertTrue(all(value._handle is None for value in retained))
+
 
 @unittest.skipUnless(os.name == "nt", "physical NTFS tests require Windows")
 class WindowsIdentityPhysicalTests(unittest.TestCase):

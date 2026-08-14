@@ -118,22 +118,27 @@ class Qualification:
         self, evidence_set: Path
     ) -> tuple[dict[str, dict], dict[str, bytes], str, dict[str, dict]]:
         try:
-            if not isinstance(evidence_set, Path) or evidence_set.is_symlink():
+            if not isinstance(evidence_set, Path):
                 raise ValueError("unsafe evidence root")
-            root = evidence_set.resolve(strict=True)
             expected = {*_INPUTS, "semantic-inputs.json"}
             member_names = tuple(sorted(expected))
-            member_paths = tuple(root / name for name in member_names)
-            retained = (
-                retain_identities(root, member_paths)
-                if os.name == "nt"
-                else nullcontext()
-            )
-            with retained:
+            if os.name == "nt":
+                member_paths = tuple(evidence_set / name for name in member_names)
+                retained = retain_identities(evidence_set, member_paths)
+            else:
+                if evidence_set.is_symlink():
+                    raise ValueError("unsafe evidence root")
+                root = evidence_set.resolve(strict=True)
+                member_paths = tuple(root / name for name in member_names)
+                retained = nullcontext((root, member_paths))
+            with retained as (root, member_paths):
                 members = {path.name for path in root.iterdir()}
                 if not root.is_dir() or members != expected:
                     raise QualificationError("qualification-evidence-set-mismatch")
-                raw = {name: _read_regular(root / name) for name in member_names}
+                raw = {
+                    name: _read_regular(path)
+                    for name, path in zip(member_names, member_paths, strict=True)
+                }
             values = {name: _strict_object(member) for name, member in raw.items()}
             semantic = values["semantic-inputs.json"]
             if set(semantic) != {"schema_version", "inputs"} or semantic["schema_version"] != 1 or not isinstance(semantic["inputs"], list):

@@ -319,8 +319,7 @@ def require_path_identity(retained: RetainedIdentity) -> None:
 
 
 @contextmanager
-def retain_identities(root: Path, members: tuple[Path, ...]):
-    """Retain a physical root and its named members across one exact read."""
+def _retain_open_identities(root: Path, members: tuple[Path, ...]):
     _require_windows()
     if not isinstance(root, Path) or not isinstance(members, tuple) or any(
         not isinstance(member, Path) for member in members
@@ -339,6 +338,47 @@ def retain_identities(root: Path, members: tuple[Path, ...]):
         require_path_identity(retained_root)
         for retained_member in retained_members:
             require_path_identity(retained_member)
+
+
+def _require_same_retained(
+    original: RetainedIdentity,
+    final: RetainedIdentity,
+) -> None:
+    original_identity = _require_open(original)
+    final_identity = _require_open(final)
+    if (
+        original_identity.key != final_identity.key
+        or original_identity.final_path != final_identity.final_path
+        or original_identity.ancestor_ids != final_identity.ancestor_ids
+        or original_identity.link_count != final_identity.link_count
+        or original_identity.is_directory != final_identity.is_directory
+        or original_identity.traversed_reparse_point
+        != final_identity.traversed_reparse_point
+    ):
+        raise ValueError("resolved path changed retained file identity")
+
+
+@contextmanager
+def retain_identities(root: Path, members: tuple[Path, ...]):
+    """Retain original and final physical identities across one exact read."""
+    with _retain_open_identities(root, members) as (
+        original_root,
+        original_members,
+    ):
+        final_root_path = root.resolve(strict=True)
+        final_member_paths = tuple(member.resolve(strict=True) for member in members)
+        with _retain_open_identities(final_root_path, final_member_paths) as (
+            final_root,
+            final_members,
+        ):
+            _require_same_retained(original_root, final_root)
+            for original_member, final_member in zip(
+                original_members,
+                final_members,
+                strict=True,
+            ):
+                _require_same_retained(original_member, final_member)
+            yield final_root_path, final_member_paths
 
 
 def require_within(child: FileIdentity, root: FileIdentity) -> None:

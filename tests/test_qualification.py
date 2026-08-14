@@ -465,7 +465,7 @@ class QualificationTests(unittest.TestCase):
         def accept_retained(root, members):
             self.assertEqual(root, paths[0])
             self.assertEqual(members, paths[1:])
-            yield
+            yield root, members
 
         with (
             mock.patch("internal.qualification.os.name", "nt"),
@@ -496,13 +496,46 @@ class QualificationTests(unittest.TestCase):
             raised.exception.code, "qualification-evidence-set-mismatch"
         )
 
+    def test_windows_evidence_validates_original_spelling_before_resolution(self):
+        # MUTATION: resolving first erases a junction-bearing evidence ancestor
+        # before retained identity validation receives the caller's spelling.
+        alias = self.base / "evidence-parent-alias"
+        alias.symlink_to(self.evidence.parent, target_is_directory=True)
+        original = alias / self.evidence.name
+        member_names = tuple(
+            sorted({*qualification_module._INPUTS, "semantic-inputs.json"})
+        )
+        expected = (original, tuple(original / name for name in member_names))
+        seen = []
+
+        @contextmanager
+        def reject_original(root, members):
+            seen.append((root, members))
+            raise ValueError("reparse-point ancestor")
+            yield root, members
+
+        with (
+            mock.patch("internal.qualification.os.name", "nt"),
+            mock.patch(
+                "internal.qualification.retain_identities",
+                new=reject_original,
+            ),
+        ):
+            with self.assertRaises(QualificationError) as raised:
+                Qualification(self.root)._evidence(original)
+
+        self.assertEqual(
+            raised.exception.code, "qualification-evidence-set-mismatch"
+        )
+        self.assertEqual(seen, [expected])
+
     def test_windows_semantic_manifest_replacement_after_read_fails_closed(self):
         # MUTATION: entry-only evidence containment accepts a semantic manifest
         # replaced after its identity was captured.
         qualification = Qualification(self.root)
         @contextmanager
         def reject_replaced_semantic(_root, _members):
-            yield
+            yield _root, _members
             raise ValueError("semantic manifest identity changed")
 
         with (
@@ -526,7 +559,7 @@ class QualificationTests(unittest.TestCase):
 
         @contextmanager
         def reject_retained_aba(_root, _members):
-            yield
+            yield _root, _members
             raise ValueError("evidence path no longer names retained handle")
 
         with (

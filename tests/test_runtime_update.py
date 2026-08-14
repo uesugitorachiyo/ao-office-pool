@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -222,7 +223,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         def accept_retained(root, members):
             self.assertEqual(root, paths[0])
             self.assertEqual(members, paths[1:])
-            yield
+            yield root, members
 
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
@@ -251,13 +252,61 @@ class RuntimeUpdateTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "runtime-package-invalid")
 
+    def test_windows_candidate_validates_original_spelling_before_resolution(self):
+        # MUTATION: resolving first erases a junction-bearing ancestor before
+        # Windows identity validation receives the caller's spelling.
+        alias = self.base / "candidate-parent-alias"
+        alias.symlink_to(self.candidate.parent, target_is_directory=True)
+        original = alias / self.candidate.name
+        expected = (
+            original,
+            (original / "runtime-package.json", original / "ao2"),
+        )
+        seen = []
+
+        @contextmanager
+        def reject_original(root, members):
+            seen.append((root, members))
+            raise ValueError("reparse-point ancestor")
+            yield root, members
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
+            mock.patch(
+                "internal.runtime_update.retain_identities",
+                new=reject_original,
+            ),
+        ):
+            with self.assertRaises(RuntimeUpdateError) as raised:
+                RuntimeUpdate(self.root)._package(original)
+
+        self.assertEqual(raised.exception.code, "runtime-package-invalid")
+        self.assertEqual(seen, [expected])
+
+    @unittest.skipUnless(os.name == "nt", "physical junction test requires Windows")
+    def test_native_windows_candidate_junction_cannot_bypass_original_spelling(self):
+        # MUTATION: Path.resolve before retained validation accepts the target
+        # package after discarding the candidate junction spelling.
+        junction = self.base / "candidate-junction"
+        subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(junction), str(self.candidate)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaises(RuntimeUpdateError) as raised:
+            RuntimeUpdate(self.root)._package(junction)
+
+        self.assertEqual(raised.exception.code, "runtime-package-invalid")
+
     def test_windows_candidate_member_replacement_after_read_fails_closed(self):
         # MUTATION: entry-only containment accepts a manifest replaced after
         # its identity was captured but before the package is consumed.
         updater = RuntimeUpdate(self.root)
         @contextmanager
         def reject_replaced_manifest(_root, _members):
-            yield
+            yield _root, _members
             raise ValueError("manifest identity changed")
 
         with (
@@ -291,7 +340,7 @@ class RuntimeUpdateTests(unittest.TestCase):
 
         @contextmanager
         def reject_retained_aba(_root, _members):
-            yield
+            yield _root, _members
             raise ValueError("path no longer names retained handle")
 
         with (
@@ -327,7 +376,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         def accept_retained(root, members):
             self.assertEqual(root, paths[0])
             self.assertEqual(members, paths[1:])
-            yield
+            yield root, members
 
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
@@ -340,6 +389,42 @@ class RuntimeUpdateTests(unittest.TestCase):
 
         self.assertEqual(manifest["version"], "v2")
 
+    def test_windows_staged_package_validates_original_spelling_before_resolution(self):
+        # MUTATION: resolving the Pool root in RuntimeUpdate.__init__ erases a
+        # junction-bearing staged-package ancestor before identity validation.
+        RuntimeUpdate(self.root).stage(self.candidate)
+        alias = self.base / "pool-root-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        original = alias / "components" / "ao2" / "v2"
+        expected = (
+            original,
+            (
+                original / "runtime-package.json",
+                original / "ao2",
+                original / "runtime-anchor.json",
+            ),
+        )
+        seen = []
+
+        @contextmanager
+        def reject_original(root, members):
+            seen.append((root, members))
+            raise ValueError("reparse-point ancestor")
+            yield root, members
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
+            mock.patch(
+                "internal.runtime_update.retain_identities",
+                new=reject_original,
+            ),
+        ):
+            with self.assertRaises(RuntimeUpdateError) as raised:
+                RuntimeUpdate(alias)._staged("v2")
+
+        self.assertEqual(raised.exception.code, "runtime-package-tampered")
+        self.assertEqual(seen, [expected])
+
     def test_windows_staged_anchor_replacement_after_read_fails_closed(self):
         # MUTATION: omitting the final staged-member identity check accepts an
         # anchor path replaced after its descriptor read.
@@ -347,7 +432,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         staged = updater.stage(self.candidate)
         @contextmanager
         def reject_replaced_anchor(_root, _members):
-            yield
+            yield _root, _members
             raise ValueError("anchor identity changed")
 
         with (
@@ -370,7 +455,7 @@ class RuntimeUpdateTests(unittest.TestCase):
 
         @contextmanager
         def reject_retained_aba(_root, _members):
-            yield
+            yield _root, _members
             raise ValueError("staged path no longer names retained handle")
 
         with (
