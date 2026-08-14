@@ -48,12 +48,23 @@ class ExecutionResult:
     diagnostics: dict
 
 
+@dataclass(frozen=True)
+class _WrittenRecord:
+    path: Path
+    value: dict
+    sha256: str
+
+
 def _canonical(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
 def _digest(value) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _identifier() -> str:
+    return uuid.uuid4().hex
 
 
 def _execution_environment() -> dict[str, str]:
@@ -228,7 +239,7 @@ def _retained_workflow(governed: GovernedExecution):
     staged = _private_file(
         governed.target,
         (".ao", "governance", "office-pool", "staging"),
-        f"{governed.workflow_digest}-{uuid.uuid4().hex}",
+        f"{governed.workflow_digest}-{_identifier()}",
     )
     staged_created = False
     try:
@@ -529,7 +540,7 @@ def _write_record(
     diagnostics: dict,
     failure_code: str | None,
     exit_code: int | None,
-) -> Path:
+) -> _WrittenRecord:
     workflow_path = project.joinpath(
         ".ao",
         "governance",
@@ -571,7 +582,7 @@ def _write_record(
         }
         _validate_schema(candidate, EXECUTION_SCHEMA)
         for _attempt in range(MAX_EXECUTION_IDS):
-            value["execution_id"] = "execution-" + uuid.uuid4().hex
+            value["execution_id"] = "execution-" + _identifier()
             value["record_digest"] = _digest(
                 {
                     name: member
@@ -630,7 +641,11 @@ def _write_record(
             or raw != expected
         ):
             raise ValueError("execution record readback mismatch")
-        return record.path
+        return _WrittenRecord(
+            record.path,
+            readback,
+            hashlib.sha256(raw).hexdigest(),
+        )
     except ExecutionError:
         raise
     except (
@@ -707,12 +722,12 @@ def _execute_governed(receipt, lease, governed, timeout_seconds) -> ExecutionRes
                     failure_code=code,
                     exit_code=None,
                 )
-                raise ExecutionError(code, record) from error
+                raise ExecutionError(code, record.path) from error
     except ExecutionError:
         raise
     except MissionBridgeError as error:
         raise ExecutionError("ao2-identity-mismatch") from error
-    record = _write_record(
+    written = _write_record(
         governed.target,
         lease.authority,
         lease.authority_bytes,
@@ -722,9 +737,19 @@ def _execute_governed(receipt, lease, governed, timeout_seconds) -> ExecutionRes
         failure_code=None,
         exit_code=0,
     )
+    if diagnostics["status"] == "accepted":
+        try:
+            governed._complete(
+                lambda: {
+                    "record": written.value,
+                    "execution_sha256": written.sha256,
+                }
+            )
+        except PoolError as error:
+            raise ExecutionError("recovery-required", written.path) from error
     return ExecutionResult(
         diagnostics["status"],
-        record,
+        written.path,
         governed.request_digest,
         diagnostics,
     )

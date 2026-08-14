@@ -1,4 +1,3 @@
-import ast
 import hashlib
 import hmac
 import json
@@ -6,10 +5,19 @@ import os
 import stat
 from pathlib import Path
 
-from internal.mission_bridge import _validate_schema
+from internal import governance_witness
+from internal.governance_witness import GovernanceError, _load_envelope
+from internal.mission_bridge import (
+    MissionBridgeError,
+    _private_file,
+    _read_private_bytes,
+    _record_paths,
+    _validate_schema,
+)
 from internal.pool import AUTHORITY_FIELDS, OFFICE_IDS, Pool, PoolError
 from internal.transactions import atomic_write_json, read_json
-from scripts.verify_requirements import verify_requirements
+from internal.windows_identity import open_identity, require_within
+from scripts.verify_requirements import verify_requirements_data
 
 
 _ROOT = Path(__file__).parents[1]
@@ -18,7 +26,6 @@ _MISSION_SCHEMA = _ROOT / "schemas/mission-record.schema.json"
 _GOVERNANCE_SCHEMA = _ROOT / "schemas/governance-envelope.schema.json"
 _EXECUTION_SCHEMA = _ROOT / "schemas/execution-record.schema.json"
 _QUALIFICATION_SCHEMA = _ROOT / "schemas/qualification-record.schema.json"
-_AUTHORITATIVE_REQUIREMENTS = _ROOT / "manifests/requirements.json"
 _INPUTS = (
     "runtime-package.json",
     "components.lock.json",
@@ -89,23 +96,6 @@ def _read_regular(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _test_exists(test_id: str) -> bool:
-    parts = test_id.split(".")
-    if len(parts) != 4 or parts[0] != "tests" or not all(part.isidentifier() for part in parts):
-        return False
-    path = _ROOT / "tests" / f"{parts[1]}.py"
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeError):
-        return False
-    return any(
-        isinstance(node, ast.ClassDef)
-        and node.name == parts[2]
-        and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == parts[3] for member in node.body)
-        for node in tree.body
-    )
-
-
 class Qualification:
     def __init__(self, root: Path):
         if not isinstance(root, Path):
@@ -123,11 +113,16 @@ class Qualification:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise QualificationError("qualification-not-initialized") from error
 
-    def _evidence(self, evidence_set: Path) -> tuple[dict[str, dict], dict[str, bytes], str]:
+    def _evidence(
+        self, evidence_set: Path
+    ) -> tuple[dict[str, dict], dict[str, bytes], str, dict[str, dict]]:
         try:
             if not isinstance(evidence_set, Path) or evidence_set.is_symlink():
                 raise ValueError("unsafe evidence root")
             root = evidence_set.resolve(strict=True)
+            if os.name == "nt":
+                identity = open_identity(root)
+                require_within(identity, identity)
             expected = {*_INPUTS, "semantic-inputs.json"}
             members = {path.name for path in root.iterdir()}
             if not root.is_dir() or members != expected:
@@ -153,7 +148,18 @@ class Qualification:
             if supplied != actual:
                 raise QualificationError("qualification-fingerprint-mismatch")
             fingerprint = _digest_value([{"name": name, "sha256": actual[name]} for name in sorted(actual)])
-            return values, raw, fingerprint
+            snapshots = {
+                "installed_components": _strict_object(
+                    _read_regular(self.root / "manifests" / "components.lock.json")
+                ),
+                "released_components": _strict_object(
+                    _read_regular(governance_witness.COMPONENT_LOCK)
+                ),
+                "released_requirements": _strict_object(
+                    _read_regular(governance_witness.REQUIREMENTS_MANIFEST)
+                ),
+            }
+            return values, raw, fingerprint, snapshots
         except QualificationError:
             raise
         except (OSError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
@@ -179,39 +185,42 @@ class Qualification:
         if runtime != {"schema_version": 1, **expected}:
             raise QualificationError("qualification-identity-mismatch")
 
-    def _installed_component(self, components: dict) -> None:
+    @staticmethod
+    def _installed_component(
+        components: dict, installed: dict, released: dict
+    ) -> None:
         try:
-            installed = _strict_object(
-                _read_regular(self.root / "manifests" / "components.lock.json")
-            )
-            if (
-                set(installed) != {"schema_version", "components"}
-                or installed["schema_version"] != 1
-                or not isinstance(installed["components"], list)
-                or any(not isinstance(row, dict) for row in installed["components"])
-            ):
-                raise ValueError("invalid installed component lock")
-            evidence = [row for row in components["components"] if row.get("name") == "ao2"]
-            anchored = [row for row in installed["components"] if row.get("name") == "ao2"]
-            if len(evidence) != 1 or anchored != evidence:
-                raise ValueError("installed AO2 identity mismatch")
+            for value in (components, installed, released):
+                if (
+                    set(value) != {"schema_version", "components"}
+                    or value["schema_version"] != 1
+                    or not isinstance(value["components"], list)
+                    or any(not isinstance(row, dict) for row in value["components"])
+                ):
+                    raise ValueError("invalid component lock")
+            if components != installed or installed != released:
+                raise ValueError("component authority mismatch")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise QualificationError("qualification-identity-mismatch") from error
 
     @staticmethod
-    def _matrix(requirements_path: Path, matrix: dict) -> list[dict]:
+    def _matrix(requirements: dict, released: dict, matrix: dict) -> list[dict]:
         try:
-            evidence_requirements = verify_requirements(requirements_path)
+            evidence_requirements = verify_requirements_data(requirements)
+            authoritative = verify_requirements_data(released)
             blocker_ids = [f"B{number:02d}" for number in range(1, 20)]
             expected = [
                 {"requirement_id": identifier, "test_id": evidence_requirements[identifier].test_id}
                 for identifier in blocker_ids
             ]
-            if any(not _test_exists(row["test_id"]) for row in expected):
+            if any(
+                evidence_requirements[identifier].test_id
+                != authoritative[identifier].test_id
+                for identifier in blocker_ids
+            ):
                 raise QualificationError("qualification-test-binding-mismatch")
             if matrix != {"schema_version": 1, "assertions": expected}:
                 raise QualificationError("qualification-critical-matrix-mismatch")
-            authoritative = verify_requirements(_AUTHORITATIVE_REQUIREMENTS)
             if any(evidence_requirements[identifier] != authoritative[identifier] for identifier in blocker_ids):
                 raise QualificationError("qualification-critical-matrix-mismatch")
             return expected
@@ -335,6 +344,98 @@ class Qualification:
         except (OSError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError, PoolError) as error:
             raise QualificationError("qualification-identity-mismatch") from error
 
+    @staticmethod
+    def _authenticated_task_six(
+        values: dict[str, dict], raw: dict[str, bytes], pool: Pool, lease
+    ) -> None:
+        governance = values["governance-envelope.json"]
+        execution = values["execution-record.json"]
+        project = None
+        mission_record = mission_seal = governance_record = execution_record = None
+        try:
+            if lease.authority_bytes != raw["claim-receipt.json"]:
+                raise ValueError("detached authority")
+            envelope_path = Path(lease.authority["project_path"]).joinpath(
+                ".ao",
+                "governance",
+                "office-pool",
+                governance["witness_id"] + ".json",
+            )
+            authenticated, project = _load_envelope(lease, envelope_path)
+            live_governance = dict(authenticated)
+            live_governance.pop("_mission")
+            live_governance.pop("_route")
+            if live_governance != governance:
+                raise ValueError("detached governance envelope")
+            governance_record = _private_file(
+                project,
+                (".ao", "governance", "office-pool"),
+                governance["witness_id"] + ".json",
+            )
+            if _read_private_bytes(governance_record, _MAX_INPUT) != raw[
+                "governance-envelope.json"
+            ]:
+                raise ValueError("governance bytes mismatch")
+            mission_record, mission_seal = _record_paths(
+                lease.authority,
+                lease.authority_bytes,
+                project,
+                None,
+            )
+            if _read_private_bytes(mission_record, _MAX_INPUT) != raw[
+                "mission-record.json"
+            ]:
+                raise ValueError("mission bytes mismatch")
+            execution_record = _private_file(
+                project,
+                (".ao", "evidence", "office-pool"),
+                execution["execution_id"] + ".json",
+            )
+            live_execution = _read_private_bytes(execution_record, _MAX_INPUT)
+            if live_execution != raw["execution-record.json"]:
+                raise ValueError("execution bytes mismatch")
+            if (
+                execution["phase"] != "completed"
+                or execution["diagnostics"]
+                != {"status": "accepted", "run_id": execution["run_id"]}
+                or execution["exit_code"] != 0
+                or execution["failure_code"] is not None
+                or not pool.validate_governance_execution(
+                    lease,
+                    governance["witness_id"],
+                    governance["authority_digest"],
+                    governance["request_digest"],
+                    execution["execution_id"],
+                    hashlib.sha256(live_execution).hexdigest(),
+                )
+            ):
+                raise ValueError("execution is not accepted and completed")
+        except QualificationError:
+            raise
+        except (
+            GovernanceError,
+            MissionBridgeError,
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeError,
+            json.JSONDecodeError,
+            PoolError,
+        ) as error:
+            raise QualificationError("qualification-identity-mismatch") from error
+        finally:
+            for member in (
+                execution_record,
+                mission_seal,
+                mission_record,
+                governance_record,
+            ):
+                if member is not None:
+                    member.close()
+            if project is not None:
+                project.close()
+
     def _existing(self) -> dict | None:
         if not self._record_path.exists():
             return None
@@ -351,59 +452,74 @@ class Qualification:
     def promote(self, evidence_set: Path, state: str) -> Path:
         if state not in _STATES:
             raise QualificationError("qualification-state-invalid")
-        values, raw, fingerprint = self._evidence(evidence_set)
-        self._component(values["runtime-package.json"], values["components.lock.json"])
-        self._installed_component(values["components.lock.json"])
-        matrix = self._matrix(evidence_set / "requirements.json", values["critical-matrix.json"])
         pool = self._pool()
         try:
             with pool._locked():
-                pool._ensure_initialized()
-                self._identity(values, raw, pool)
-                existing = self._existing()
-                if existing is not None:
-                    current = existing["qualification_state"]
-                    if existing["semantic_fingerprint"] != fingerprint:
-                        raise QualificationError("qualification-evidence-changed")
-                    if state == current:
-                        return self._record_path
-                    if _STATES.index(state) != _STATES.index(current) + 1:
-                        raise QualificationError("qualification-transition-invalid")
-                elif state != "candidate":
-                    raise QualificationError("qualification-transition-invalid")
-                runtime = values["runtime-package.json"]
+                values, raw, fingerprint, snapshots = self._evidence(evidence_set)
+                self._component(
+                    values["runtime-package.json"], values["components.lock.json"]
+                )
+                self._installed_component(
+                    values["components.lock.json"],
+                    snapshots["installed_components"],
+                    snapshots["released_components"],
+                )
+                matrix = self._matrix(
+                    values["requirements.json"],
+                    snapshots["released_requirements"],
+                    values["critical-matrix.json"],
+                )
                 authority = values["claim-receipt.json"]
-                record = {
-                    "schema_version": 1,
-                    "runtime_version": runtime["version"],
-                    "runtime_sha256": runtime["sha256"],
-                    "runtime_state": "activated",
-                    "qualification_state": state,
-                    "components_sha256": hashlib.sha256(raw["components.lock.json"]).hexdigest(),
-                    "project_identity_sha256": _digest_value({name: authority[name] for name in ("project_path", "project_volume", "project_file_id")}),
-                    "authority_sha256": hashlib.sha256(raw["claim-receipt.json"]).hexdigest(),
-                    "mission_id": values["mission-record.json"]["mission_id"],
-                    "mission_sha256": hashlib.sha256(raw["mission-record.json"]).hexdigest(),
-                    "witness_id": values["governance-envelope.json"]["witness_id"],
-                    "governance_sha256": hashlib.sha256(raw["governance-envelope.json"]).hexdigest(),
-                    "execution_id": values["execution-record.json"]["execution_id"],
-                    "execution_sha256": hashlib.sha256(raw["execution-record.json"]).hexdigest(),
-                    "requirements_sha256": hashlib.sha256(raw["requirements.json"]).hexdigest(),
-                    "critical_matrix_sha256": hashlib.sha256(raw["critical-matrix.json"]).hexdigest(),
-                    "semantic_fingerprint": fingerprint,
-                    "assertion_count": len(matrix),
-                    "record_digest": "0" * 64,
-                }
-                record["record_digest"] = _digest_value({name: member for name, member in record.items() if name != "record_digest"})
-                _validate_schema(record, _QUALIFICATION_SCHEMA)
-                try:
-                    atomic_write_json(self._record_path, record)
-                except OSError as error:
-                    raise QualificationError("qualification-promotion-failed") from error
-                if self._existing() != record:
-                    raise QualificationError("qualification-promotion-failed")
-                return self._record_path
+                with pool._authority_lease_locked(
+                    pool._authority_path(authority["authority_id"])
+                ) as lease:
+                    self._identity(values, raw, pool)
+                    self._authenticated_task_six(values, raw, pool, lease)
+                    existing = self._existing()
+                    if existing is not None:
+                        current = existing["qualification_state"]
+                        if existing["semantic_fingerprint"] != fingerprint:
+                            raise QualificationError("qualification-evidence-changed")
+                        if state == current:
+                            return self._record_path
+                        if _STATES.index(state) != _STATES.index(current) + 1:
+                            raise QualificationError("qualification-transition-invalid")
+                    elif state != "candidate":
+                        raise QualificationError("qualification-transition-invalid")
+                    runtime = values["runtime-package.json"]
+                    record = {
+                        "schema_version": 1,
+                        "runtime_version": runtime["version"],
+                        "runtime_sha256": runtime["sha256"],
+                        "runtime_state": "activated",
+                        "qualification_state": state,
+                        "components_sha256": hashlib.sha256(raw["components.lock.json"]).hexdigest(),
+                        "project_identity_sha256": _digest_value({name: authority[name] for name in ("project_path", "project_volume", "project_file_id")}),
+                        "authority_sha256": hashlib.sha256(raw["claim-receipt.json"]).hexdigest(),
+                        "mission_id": values["mission-record.json"]["mission_id"],
+                        "mission_sha256": hashlib.sha256(raw["mission-record.json"]).hexdigest(),
+                        "witness_id": values["governance-envelope.json"]["witness_id"],
+                        "governance_sha256": hashlib.sha256(raw["governance-envelope.json"]).hexdigest(),
+                        "execution_id": values["execution-record.json"]["execution_id"],
+                        "execution_sha256": hashlib.sha256(raw["execution-record.json"]).hexdigest(),
+                        "requirements_sha256": hashlib.sha256(raw["requirements.json"]).hexdigest(),
+                        "critical_matrix_sha256": hashlib.sha256(raw["critical-matrix.json"]).hexdigest(),
+                        "semantic_fingerprint": fingerprint,
+                        "assertion_count": len(matrix),
+                        "record_digest": "0" * 64,
+                    }
+                    record["record_digest"] = _digest_value({name: member for name, member in record.items() if name != "record_digest"})
+                    _validate_schema(record, _QUALIFICATION_SCHEMA)
+                    try:
+                        atomic_write_json(self._record_path, record)
+                    except OSError as error:
+                        raise QualificationError("qualification-promotion-failed") from error
+                    if self._existing() != record:
+                        raise QualificationError("qualification-promotion-failed")
+                    return self._record_path
         except QualificationError:
             raise
         except PoolError as error:
+            if error.code in {"unauthorized", "stale-generation"}:
+                raise QualificationError("qualification-identity-mismatch") from error
             raise QualificationError("qualification-recovery-required") from error

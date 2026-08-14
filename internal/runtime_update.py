@@ -10,12 +10,14 @@ from pathlib import Path
 from internal.mission_bridge import _validate_schema
 from internal.pool import OFFICE_IDS, Pool, PoolError
 from internal.transactions import atomic_write_json, read_json
+from internal.windows_identity import open_identity, require_within
 from internal.windows_paths import validate_segment
 
 
 RUNTIME_SCHEMA = Path(__file__).parents[1] / "schemas/runtime-package.schema.json"
 _MANIFEST = "runtime-package.json"
 _ASSET = "ao2"
+_ANCHOR = "runtime-anchor.json"
 _MAX_ASSET = 64 * 1024 * 1024
 _COMPONENT_FIELDS = {
     "name", "version", "repository", "commit", "asset", "license", "sha256"
@@ -124,16 +126,16 @@ class RuntimeUpdate:
         return self.root / "manifests" / "components.lock.json"
 
     @property
-    def _anchors(self) -> Path:
-        return self.root / "operator-secrets" / "runtime-anchors"
-
-    @property
     def _journal(self) -> Path:
         return self.root / "updates" / "runtime-transaction.json"
 
     @property
     def _journal_key(self) -> Path:
         return self.root / "operator-secrets" / "governance-witness.key"
+
+    @property
+    def _completion_state(self) -> Path:
+        return self.root / "runtime" / "runtime-update-state.json"
 
     def _pool(self) -> Pool:
         try:
@@ -153,6 +155,9 @@ class RuntimeUpdate:
             if not isinstance(candidate, Path) or candidate.is_symlink():
                 raise ValueError("unsafe candidate")
             candidate = candidate.resolve(strict=True)
+            if os.name == "nt":
+                identity = open_identity(candidate)
+                require_within(identity, identity)
             if not candidate.is_dir() or {path.name for path in candidate.iterdir()} != {_MANIFEST, _ASSET}:
                 raise ValueError("unexpected package members")
             manifest_raw = _read_regular(candidate / _MANIFEST, 64 * 1024)
@@ -183,6 +188,22 @@ class RuntimeUpdate:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise RuntimeUpdateError("runtime-package-incompatible") from error
 
+    def _anchor(self, version: str, manifest_raw: bytes, asset_raw: bytes) -> dict:
+        payload = {
+            "schema_version": 1,
+            "version": version,
+            "manifest_sha256": _digest(manifest_raw),
+            "asset_sha256": _digest(asset_raw),
+        }
+        return {
+            **payload,
+            "anchor_tag": hmac.new(
+                _read_regular(self._journal_key, 32),
+                b"runtime-package-anchor\0" + _canonical(payload),
+                hashlib.sha256,
+            ).hexdigest(),
+        }
+
     def stage(self, candidate: Path) -> Path:
         manifest, manifest_raw, asset_raw = self._package(candidate)
         self._anchored_component(manifest)
@@ -193,8 +214,7 @@ class RuntimeUpdate:
                 pool._ensure_initialized()
                 self._recover(pool)
                 target = self.root / "components" / "ao2" / version
-                anchor = self._anchors / f"{version}.json"
-                if target.exists() or target.is_symlink() or anchor.exists() or anchor.is_symlink():
+                if target.exists() or target.is_symlink():
                     raise RuntimeUpdateError("runtime-version-exists")
                 parent = target.parent
                 parent.mkdir(parents=True, exist_ok=True)
@@ -203,45 +223,36 @@ class RuntimeUpdate:
                 try:
                     _create_bytes(temporary / _MANIFEST, manifest_raw)
                     _create_bytes(temporary / _ASSET, asset_raw)
+                    _create_bytes(
+                        temporary / _ANCHOR,
+                        _canonical(self._anchor(version, manifest_raw, asset_raw)),
+                    )
+                    self._checkpoint("stage:prepared")
                     os.rename(temporary, target)
-                    anchor_value = {
-                        "schema_version": 1,
-                        "version": version,
-                        "manifest_sha256": _digest(manifest_raw),
-                        "asset_sha256": _digest(asset_raw),
-                    }
-                    try:
-                        _create_bytes(anchor, _canonical(anchor_value))
-                    except BaseException:
-                        shutil.rmtree(target)
-                        raise
                     return target
                 finally:
                     if temporary.exists():
                         shutil.rmtree(temporary)
         except RuntimeUpdateError:
             raise
-        except (OSError, PoolError, ValueError) as error:
+        except PoolError as error:
+            raise RuntimeUpdateError("runtime-recovery-required") from error
+        except (OSError, ValueError) as error:
             raise RuntimeUpdateError("runtime-stage-failed") from error
 
     def _staged(self, version: str) -> tuple[dict, bytes]:
         try:
             version = validate_segment(version)
             target = self.root / "components" / "ao2" / version
-            if target.is_symlink() or not target.is_dir() or {path.name for path in target.iterdir()} != {_MANIFEST, _ASSET}:
+            if target.is_symlink() or not target.is_dir() or {path.name for path in target.iterdir()} != {_MANIFEST, _ASSET, _ANCHOR}:
                 raise ValueError("missing staged package")
             manifest_raw = _read_regular(target / _MANIFEST, 64 * 1024)
             asset_raw = _read_regular(target / _ASSET, _MAX_ASSET)
             manifest = _strict_object(manifest_raw)
             _validate_schema(manifest, RUNTIME_SCHEMA)
-            anchor_raw = _read_regular(self._anchors / f"{version}.json", 1024)
+            anchor_raw = _read_regular(target / _ANCHOR, 2048)
             anchor = _strict_object(anchor_raw)
-            expected_anchor = {
-                "schema_version": 1,
-                "version": version,
-                "manifest_sha256": _digest(manifest_raw),
-                "asset_sha256": _digest(asset_raw),
-            }
+            expected_anchor = self._anchor(version, manifest_raw, asset_raw)
             if (
                 manifest["version"] != version
                 or manifest_raw != _canonical(manifest)
@@ -262,23 +273,24 @@ class RuntimeUpdate:
         _create_bytes(executable, asset)
 
     @staticmethod
-    def _runtime_matches(path: Path, version: str, digest: str) -> bool:
+    def _runtime_digest(path: Path, version: str) -> str | None:
         executable = path / "versions" / version / ("ao2.exe" if os.name == "nt" else "ao2")
         expected = {path / "versions", path / "versions" / version, executable}
         try:
-            return (
-                not path.is_symlink()
-                and path.is_dir()
-                and set(path.rglob("*")) == expected
-                and _digest(_read_regular(executable, _MAX_ASSET)) == digest
-            )
+            if path.is_symlink() or not path.is_dir() or set(path.rglob("*")) != expected:
+                return None
+            return _digest(_read_regular(executable, _MAX_ASSET))
         except (OSError, ValueError):
-            return False
+            return None
+
+    @classmethod
+    def _runtime_matches(cls, path: Path, version: str, digest: str) -> bool:
+        return hmac.compare_digest(cls._runtime_digest(path, version) or "", digest)
 
     def _validated_journal(self) -> dict:
         try:
             journal = read_json(self._journal)
-            fields = {"schema_version", "operation_id", "phase", "previous_version", "target_version", "target_sha256", "previous_present", "replaced", "journal_tag"}
+            fields = {"schema_version", "operation_id", "phase", "previous_version", "previous_sha256", "target_version", "target_sha256", "previous_present", "replaced", "journal_tag"}
             operation = journal["operation_id"]
             supplied_tag = journal.get("journal_tag")
             if (
@@ -296,6 +308,24 @@ class RuntimeUpdate:
                 or len(supplied_tag) != 64
                 or set(journal["previous_present"]) != set(OFFICE_IDS)
                 or any(type(value) is not bool for value in journal["previous_present"].values())
+                or set(journal["previous_sha256"]) != set(OFFICE_IDS)
+                or any(
+                    (value is not None)
+                    and (
+                        not isinstance(value, str)
+                        or len(value) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in value
+                        )
+                    )
+                    for value in journal["previous_sha256"].values()
+                )
+                or any(
+                    journal["previous_present"][office]
+                    != (journal["previous_sha256"][office] is not None)
+                    for office in OFFICE_IDS
+                )
                 or not isinstance(journal["replaced"], list)
                 or len(journal["replaced"]) != len(set(journal["replaced"]))
                 or any(office not in OFFICE_IDS for office in journal["replaced"])
@@ -309,15 +339,6 @@ class RuntimeUpdate:
             ).hexdigest()
             if not hmac.compare_digest(supplied_tag, expected_tag):
                 raise ValueError("unauthenticated runtime journal")
-            transaction = self._transaction_root(journal)
-            if (
-                transaction.is_symlink()
-                or not transaction.is_dir()
-                or not transaction.resolve(strict=True).is_relative_to(
-                    self.root.resolve(strict=True)
-                )
-            ):
-                raise ValueError("missing runtime transaction")
             return journal
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise RuntimeUpdateError("runtime-recovery-required") from error
@@ -331,21 +352,157 @@ class RuntimeUpdate:
         ).hexdigest()
         atomic_write_json(self._journal, journal)
 
+    def _validated_completion_state(self) -> dict:
+        try:
+            raw = _read_regular(self._completion_state, 16 * 1024 * 1024)
+            value = _strict_object(raw)
+            completed = value["completed"]
+            payload = {"schema_version": 1, "completed": completed}
+            expected_tag = hmac.new(
+                _read_regular(self._journal_key, 32),
+                b"runtime-update-state\0" + _canonical(payload),
+                hashlib.sha256,
+            ).hexdigest()
+            if (
+                set(value) != {"schema_version", "completed", "state_tag"}
+                or value["schema_version"] != 1
+                or not isinstance(completed, dict)
+                or any(
+                    not isinstance(operation, str)
+                    or len(operation) != 32
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in operation
+                    )
+                    or not isinstance(entry, dict)
+                    or set(entry) != {"journal_tag", "outcome"}
+                    or not isinstance(entry["journal_tag"], str)
+                    or len(entry["journal_tag"]) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in entry["journal_tag"]
+                    )
+                    or entry["outcome"] not in {"committed", "restored"}
+                    for operation, entry in completed.items()
+                )
+                or not isinstance(value["state_tag"], str)
+                or not hmac.compare_digest(value["state_tag"], expected_tag)
+                or raw != _canonical(value)
+            ):
+                raise ValueError("invalid runtime completion state")
+            return value
+        except (OSError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeUpdateError("runtime-recovery-required") from error
+
+    def _write_completion_state(self, completed: dict) -> None:
+        payload = {"schema_version": 1, "completed": completed}
+        value = {
+            **payload,
+            "state_tag": hmac.new(
+                _read_regular(self._journal_key, 32),
+                b"runtime-update-state\0" + _canonical(payload),
+                hashlib.sha256,
+            ).hexdigest(),
+        }
+        try:
+            atomic_write_json(self._completion_state, value)
+            if self._validated_completion_state() != value:
+                raise ValueError("runtime completion state readback mismatch")
+        except RuntimeUpdateError:
+            raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeUpdateError("runtime-recovery-required") from error
+
+    def _record_completion(self, journal: dict, outcome: str) -> None:
+        state = self._validated_completion_state()
+        expected = {"journal_tag": journal["journal_tag"], "outcome": outcome}
+        existing = state["completed"].get(journal["operation_id"])
+        if existing is not None and existing != expected:
+            raise RuntimeUpdateError("runtime-recovery-required")
+        if existing is None:
+            completed = dict(state["completed"])
+            completed[journal["operation_id"]] = expected
+            self._write_completion_state(completed)
+
+    def _completed_outcome(self, journal: dict) -> str | None:
+        entry = self._validated_completion_state()["completed"].get(
+            journal["operation_id"]
+        )
+        if entry is None:
+            return None
+        if entry["journal_tag"] != journal["journal_tag"]:
+            raise RuntimeUpdateError("runtime-recovery-required")
+        return entry["outcome"]
+
     def _transaction_root(self, journal: dict) -> Path:
         return self.root / "updates" / "runtime-transactions" / journal["operation_id"]
 
-    def _complete_transaction(self, transaction: Path) -> None:
-        self._journal.unlink()
-        if os.name != "nt":
-            parent = os.open(self._journal.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(parent)
-            finally:
-                os.close(parent)
+    def _validate_transaction(self, journal: dict) -> Path:
+        transaction = self._transaction_root(journal)
         try:
-            shutil.rmtree(transaction)
-        except OSError:
-            pass
+            if (
+                transaction.is_symlink()
+                or not transaction.is_dir()
+                or not transaction.resolve(strict=True).is_relative_to(
+                    self.root.resolve(strict=True)
+                )
+            ):
+                raise ValueError("missing runtime transaction")
+            return transaction
+        except (OSError, ValueError) as error:
+            raise RuntimeUpdateError("runtime-recovery-required") from error
+
+    def _validate_final_state(self, journal: dict, outcome: str) -> None:
+        try:
+            metadata = read_json(self.root / "pool.json")
+            version = (
+                journal["target_version"]
+                if outcome == "committed"
+                else journal["previous_version"]
+            )
+            if metadata.get("runtime_version") != version:
+                raise ValueError("runtime metadata mismatch")
+            for office_id in OFFICE_IDS:
+                runtime = self.root / "offices" / office_id / "runtime"
+                if outcome == "committed":
+                    valid = self._runtime_matches(
+                        runtime,
+                        journal["target_version"],
+                        journal["target_sha256"],
+                    )
+                elif journal["previous_present"][office_id]:
+                    valid = self._runtime_matches(
+                        runtime,
+                        journal["previous_version"],
+                        journal["previous_sha256"][office_id],
+                    )
+                else:
+                    valid = not (runtime.exists() or runtime.is_symlink())
+                if not valid:
+                    raise ValueError("runtime final state mismatch")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeUpdateError("runtime-recovery-required") from error
+
+    def _complete_transaction(self, journal: dict, outcome: str) -> None:
+        self._validate_final_state(journal, outcome)
+        self._record_completion(journal, outcome)
+        transaction = self._transaction_root(journal)
+        try:
+            if transaction.exists() or transaction.is_symlink():
+                if transaction.is_symlink() or not transaction.is_dir():
+                    raise ValueError("unsafe runtime transaction")
+                shutil.rmtree(transaction)
+            if transaction.exists() or transaction.is_symlink():
+                raise OSError("runtime transaction cleanup incomplete")
+            self._journal.unlink()
+            if os.name != "nt":
+                parent = os.open(self._journal.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+        except (OSError, ValueError) as error:
+            raise RuntimeUpdateError("runtime-recovery-required") from error
 
     def _remove_new_runtime(self, runtime: Path, journal: dict) -> None:
         if not self._runtime_matches(runtime, journal["target_version"], journal["target_sha256"]):
@@ -353,17 +510,26 @@ class RuntimeUpdate:
         shutil.rmtree(runtime)
 
     def _restore(self, journal: dict) -> None:
-        transaction = self._transaction_root(journal)
+        transaction = self._validate_transaction(journal)
         for office_id in reversed(OFFICE_IDS):
             runtime = self.root / "offices" / office_id / "runtime"
             backup = transaction / f"{office_id}.old"
-            if backup.exists():
+            previous_digest = journal["previous_sha256"][office_id]
+            if backup.exists() or backup.is_symlink():
+                if not self._runtime_matches(
+                    backup, journal["previous_version"], previous_digest
+                ):
+                    raise RuntimeUpdateError("runtime-recovery-required")
                 if runtime.exists() or runtime.is_symlink():
                     self._remove_new_runtime(runtime, journal)
                 os.replace(backup, runtime)
-            elif not journal["previous_present"][office_id] and runtime.exists():
+            elif journal["previous_present"][office_id]:
+                if not self._runtime_matches(
+                    runtime, journal["previous_version"], previous_digest
+                ):
+                    raise RuntimeUpdateError("runtime-recovery-required")
+            elif runtime.exists() or runtime.is_symlink():
                 self._remove_new_runtime(runtime, journal)
-        metadata = read_json(self.root / "pool.json")
         atomic_write_json(
             self.root / "pool.json",
             {
@@ -373,8 +539,7 @@ class RuntimeUpdate:
                 "runtime_version": journal["previous_version"],
             },
         )
-        del metadata
-        self._complete_transaction(transaction)
+        self._complete_transaction(journal, "restored")
 
     def _finish_committed(self, journal: dict) -> None:
         metadata = read_json(self.root / "pool.json")
@@ -384,13 +549,17 @@ class RuntimeUpdate:
             runtime = self.root / "offices" / office_id / "runtime"
             if not self._runtime_matches(runtime, journal["target_version"], journal["target_sha256"]):
                 raise RuntimeUpdateError("runtime-recovery-required")
-        self._complete_transaction(self._transaction_root(journal))
+        self._complete_transaction(journal, "committed")
 
     def _recover(self, pool: Pool) -> None:
         if not self._journal.exists():
             return
         journal = self._validated_journal()
-        if journal["phase"] == "committed":
+        outcome = self._completed_outcome(journal)
+        if outcome is not None:
+            self._complete_transaction(journal, outcome)
+        elif journal["phase"] == "committed":
+            self._validate_transaction(journal)
             self._finish_committed(journal)
         else:
             self._restore(journal)
@@ -416,6 +585,18 @@ class RuntimeUpdate:
                     raise RuntimeUpdateError("runtime-recovery-required")
                 manifest, asset = self._staged(version)
                 operation = uuid.uuid4().hex
+                previous_sha256 = {}
+                for office in OFFICE_IDS:
+                    runtime = self.root / "offices" / office / "runtime"
+                    if runtime.exists():
+                        digest = self._runtime_digest(
+                            runtime, metadata["runtime_version"]
+                        )
+                        if digest is None:
+                            raise RuntimeUpdateError("runtime-recovery-required")
+                        previous_sha256[office] = digest
+                    else:
+                        previous_sha256[office] = None
                 journal = {
                     "schema_version": 1,
                     "operation_id": operation,
@@ -424,9 +605,10 @@ class RuntimeUpdate:
                     "target_version": version,
                     "target_sha256": manifest["sha256"],
                     "previous_present": {
-                        office: (self.root / "offices" / office / "runtime").exists()
+                        office: previous_sha256[office] is not None
                         for office in OFFICE_IDS
                     },
+                    "previous_sha256": previous_sha256,
                     "replaced": [],
                     "journal_tag": "0" * 64,
                 }

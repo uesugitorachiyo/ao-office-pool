@@ -23,6 +23,10 @@ def verify_requirements(path: Path) -> dict[str, Requirement]:
             data = json.load(requirements_file)
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid requirements manifest: {path}") from error
+    return verify_requirements_data(data)
+
+
+def verify_requirements_data(data) -> dict[str, Requirement]:
     if not isinstance(data, dict) or set(data) != _DOCUMENT_FIELDS or data["schema_version"] != 1:
         raise ValueError("invalid requirements manifest fields")
     rows = data["requirements"]

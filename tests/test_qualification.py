@@ -1,13 +1,17 @@
 import hashlib
 import json
 import os
-import tempfile
+import shutil
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from internal.execution import execute
+from internal.governance_witness import issue_witness
 from internal.pool import OFFICE_IDS, Pool
 from internal.qualification import Qualification, QualificationError
+from tests import test_execution as execution_tests
 
 
 def _canonical(value: dict) -> bytes:
@@ -20,29 +24,58 @@ def _digest_value(value) -> str:
 
 class QualificationTests(unittest.TestCase):
     def setUp(self):
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.base = Path(self.temporary_directory.name).resolve()
-        self.root = self.base / "pool"
-        self.project = self.base / "connected-project"
-        self.project.mkdir()
-        self.runtime_bytes = b"qualified ao2\n"
+        self.execution_fixture = execution_tests.ExecutionTests(
+            "test_executes_only_envelope_bound_objects_and_relative_target"
+        )
+        self.execution_fixture.setUp()
+        self.addCleanup(self.execution_fixture.doCleanups)
+        self.harness = self.execution_fixture.harness
+        self.base = self.execution_fixture.base
+        self.root = self.harness.pool_root
+        self.pool = self.harness.pool
+        self.project = self.execution_fixture.project
+        self.claim_path = self.execution_fixture.claim_path
+        component = self._component()
+        old_runtime = self.execution_fixture.executable.parent
+        new_runtime = old_runtime.with_name(component["version"])
+        old_runtime.rename(new_runtime)
+        self.execution_fixture.executable = new_runtime / self.execution_fixture.executable.name
+        self.pool.runtime_version = component["version"]
+        (self.root / "pool.json").write_bytes(
+            _canonical(
+                {
+                    "schema_version": 1,
+                    "office_count": 5,
+                    "offices": list(OFFICE_IDS),
+                    "runtime_version": component["version"],
+                }
+            )
+        )
+        self.harness._write_mission("ao-foundry")
+        self.envelope_path = issue_witness(
+            self.claim_path,
+            self.harness.task_text,
+            self.harness.valid_artifacts(atlas=True),
+        )
+        result = execute(self.claim_path, self.envelope_path)
+        self.execution_path = result.record
+        self.runtime_bytes = self.execution_fixture.executable.read_bytes()
         self.runtime_sha256 = hashlib.sha256(self.runtime_bytes).hexdigest()
-        Pool(self.root, runtime_version="v2").initialize()
         for office_id in OFFICE_IDS:
-            path = self.root / "offices" / office_id / "runtime" / "versions" / "v2" / ("ao2.exe" if os.name == "nt" else "ao2")
-            path.parent.mkdir(parents=True)
-            path.write_bytes(self.runtime_bytes)
+            path = self.root / "offices" / office_id / "runtime" / "versions" / component["version"] / ("ao2.exe" if os.name == "nt" else "ao2")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path != self.execution_fixture.executable:
+                shutil.copy2(self.execution_fixture.executable, path)
         installed_lock = self.root / "manifests" / "components.lock.json"
         installed_lock.parent.mkdir(parents=True)
-        installed_lock.write_bytes(
-            _canonical({"schema_version": 1, "components": [self._component()]})
+        installed_lock.write_bytes(self.harness.lock.read_bytes())
+        self.authority = json.loads(self.claim_path.read_bytes())
+        self.mission_path = next(
+            (self.project / ".ao" / "mission" / "office-pool").glob("*.json")
         )
         self.evidence = self.base / "evidence"
         self.evidence.mkdir()
         self._write_evidence()
-
-    def tearDown(self):
-        self.temporary_directory.cleanup()
 
     def _write(self, name: str, value: dict) -> bytes:
         raw = _canonical(value)
@@ -50,176 +83,45 @@ class QualificationTests(unittest.TestCase):
         return raw
 
     def _component(self):
-        return {
-            "name": "ao2",
-            "version": "v2",
-            "repository": "https://example.invalid/ao2",
-            "commit": "a" * 40,
-            "asset": "ao2",
-            "license": "Apache-2.0",
-            "sha256": self.runtime_sha256,
-        }
+        return next(
+            component
+            for component in self.harness.components
+            if component["name"] == "ao2"
+        )
 
     def _write_evidence(self):
+        component = self._component()
         runtime = {
             "schema_version": 1,
             "name": "ao2",
-            "version": "v2",
-            "commit": "a" * 40,
-            "asset": "ao2",
+            "version": component["version"],
+            "commit": component["commit"],
+            "asset": component["asset"],
             "sha256": self.runtime_sha256,
         }
-        component_lock = {"schema_version": 1, "components": [self._component()]}
-        project_information = self.project.stat()
-        authority = {
-            "schema_version": 1,
-            "authority_id": "1" * 64,
-            "office_id": "O1",
-            "generation": 4,
-            "holder_digest": "2" * 64,
-            "task_digest": "3" * 64,
-            "project_path": str(self.project),
-            "project_volume": project_information.st_dev,
-            "project_file_id": str(project_information.st_ino),
-            "mode": "conversation",
-        }
-        authority_raw = _canonical(authority)
-        authority_digest = hashlib.sha256(authority_raw).hexdigest()
-        mission = {
-            "schema_version": 1,
-            "mission_id": "mission-0123456789abcdef",
-            "objective_digest": "sha256:" + authority["task_digest"],
-            "authority_digest": authority_digest,
-            "chat_digest": authority["holder_digest"],
-            "task_digest": authority["task_digest"],
-            "office_id": authority["office_id"],
-            "generation": authority["generation"],
-            "project_path": authority["project_path"],
-            "mission_status": "active",
-            "current_route": "ao-forge",
-        }
         source_requirements = Path(__file__).parents[1] / "manifests" / "requirements.json"
-        requirements = json.loads(source_requirements.read_text(encoding="utf-8"))
-        requirements_raw = _canonical(requirements)
+        requirements_raw = source_requirements.read_bytes()
+        requirements = json.loads(requirements_raw)
         blocker_rows = [row for row in requirements["requirements"] if row["id"].startswith("B")]
-        blocker_bindings = {row["id"]: row["test_id"] for row in blocker_rows}
-        requirements_evidence = {
-            "requirements_sha256": hashlib.sha256(requirements_raw).hexdigest(),
-            "test_bindings_sha256": _digest_value(blocker_bindings),
-            "requirement_ids": [f"B{number:02d}" for number in range(1, 20)],
-        }
-        producer_artifacts = {
-            "ao-blueprint": self._producer("4"),
-            "ao-atlas": self._producer("5"),
-            "ao-forge": self._producer("6"),
-            "ao-covenant": self._producer("7"),
-        }
-        route = {
-            "decision_digest": "8" * 64,
-            "route": "ao-forge",
-            "atlas_required": True,
-            "execution_candidate": True,
-        }
-        target = {
-            "canonical_path": authority["project_path"],
-            "volume": authority["project_volume"],
-            "file_id": authority["project_file_id"],
-        }
-        ao2 = {"name": "ao2", "commit": "a" * 40, "asset": "ao2", "sha256": self.runtime_sha256}
-        request = {
-            "authority_digest": authority_digest,
-            "mission_id": mission["mission_id"],
-            "route_digest": route["decision_digest"],
-            "target": target,
-            "workflow_digest": "9" * 64,
-            "run_id": "run-0123456789abcdef",
-            "producer_artifacts": producer_artifacts,
-            "requirements_evidence_digest": _digest_value(requirements_evidence),
-            "ao2": ao2,
-        }
-        governance = {
-            "schema_version": 1,
-            "witness_id": "witness-0123456789abcdef0123456789abcdef",
-            "state": "ready",
-            "authority_digest": authority_digest,
-            "office_id": authority["office_id"],
-            "generation": authority["generation"],
-            "runtime_version": "v2",
-            "project_path": authority["project_path"],
-            "project_volume": authority["project_volume"],
-            "project_file_id": authority["project_file_id"],
-            "mission": {"mission_id": mission["mission_id"], "objective_digest": mission["objective_digest"], "status": mission["mission_status"], "current_route": mission["current_route"]},
-            "route": route,
-            "task_digest": authority["task_digest"],
-            "request_digest": _digest_value(request),
-            "target": target,
-            "workflow_digest": request["workflow_digest"],
-            "run_id": request["run_id"],
-            "producer_artifacts": producer_artifacts,
-            "covenant": {"decision": "authorized", "scope": authority["project_path"], "expires_at": "2026-08-13T23:59:59Z", "revoked": False},
-            "requirements_evidence_digest": request["requirements_evidence_digest"],
-            "ao2": ao2,
-            "created_at": "2026-08-13T00:00:00Z",
-            "expires_at": "2026-08-13T00:05:00Z",
-            "payload_digest": "0" * 64,
-        }
-        governance["payload_digest"] = _digest_value({key: value for key, value in governance.items() if key != "payload_digest"})
-        execution = {
-            "schema_version": 1,
-            "execution_id": "execution-0123456789abcdef0123456789abcdef",
-            "phase": "completed",
-            "request_digest": governance["request_digest"],
-            "mission_id": mission["mission_id"],
-            "objective_digest": mission["objective_digest"],
-            "route_digest": route["decision_digest"],
-            "authority_digest": authority_digest,
-            "office_id": authority["office_id"],
-            "generation": authority["generation"],
-            "project_path": authority["project_path"],
-            "target_path": authority["project_path"],
-            "workflow_path": str(self.project / ".ao" / "governance" / "office-pool" / "workflows" / request["workflow_digest"]),
-            "workflow_sha256": request["workflow_digest"],
-            "run_id": request["run_id"],
-            "blueprint_digest": producer_artifacts["ao-blueprint"]["artifact_sha256"],
-            "atlas_digest": producer_artifacts["ao-atlas"]["artifact_sha256"],
-            "forge_digest": producer_artifacts["ao-forge"]["artifact_sha256"],
-            "covenant_digest": producer_artifacts["ao-covenant"]["artifact_sha256"],
-            "ao2_sha256": self.runtime_sha256,
-            "diagnostics": {"status": "accepted", "run_id": request["run_id"]},
-            "exit_code": 0,
-            "failure_code": None,
-            "record_digest": "0" * 64,
-        }
-        execution["record_digest"] = _digest_value({key: value for key, value in execution.items() if key != "record_digest"})
         matrix = {
             "schema_version": 1,
             "assertions": [{"requirement_id": row["id"], "test_id": row["test_id"]} for row in blocker_rows],
         }
-        values = {
-            "runtime-package.json": runtime,
-            "components.lock.json": component_lock,
-            "claim-receipt.json": authority,
-            "mission-record.json": mission,
-            "governance-envelope.json": governance,
-            "execution-record.json": execution,
-            "requirements.json": requirements,
-            "critical-matrix.json": matrix,
+        sources = {
+            "runtime-package.json": _canonical(runtime),
+            "components.lock.json": self.harness.lock.read_bytes(),
+            "claim-receipt.json": self.claim_path.read_bytes(),
+            "mission-record.json": self.mission_path.read_bytes(),
+            "governance-envelope.json": self.envelope_path.read_bytes(),
+            "execution-record.json": self.execution_path.read_bytes(),
+            "requirements.json": requirements_raw,
+            "critical-matrix.json": _canonical(matrix),
         }
         fingerprints = []
-        for name, value in values.items():
-            raw = self._write(name, value)
+        for name, raw in sources.items():
+            (self.evidence / name).write_bytes(raw)
             fingerprints.append({"name": name, "sha256": hashlib.sha256(raw).hexdigest()})
         self._write("semantic-inputs.json", {"schema_version": 1, "inputs": fingerprints})
-
-    @staticmethod
-    def _producer(digit: str):
-        return {
-            "commit": digit * 40,
-            "asset": "producer",
-            "binary_sha256": digit * 64,
-            "command_contract": "producer run",
-            "artifact_sha256": digit * 64,
-        }
 
     def _rewrite_semantic_manifest(self):
         inputs = []
@@ -232,18 +134,275 @@ class QualificationTests(unittest.TestCase):
     def _record(self):
         return json.loads((self.root / "updates" / "qualification.json").read_text(encoding="utf-8"))
 
+    def _governance_marker(self, kind: str) -> Path:
+        governance = json.loads(self.envelope_path.read_bytes())
+        authority_digest = hashlib.sha256(self.claim_path.read_bytes()).hexdigest()
+        return (
+            self.root
+            / "runtime"
+            / "governance"
+            / kind
+            / f"{authority_digest}-{governance['witness_id']}"
+        )
+
     def test_exact_qualification_binding_promotes_candidate(self):
         # MUTATION: omitting one cross-record identity accepts unrelated execution evidence.
         record_path = Qualification(self.root).promote(self.evidence, "candidate")
         record = json.loads(record_path.read_text(encoding="utf-8"))
         self.assertEqual(record["qualification_state"], "candidate")
-        self.assertEqual(record["runtime_version"], "v2")
+        self.assertEqual(record["runtime_version"], self._component()["version"])
         self.assertEqual(record["runtime_sha256"], self.runtime_sha256)
         self.assertEqual(record["mission_id"], "mission-0123456789abcdef")
-        self.assertEqual(record["witness_id"], "witness-0123456789abcdef0123456789abcdef")
-        self.assertEqual(record["execution_id"], "execution-0123456789abcdef0123456789abcdef")
+        self.assertEqual(
+            record["witness_id"],
+            json.loads(self.envelope_path.read_bytes())["witness_id"],
+        )
+        self.assertEqual(
+            record["execution_id"],
+            json.loads(self.execution_path.read_bytes())["execution_id"],
+        )
         self.assertEqual(record["assertion_count"], 19)
         self.assertNotIn(str(self.project), json.dumps(record))
+
+    def test_detached_invented_task_six_artifacts_cannot_qualify(self):
+        # MUTATION: self-consistent copied JSON must not replace a live Pool authority.
+        self.pool.release(self.claim_path)
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_missing_live_mission_authentication_cannot_qualify(self):
+        # MUTATION: parsing the copied Mission record ignores its live detached HMAC.
+        self.mission_path.with_suffix(".hmac").unlink()
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_forged_live_mission_authentication_cannot_qualify(self):
+        # MUTATION: trusting Mission fields accepts a record rejected by its authority HMAC.
+        self.mission_path.with_suffix(".hmac").write_bytes(b"f" * 64 + b"\n")
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_missing_live_governance_authentication_cannot_qualify(self):
+        # MUTATION: copied envelope JSON is not proof that Pool authenticated its issuance.
+        self.envelope_path.with_suffix(".hmac").unlink()
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_forged_live_governance_authentication_cannot_qualify(self):
+        # MUTATION: the unkeyed payload digest cannot substitute for the detached HMAC.
+        self.envelope_path.with_suffix(".hmac").write_bytes(b"f" * 64 + b"\n")
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_missing_pool_governance_issuance_cannot_qualify(self):
+        # MUTATION: a detached HMAC copied beside an envelope is not Pool issuance.
+        self._governance_marker("issued").unlink()
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_consumption_without_pool_execution_completion_cannot_qualify(self):
+        # MUTATION: one-use consumption proves an attempt, not accepted completion.
+        self._governance_marker("consumed").write_bytes(b"1\n")
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_failed_execution_record_cannot_qualify(self):
+        # MUTATION: schema validity and cross-record digests do not imply accepted execution.
+        execution_path = self.evidence / "execution-record.json"
+        execution = json.loads(execution_path.read_bytes())
+        execution.update(
+            {
+                "phase": "failed",
+                "diagnostics": {},
+                "exit_code": None,
+                "failure_code": "execution-failed",
+            }
+        )
+        execution["record_digest"] = _digest_value(
+            {name: value for name, value in execution.items() if name != "record_digest"}
+        )
+        self._write("execution-record.json", execution)
+        self._rewrite_semantic_manifest()
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_nonreleased_producer_identity_cannot_qualify(self):
+        # MUTATION: internally consistent producer claims do not override released pins.
+        governance_path = self.evidence / "governance-envelope.json"
+        governance = json.loads(governance_path.read_bytes())
+        governance["producer_artifacts"]["ao-blueprint"]["commit"] = "f" * 40
+        request = {
+            "authority_digest": governance["authority_digest"],
+            "mission_id": governance["mission"]["mission_id"],
+            "route_digest": governance["route"]["decision_digest"],
+            "target": governance["target"],
+            "workflow_digest": governance["workflow_digest"],
+            "run_id": governance["run_id"],
+            "producer_artifacts": governance["producer_artifacts"],
+            "requirements_evidence_digest": governance["requirements_evidence_digest"],
+            "ao2": governance["ao2"],
+        }
+        governance["request_digest"] = _digest_value(request)
+        governance["payload_digest"] = _digest_value(
+            {name: value for name, value in governance.items() if name != "payload_digest"}
+        )
+        self._write("governance-envelope.json", governance)
+        execution = json.loads((self.evidence / "execution-record.json").read_bytes())
+        execution["request_digest"] = governance["request_digest"]
+        execution["record_digest"] = _digest_value(
+            {name: value for name, value in execution.items() if name != "record_digest"}
+        )
+        self._write("execution-record.json", execution)
+        self._rewrite_semantic_manifest()
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+
+    def test_locked_snapshot_is_not_reopened_after_capture(self):
+        # MUTATION: reopening requirements or the installed lock mixes two snapshots.
+        qualification = Qualification(self.root)
+        capture = qualification._evidence
+
+        def capture_then_replace(evidence_set):
+            snapshot = capture(evidence_set)
+            (self.evidence / "requirements.json").write_text("{}\n", encoding="utf-8")
+            (self.root / "manifests/components.lock.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with mock.patch.object(
+            qualification,
+            "_evidence",
+            side_effect=capture_then_replace,
+        ):
+            record = qualification.promote(self.evidence, "candidate")
+
+        self.assertTrue(record.is_file())
+
+    def test_evidence_capture_occurs_while_pool_lock_is_held(self):
+        # MUTATION: pre-lock capture permits an activation or rollback to split authority.
+        qualification = Qualification(self.root)
+        capture = qualification._evidence
+        locked = False
+        pool_locked = Pool._locked
+
+        @contextmanager
+        def tracked_lock(pool, *args, **kwargs):
+            nonlocal locked
+            with pool_locked(pool, *args, **kwargs):
+                locked = True
+                try:
+                    yield
+                finally:
+                    locked = False
+
+        def require_lock(evidence_set):
+            self.assertTrue(locked)
+            return capture(evidence_set)
+
+        with (
+            mock.patch.object(Pool, "_locked", tracked_lock),
+            mock.patch.object(
+                qualification,
+                "_evidence",
+                side_effect=require_lock,
+            ),
+        ):
+            record = qualification.promote(self.evidence, "candidate")
+
+        self.assertTrue(record.is_file())
+
+    def test_windows_evidence_root_reparse_ancestors_fail_closed(self):
+        # MUTATION: a resolved evidence root can still traverse a Windows junction.
+        qualification = Qualification(self.root)
+        identity = object()
+        with (
+            mock.patch("internal.qualification.os.name", "nt"),
+            mock.patch(
+                "internal.qualification.open_identity", return_value=identity, create=True
+            ) as opened,
+            mock.patch("internal.qualification.require_within", create=True) as contained,
+        ):
+            values, _, _, _ = qualification._evidence(self.evidence)
+        self.assertEqual(values["runtime-package.json"]["name"], "ao2")
+        opened.assert_called_once_with(self.evidence)
+        contained.assert_called_once_with(identity, identity)
+
+        with (
+            mock.patch("internal.qualification.os.name", "nt"),
+            mock.patch(
+                "internal.qualification.open_identity", return_value=identity, create=True
+            ),
+            mock.patch(
+                "internal.qualification.require_within",
+                side_effect=ValueError("reparse-point ancestor"),
+                create=True,
+            ),
+        ):
+            with self.assertRaises(QualificationError) as raised:
+                qualification._evidence(self.evidence)
+
+        self.assertEqual(
+            raised.exception.code, "qualification-evidence-set-mismatch"
+        )
+
+    def test_source_ast_names_are_not_qualification_authority(self):
+        # MUTATION: authenticated Task 6 bindings must not depend on later source parsing.
+        with mock.patch("ast.parse", side_effect=SyntaxError("source unavailable")):
+            record = Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertTrue(record.is_file())
+
+    def test_every_released_component_row_is_authoritative(self):
+        # MUTATION: checking only AO2 lets a producer row drift from Task 6 authority.
+        evidence_lock = json.loads(
+            (self.evidence / "components.lock.json").read_bytes()
+        )
+        installed_lock = json.loads(
+            (self.root / "manifests/components.lock.json").read_bytes()
+        )
+        for value in (evidence_lock, installed_lock):
+            producer = next(
+                row for row in value["components"] if row["name"] == "ao-blueprint"
+            )
+            producer["commit"] = "f" * 40
+        self._write("components.lock.json", evidence_lock)
+        (self.root / "manifests/components.lock.json").write_bytes(
+            _canonical(installed_lock)
+        )
+        self._rewrite_semantic_manifest()
+
+        with self.assertRaises(QualificationError) as raised:
+            Qualification(self.root).promote(self.evidence, "candidate")
+
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
 
     def test_fingerprint_binds_semantic_inputs(self):
         # MUTATION: hashing only a wrapper lets a consumed evidence file change undetected.

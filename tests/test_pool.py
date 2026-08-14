@@ -176,6 +176,7 @@ class PoolTests(unittest.TestCase):
         key = self.root / "operator-secrets/governance-witness.key"
         governance_state = self.root / "runtime/governance"
         shutil.rmtree(governance_state)
+        (self.root / "runtime/runtime-update-state.json").unlink()
         key.unlink()
         self.pool.initialize()
         created = key.read_bytes()
@@ -229,6 +230,7 @@ class PoolTests(unittest.TestCase):
         key = b"\x00\xff\n\r\n\x1a" + b"K" * 26
         key_path = self.root / "operator-secrets/governance-witness.key"
         key_path.write_bytes(key)
+        self.pool._write_runtime_update_state({})
         witness_id = "witness-" + "a" * 32
         commitment = {
             "schema_version": 1,

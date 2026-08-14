@@ -1005,13 +1005,9 @@ class ExecutionTests(unittest.TestCase):
         self._execution_records.mkdir(parents=True, exist_ok=True)
         sentinel = self._execution_records / ("execution-" + "a" * 32 + ".json")
         sentinel.write_bytes(b"preserve-me")
-        identifiers = [
-            types.SimpleNamespace(hex="c" * 32),
-            types.SimpleNamespace(hex="a" * 32),
-            types.SimpleNamespace(hex="b" * 32),
-        ]
+        identifiers = ["c" * 32, "a" * 32, "b" * 32]
         with mock.patch.object(
-            execution_module.uuid, "uuid4", side_effect=identifiers
+            execution_module, "_identifier", side_effect=identifiers
         ):
             result = execute(self.claim_path, self.envelope)
         self.assertEqual(sentinel.read_bytes(), b"preserve-me")
@@ -1022,10 +1018,10 @@ class ExecutionTests(unittest.TestCase):
         self._execution_records.mkdir(parents=True, exist_ok=True)
         sentinel = self._execution_records / ("execution-" + "a" * 32 + ".json")
         sentinel.write_bytes(b"preserve-me")
-        fixed = types.SimpleNamespace(hex="a" * 32)
+        fixed = "a" * 32
         with (
             mock.patch.object(
-                execution_module.uuid, "uuid4", side_effect=[fixed] * 130
+                execution_module, "_identifier", side_effect=[fixed] * 130
             ) as ids,
             self.assertRaises(ExecutionError) as raised,
         ):
