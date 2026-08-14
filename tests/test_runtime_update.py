@@ -217,39 +217,33 @@ class RuntimeUpdateTests(unittest.TestCase):
             self.candidate / "runtime-package.json",
             self.candidate / "ao2",
         )
-        identities = {path: object() for path in paths}
+
+        @contextmanager
+        def accept_retained(root, members):
+            self.assertEqual(root, paths[0])
+            self.assertEqual(members, paths[1:])
+            yield
+
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.open_identity",
-                side_effect=lambda path: identities[path],
-                create=True,
-            ) as opened,
-            mock.patch("internal.runtime_update.require_within", create=True) as contained,
+                "internal.runtime_update.retain_identities",
+                new=accept_retained,
+            ),
         ):
             manifest, _, _ = updater._package(self.candidate)
         self.assertEqual(manifest["version"], "v2")
-        self.assertEqual(opened.call_args_list, [mock.call(path) for path in paths])
-        expected_containment = [
-            mock.call(identities[paths[0]], identities[paths[0]]),
-            mock.call(identities[paths[1]], identities[paths[0]]),
-            mock.call(identities[paths[2]], identities[paths[0]]),
-        ]
-        self.assertEqual(
-            contained.call_args_list,
-            expected_containment + expected_containment,
-        )
 
-        identity = object()
+        @contextmanager
+        def reject_reparse(_root, _members):
+            raise ValueError("reparse-point ancestor")
+            yield
+
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.open_identity", return_value=identity, create=True
-            ),
-            mock.patch(
-                "internal.runtime_update.require_within",
-                side_effect=ValueError("reparse-point ancestor"),
-                create=True,
+                "internal.runtime_update.retain_identities",
+                new=reject_reparse,
             ),
         ):
             with self.assertRaises(RuntimeUpdateError) as raised:
@@ -261,30 +255,55 @@ class RuntimeUpdateTests(unittest.TestCase):
         # MUTATION: entry-only containment accepts a manifest replaced after
         # its identity was captured but before the package is consumed.
         updater = RuntimeUpdate(self.root)
-        paths = (
-            self.candidate,
-            self.candidate / "runtime-package.json",
-            self.candidate / "ao2",
-        )
-        identities = {path: object() for path in paths}
-        manifest_checks = 0
-
-        def reject_replaced_manifest(child, _root):
-            nonlocal manifest_checks
-            if child is identities[paths[1]]:
-                manifest_checks += 1
-                if manifest_checks == 2:
-                    raise ValueError("manifest identity changed")
+        @contextmanager
+        def reject_replaced_manifest(_root, _members):
+            yield
+            raise ValueError("manifest identity changed")
 
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.open_identity",
-                side_effect=lambda path: identities[path],
+                "internal.runtime_update.retain_identities",
+                new=reject_replaced_manifest,
+            ),
+        ):
+            with self.assertRaises(RuntimeUpdateError) as raised:
+                updater._package(self.candidate)
+
+        self.assertEqual(raised.exception.code, "runtime-package-invalid")
+
+    def test_windows_candidate_aba_bytes_fail_retained_identity(self):
+        # MUTATION: equal pre/post FileIdentity snapshots accept replacement
+        # bytes read during an ABA swap.
+        updater = RuntimeUpdate(self.root)
+        manifest = json.loads((self.candidate / "runtime-package.json").read_bytes())
+        replacement_asset = b"replacement runtime bytes\n"
+        manifest["sha256"] = hashlib.sha256(replacement_asset).hexdigest()
+        replacement_manifest = _canonical(manifest)
+        real_read = runtime_update_module._read_regular
+
+        def replacement_read(path, limit):
+            if Path(path).name == "runtime-package.json":
+                return replacement_manifest
+            if Path(path).name == "ao2":
+                return replacement_asset
+            return real_read(path, limit)
+
+        @contextmanager
+        def reject_retained_aba(_root, _members):
+            yield
+            raise ValueError("path no longer names retained handle")
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
+            mock.patch(
+                "internal.runtime_update.retain_identities",
+                new=reject_retained_aba,
+                create=True,
             ),
             mock.patch(
-                "internal.runtime_update.require_within",
-                side_effect=reject_replaced_manifest,
+                "internal.runtime_update._read_regular",
+                side_effect=replacement_read,
             ),
         ):
             with self.assertRaises(RuntimeUpdateError) as raised:
@@ -303,62 +322,63 @@ class RuntimeUpdateTests(unittest.TestCase):
             staged / "ao2",
             staged / "runtime-anchor.json",
         )
-        identities = {path: object() for path in paths}
+
+        @contextmanager
+        def accept_retained(root, members):
+            self.assertEqual(root, paths[0])
+            self.assertEqual(members, paths[1:])
+            yield
 
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.open_identity",
-                side_effect=lambda path: identities[path],
-            ) as opened,
-            mock.patch("internal.runtime_update.require_within") as contained,
+                "internal.runtime_update.retain_identities",
+                new=accept_retained,
+            ),
         ):
             manifest, _, _ = updater._staged("v2")
 
         self.assertEqual(manifest["version"], "v2")
-        self.assertEqual(opened.call_args_list, [mock.call(path) for path in paths])
-        expected_containment = [
-            mock.call(identities[paths[0]], identities[paths[0]]),
-            *[
-                mock.call(identities[path], identities[paths[0]])
-                for path in paths[1:]
-            ],
-        ]
-        self.assertEqual(
-            contained.call_args_list,
-            expected_containment + expected_containment,
-        )
 
     def test_windows_staged_anchor_replacement_after_read_fails_closed(self):
         # MUTATION: omitting the final staged-member identity check accepts an
         # anchor path replaced after its descriptor read.
         updater = RuntimeUpdate(self.root)
         staged = updater.stage(self.candidate)
-        paths = (
-            staged,
-            staged / "runtime-package.json",
-            staged / "ao2",
-            staged / "runtime-anchor.json",
-        )
-        identities = {path: object() for path in paths}
-        anchor_checks = 0
-
-        def reject_replaced_anchor(child, _root):
-            nonlocal anchor_checks
-            if child is identities[paths[3]]:
-                anchor_checks += 1
-                if anchor_checks == 2:
-                    raise ValueError("anchor identity changed")
+        @contextmanager
+        def reject_replaced_anchor(_root, _members):
+            yield
+            raise ValueError("anchor identity changed")
 
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.open_identity",
-                side_effect=lambda path: identities[path],
+                "internal.runtime_update.retain_identities",
+                new=reject_replaced_anchor,
             ),
+        ):
+            with self.assertRaises(RuntimeUpdateError) as raised:
+                updater._staged("v2")
+
+        self.assertEqual(raised.exception.code, "runtime-package-tampered")
+
+    def test_windows_staged_aba_fails_retained_identity(self):
+        # MUTATION: closing staged-member handles before exact readback lets an
+        # attacker restore the original names after replacement bytes are read.
+        updater = RuntimeUpdate(self.root)
+        updater.stage(self.candidate)
+
+        @contextmanager
+        def reject_retained_aba(_root, _members):
+            yield
+            raise ValueError("staged path no longer names retained handle")
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.require_within",
-                side_effect=reject_replaced_anchor,
+                "internal.runtime_update.retain_identities",
+                new=reject_retained_aba,
+                create=True,
             ),
         ):
             with self.assertRaises(RuntimeUpdateError) as raised:

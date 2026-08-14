@@ -206,13 +206,17 @@ No older P01–P75, 152/152, 171-pass, or independent score can close these rows
 
 The executable release contract names these surfaces:
 
-- `scripts.build_release.build_release` builds the allowlisted archive;
-- `tests.test_release_tree.BuildReleaseTests` tests archive construction;
-- `scripts.verify_release_contract.verify_release_contract` resolves blocker
+- `manifest_builder`: `scripts.build_release.build_release` builds the
+  allowlisted archive;
+- `builder_tests`: `tests.test_release_tree.BuildReleaseTests` tests archive
+  construction;
+- `contract_verifier`:
+  `scripts.verify_release_contract.verify_release_contract` resolves blocker
   tests and the named architecture surfaces;
-- `internal.runtime_update.RuntimeUpdate` finalizes the active runtime;
-- `internal.qualification.Qualification` records the durable qualification
-  lifecycle.
+- `runtime_finalizer`: `internal.runtime_update.RuntimeUpdate` finalizes the
+  active runtime;
+- `qualification_lifecycle`: `internal.qualification.Qualification` records
+  the durable qualification lifecycle.
 
 ## Skills and context economy
 
@@ -236,10 +240,45 @@ Skill rules:
   private paths, metadata, trigger behavior, and forward behavior.
 
 Root `AGENTS.md` and other always-loaded instructions should stay below about
-200 lines and 2,000 tokens. Handoffs preserve paths, decisions, verification,
-blockers, and the exact next action. They do not paste raw files or tool output.
-Ordinary work uses compact routing; reusable, ambiguous, high-risk, critical,
-or explicitly requested work receives stronger gates.
+200 physical lines, 2,000 Markdown tokens, and 100 Unicode characters per
+line. The instruction verifier splits physical lines with Python
+`str.splitlines()`. It tokenizes with the Unicode regular expression
+`\w+|[^\w\s]`. Each word-character run costs at least one token and otherwise
+costs one token per four UTF-8 bytes, rounded up. Each punctuation or symbol
+match costs one token.
+
+The release verifier treats every nonblank line in the following approved
+block as an exact required line in the root `AGENTS.md`:
+
+```root-agent-contract
+Authority: platform-and-user > root-AGENTS > descendant-AGENTS
+Descendants: narrow-only
+- Platform policy and direct user instructions outrank this file.
+- This file applies to the repository unless a descendant `AGENTS.md` narrows its subtree.
+- A descendant file must declare `Authority: inherit-root` and `Descendants: narrow-only`.
+- Descendant rules may add checks or reduce scope. They must not weaken root rules.
+- Work within the requested task. Ask before expanding product scope or external effects.
+- Keep prompts, transcripts, private model output, receipts, keys, tokens, and live state untracked.
+- Keep developer and connected-project absolute paths out of tracked and public artifacts.
+- Build public archives from `manifests/public-tree.json` with the release builder.
+- Do not publish, deploy, send, or mutate upstream systems without direct user authorization.
+- Preserve unrelated user changes and inspect the working tree before edits.
+- Use one behavior-focused RED to reproduce each defect before changing production code.
+- Make the smallest GREEN change, then run focused regressions before the next defect.
+- Treat journals, locks, receipts, manifests, and HMAC records as authority-bearing data.
+- Fail closed on path ambiguity, identity drift, malformed authority, or incomplete recovery.
+- Use fresh command output for test, build, privacy, and completion claims.
+- Run focused tests during development and the full required suite before commit.
+- Parse every shipped schema and scan generated public, protected, and support outputs.
+- Run `git diff --check` and inspect the final diff for scope and private data.
+- Mocked Windows branches on macOS prove portable decision logic only.
+- Reserve native Windows compatibility claims for unchanged bytes tested on a Windows host.
+```
+
+Handoffs preserve paths, decisions, verification, blockers, and the exact next
+action. They do not paste raw files or tool output. Ordinary work uses compact
+routing; reusable, ambiguous, high-risk, critical, or explicitly requested
+work receives stronger gates.
 
 ## Public and private data
 

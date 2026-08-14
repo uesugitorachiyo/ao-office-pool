@@ -17,6 +17,8 @@ from internal.execution import execute
 from internal.governance_witness import issue_witness
 from internal.pool import OFFICE_IDS, Pool
 from internal.qualification import Qualification, QualificationError
+from internal.readback import protected_record, public_record
+from internal.runtime_update import RuntimeUpdate
 from scripts.build_release import build_release
 from tests import test_execution as execution_tests
 
@@ -147,6 +149,104 @@ class QualificationTests(unittest.TestCase):
 
     def _record(self):
         return json.loads((self.root / "updates" / "qualification.json").read_text(encoding="utf-8"))
+
+    def _production_lifecycle(self):
+        asset = self.runtime_bytes
+        runtime_sha256 = hashlib.sha256(asset).hexdigest()
+        component = next(
+            row for row in self.harness.components if row["name"] == "ao2"
+        )
+        released_component = dict(component)
+        version = released_component["version"]
+        commit = released_component["commit"]
+        self.harness.ao2_digest = runtime_sha256
+        installed = self.root / "manifests" / "components.lock.json"
+
+        finalizer = RuntimeUpdate(self.root)
+        transitions = (
+            ("transition-v2", "d" * 40),
+            (version, commit),
+        )
+        for ordinal, (candidate_version, candidate_commit) in enumerate(
+            transitions,
+            1,
+        ):
+            component.update(
+                version=candidate_version,
+                commit=candidate_commit,
+                sha256=runtime_sha256,
+            )
+            self.harness._write_lock()
+            installed.write_bytes(self.harness.lock.read_bytes())
+            candidate = self.base / f"lifecycle-package-{ordinal}"
+            candidate.mkdir()
+            (candidate / "runtime-package.json").write_bytes(
+                _canonical(
+                    {
+                        "schema_version": 1,
+                        "name": "ao2",
+                        "version": candidate_version,
+                        "commit": candidate_commit,
+                        "asset": "ao2",
+                        "sha256": runtime_sha256,
+                    }
+                )
+            )
+            (candidate / "ao2").write_bytes(asset)
+            finalizer.stage(candidate)
+            if ordinal == 1:
+                self.pool.release(self.claim_path)
+            finalizer.activate(candidate_version)
+
+        component.update(released_component)
+        self.harness._write_lock()
+        installed.write_bytes(self.harness.lock.read_bytes())
+
+        lifecycle_pool = Pool(self.root, runtime_version=version)
+        self.pool = lifecycle_pool
+        self.harness.pool = lifecycle_pool
+        self.claim_path = lifecycle_pool.claim(
+            "chat",
+            self.harness.task_text,
+            self.project,
+            "conversation",
+        )
+        self.harness.claim_path = self.claim_path
+        self.execution_fixture.claim_path = self.claim_path
+        self.harness.authority_raw = self.claim_path.read_bytes()
+        self.harness.authority = json.loads(self.harness.authority_raw)
+        self.authority = self.harness.authority
+
+        shutil.rmtree(self.project / ".ao" / "evidence")
+        self.harness._write_mission("ao-foundry")
+        authority_digest = hashlib.sha256(
+            self.harness.authority_raw
+        ).hexdigest()
+        self.mission_path = next(
+            path
+            for path in (
+                self.project / ".ao" / "mission" / "office-pool"
+            ).glob("*.json")
+            if json.loads(path.read_bytes()).get("authority_digest")
+            == authority_digest
+        )
+        self.harness._write_artifacts()
+        self.envelope_path = issue_witness(
+            self.claim_path,
+            self.harness.task_text,
+            self.harness.valid_artifacts(atlas=True),
+        )
+        self.execution_path = execute(
+            self.claim_path,
+            self.envelope_path,
+        ).record
+        self.runtime_bytes = asset
+        self.runtime_sha256 = runtime_sha256
+
+        shutil.rmtree(self.evidence)
+        self.evidence.mkdir()
+        self._write_evidence()
+        return finalizer, lifecycle_pool, version, runtime_sha256
 
     def _governance_marker(self, kind: str) -> Path:
         governance = json.loads(self.envelope_path.read_bytes())
@@ -360,41 +460,33 @@ class QualificationTests(unittest.TestCase):
         qualification = Qualification(self.root)
         member_names = tuple(sorted({*qualification_module._INPUTS, "semantic-inputs.json"}))
         paths = (self.evidence, *(self.evidence / name for name in member_names))
-        identities = {path: object() for path in paths}
+
+        @contextmanager
+        def accept_retained(root, members):
+            self.assertEqual(root, paths[0])
+            self.assertEqual(members, paths[1:])
+            yield
+
         with (
             mock.patch("internal.qualification.os.name", "nt"),
             mock.patch(
-                "internal.qualification.open_identity",
-                side_effect=lambda path: identities[path],
-                create=True,
-            ) as opened,
-            mock.patch("internal.qualification.require_within", create=True) as contained,
+                "internal.qualification.retain_identities",
+                new=accept_retained,
+            ),
         ):
             values, _, _, _ = qualification._evidence(self.evidence)
         self.assertEqual(values["runtime-package.json"]["name"], "ao2")
-        self.assertEqual(opened.call_args_list, [mock.call(path) for path in paths])
-        expected_containment = [
-            mock.call(identities[paths[0]], identities[paths[0]]),
-            *[
-                mock.call(identities[path], identities[paths[0]])
-                for path in paths[1:]
-            ],
-        ]
-        self.assertEqual(
-            contained.call_args_list,
-            expected_containment + expected_containment,
-        )
 
-        identity = object()
+        @contextmanager
+        def reject_reparse(_root, _members):
+            raise ValueError("reparse-point ancestor")
+            yield
+
         with (
             mock.patch("internal.qualification.os.name", "nt"),
             mock.patch(
-                "internal.qualification.open_identity", return_value=identity, create=True
-            ),
-            mock.patch(
-                "internal.qualification.require_within",
-                side_effect=ValueError("reparse-point ancestor"),
-                create=True,
+                "internal.qualification.retain_identities",
+                new=reject_reparse,
             ),
         ):
             with self.assertRaises(QualificationError) as raised:
@@ -408,28 +500,41 @@ class QualificationTests(unittest.TestCase):
         # MUTATION: entry-only evidence containment accepts a semantic manifest
         # replaced after its identity was captured.
         qualification = Qualification(self.root)
-        member_names = tuple(sorted({*qualification_module._INPUTS, "semantic-inputs.json"}))
-        paths = (self.evidence, *(self.evidence / name for name in member_names))
-        identities = {path: object() for path in paths}
-        semantic = self.evidence / "semantic-inputs.json"
-        semantic_checks = 0
-
-        def reject_replaced_semantic(child, _root):
-            nonlocal semantic_checks
-            if child is identities[semantic]:
-                semantic_checks += 1
-                if semantic_checks == 2:
-                    raise ValueError("semantic manifest identity changed")
+        @contextmanager
+        def reject_replaced_semantic(_root, _members):
+            yield
+            raise ValueError("semantic manifest identity changed")
 
         with (
             mock.patch("internal.qualification.os.name", "nt"),
             mock.patch(
-                "internal.qualification.open_identity",
-                side_effect=lambda path: identities[path],
+                "internal.qualification.retain_identities",
+                new=reject_replaced_semantic,
             ),
+        ):
+            with self.assertRaises(QualificationError) as raised:
+                qualification._evidence(self.evidence)
+
+        self.assertEqual(
+            raised.exception.code, "qualification-evidence-set-mismatch"
+        )
+
+    def test_windows_evidence_aba_bytes_fail_retained_identity(self):
+        # MUTATION: equal pre/post snapshots accept evidence bytes read while a
+        # named member temporarily refers to a replacement.
+        qualification = Qualification(self.root)
+
+        @contextmanager
+        def reject_retained_aba(_root, _members):
+            yield
+            raise ValueError("evidence path no longer names retained handle")
+
+        with (
+            mock.patch("internal.qualification.os.name", "nt"),
             mock.patch(
-                "internal.qualification.require_within",
-                side_effect=reject_replaced_semantic,
+                "internal.qualification.retain_identities",
+                new=reject_retained_aba,
+                create=True,
             ),
         ):
             with self.assertRaises(QualificationError) as raised:
@@ -503,20 +608,22 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "qualification-critical-matrix-mismatch")
 
     def test_readability_gates_preserve_semantics(self):
-        # MUTATION: a token-only gate permits unreadable physical-line compression.
+        # MUTATION: substituting words for Markdown tokens accepts punctuation-
+        # dense instructions far beyond the approved context budget.
         verifier = self._release_contract_module()
         repository = Path(__file__).parents[1]
         metrics = verifier.verify_instruction_contract(repository)
         root_metrics = metrics["AGENTS.md"]
         self.assertLessEqual(root_metrics["lines"], 200)
-        self.assertLessEqual(root_metrics["words"], 2000)
+        self.assertLessEqual(root_metrics["markdown_tokens"], 2000)
         self.assertLessEqual(root_metrics["max_line"], 100)
+        self.assertNotIn("words", root_metrics)
 
         original = (repository / "AGENTS.md").read_text(encoding="utf-8")
         lines = original.splitlines()
         violations = {
-            "physical-lines": "\n".join(lines + [""] * (201 - len(lines))) + "\n",
-            "word-count": original + (("word " * 19 + "word\n") * 100),
+            "physical-lines": original + ("x\n" * (201 - len(lines))),
+            "markdown-tokens": original + (("!" * 80 + "\n") * 30),
             "line-length": original + ("x" * 101 + "\n"),
         }
         for name, content in violations.items():
@@ -527,11 +634,37 @@ class QualificationTests(unittest.TestCase):
                     verifier.verify_instruction_contract(sample)
 
     def test_root_authority_order(self):
-        # MUTATION: allowing a descendant to override root authority weakens
-        # repository-wide privacy and verification rules.
+        # MUTATION: checking two self-owned headers ignores required scope,
+        # privacy, development, and verification semantics.
         verifier = self._release_contract_module()
         repository = Path(__file__).parents[1]
         verifier.verify_instruction_contract(repository)
+
+        specification = (
+            repository
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-10-ao-office-pool-design.md"
+        ).read_text(encoding="utf-8")
+        marker = "```root-agent-contract\n"
+        self.assertIn(marker, specification)
+        approved = specification.split(marker, 1)[1].split("```", 1)[0]
+        required_lines = tuple(
+            line for line in approved.splitlines() if line.strip()
+        )
+        self.assertGreaterEqual(len(required_lines), 12)
+
+        original = (repository / "AGENTS.md").read_text(encoding="utf-8")
+        for line in required_lines:
+            with self.subTest(required_line=line), tempfile.TemporaryDirectory() as directory:
+                sample = Path(directory)
+                (sample / "AGENTS.md").write_text(
+                    original.replace(line + "\n", "", 1),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError):
+                    verifier.verify_instruction_contract(sample)
 
         with tempfile.TemporaryDirectory() as directory:
             sample = Path(directory)
@@ -642,31 +775,105 @@ class QualificationTests(unittest.TestCase):
         )
 
     def test_lifecycle_authorities_agree(self):
-        # MUTATION: architecture that omits the verifier, runtime finalizer, or
-        # qualification lifecycle can accept evidence for another runtime.
+        # MUTATION: string/callable self-attestation can report agreement without
+        # a production runtime transition and active qualification readback.
         verifier = self._release_contract_module()
-        contract = verifier.verify_release_contract(Path(__file__).parents[1])
-        self.assertEqual(
-            contract["surfaces"]["contract_verifier"],
-            "scripts.verify_release_contract.verify_release_contract",
+        repository = Path(__file__).parents[1]
+        _finalizer, lifecycle_pool, version, runtime_sha256 = (
+            self._production_lifecycle()
         )
-        self.assertEqual(
-            contract["surfaces"]["runtime_finalizer"],
-            "internal.runtime_update.RuntimeUpdate",
-        )
-        self.assertEqual(
-            contract["surfaces"]["qualification_lifecycle"],
-            "internal.qualification.Qualification",
-        )
+        record_path = Qualification(self.root).promote(self.evidence, "candidate")
+        record = json.loads(record_path.read_bytes())
+        status = lifecycle_pool.public_status()
+        public = public_record(self.root, status, record)
+        protected = protected_record(self.root, status, record)
 
-        execution = json.loads((self.evidence / "execution-record.json").read_text())
-        execution["ao2_sha256"] = "f" * 64
-        execution["record_digest"] = _digest_value({key: value for key, value in execution.items() if key != "record_digest"})
-        self._write("execution-record.json", execution)
-        self._rewrite_semantic_manifest()
-        with self.assertRaises(QualificationError) as raised:
-            Qualification(self.root).promote(self.evidence, "candidate")
-        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+        self.assertTrue(hasattr(verifier, "verify_lifecycle_contract"))
+        agreement = verifier.verify_lifecycle_contract(repository, self.root)
+        semantic_inputs = json.loads(
+            (self.evidence / "semantic-inputs.json").read_bytes()
+        )["inputs"]
+        expected = {
+            "runtime_version": version,
+            "runtime_sha256": runtime_sha256,
+            "components_sha256": hashlib.sha256(
+                self.harness.lock.read_bytes()
+            ).hexdigest(),
+            "semantic_fingerprint": _digest_value(
+                sorted(semantic_inputs, key=lambda item: item["name"])
+            ),
+            "qualification_state": "candidate",
+            "record_digest": _digest_value(
+                {
+                    name: value
+                    for name, value in record.items()
+                    if name != "record_digest"
+                }
+            ),
+        }
+        self.assertEqual(agreement["identities"], expected)
+        self.assertEqual(public["runtime_version"], version)
+        self.assertEqual(protected["runtime"]["sha256"], runtime_sha256)
+
+        office_runtime = (
+            self.root
+            / "offices"
+            / "O3"
+            / "runtime"
+            / "versions"
+            / version
+            / "ao2"
+        )
+        runtime_raw = office_runtime.read_bytes()
+        office_runtime.write_bytes(b"tampered finalizer bytes\n")
+        with self.assertRaises(ValueError):
+            verifier.verify_lifecycle_contract(repository, self.root)
+        office_runtime.write_bytes(runtime_raw)
+
+        qualification_raw = record_path.read_bytes()
+        changed = dict(record)
+        changed["runtime_sha256"] = "f" * 64
+        changed["record_digest"] = _digest_value(
+            {
+                name: value
+                for name, value in changed.items()
+                if name != "record_digest"
+            }
+        )
+        record_path.write_bytes(_canonical(changed))
+        with self.assertRaises(ValueError):
+            verifier.verify_lifecycle_contract(repository, self.root)
+        record_path.write_bytes(qualification_raw)
+
+        contract_root = self.base / "verifier-boundary"
+        (contract_root / "docs" / "superpowers" / "specs").mkdir(parents=True)
+        (contract_root / "manifests").mkdir()
+        shutil.copy2(repository / "AGENTS.md", contract_root / "AGENTS.md")
+        shutil.copy2(
+            repository / "manifests" / "requirements.json",
+            contract_root / "manifests" / "requirements.json",
+        )
+        design = (
+            repository
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-10-ao-office-pool-design.md"
+        ).read_text(encoding="utf-8")
+        changed_design = design.replace(
+            "`internal.runtime_update.RuntimeUpdate` finalizes",
+            "`internal.runtime_update.MissingFinalizer` finalizes",
+            1,
+        )
+        (
+            contract_root
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-10-ao-office-pool-design.md"
+        ).write_text(changed_design, encoding="utf-8")
+        with self.assertRaises(ValueError):
+            verifier.verify_lifecycle_contract(contract_root, self.root)
 
     def test_component_identity_is_bound_to_the_installed_independent_lock(self):
         # MUTATION: checking only self-consistent evidence lets every component identity be replaced.

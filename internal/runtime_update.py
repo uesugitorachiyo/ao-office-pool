@@ -5,12 +5,13 @@ import os
 import shutil
 import stat
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 from internal.mission_bridge import _validate_schema
 from internal.pool import OFFICE_IDS, Pool, PoolError
 from internal.transactions import atomic_write_json, read_json
-from internal.windows_identity import open_identity, require_within
+from internal.windows_identity import retain_identities
 from internal.windows_paths import validate_segment
 
 
@@ -107,26 +108,6 @@ def _create_bytes(path: Path, data: bytes) -> None:
             os.close(parent)
 
 
-def _retain_windows_members(root: Path, names: tuple[str, ...]):
-    if os.name != "nt":
-        return None
-    root_identity = open_identity(root)
-    member_identities = tuple(open_identity(root / name) for name in names)
-    require_within(root_identity, root_identity)
-    for member_identity in member_identities:
-        require_within(member_identity, root_identity)
-    return root_identity, member_identities
-
-
-def _recheck_windows_members(identities) -> None:
-    if identities is None:
-        return
-    root_identity, member_identities = identities
-    require_within(root_identity, root_identity)
-    for member_identity in member_identities:
-        require_within(member_identity, root_identity)
-
-
 class RuntimeUpdate:
     def __init__(
         self,
@@ -180,12 +161,17 @@ class RuntimeUpdate:
             if not isinstance(candidate, Path) or candidate.is_symlink():
                 raise ValueError("unsafe candidate")
             candidate = candidate.resolve(strict=True)
-            identities = _retain_windows_members(candidate, (_MANIFEST, _ASSET))
-            if not candidate.is_dir() or {path.name for path in candidate.iterdir()} != {_MANIFEST, _ASSET}:
-                raise ValueError("unexpected package members")
-            manifest_raw = _read_regular(candidate / _MANIFEST, 64 * 1024)
-            asset_raw = _read_regular(candidate / _ASSET, _MAX_ASSET)
-            _recheck_windows_members(identities)
+            members = (candidate / _MANIFEST, candidate / _ASSET)
+            retained = (
+                retain_identities(candidate, members)
+                if os.name == "nt"
+                else nullcontext()
+            )
+            with retained:
+                if not candidate.is_dir() or {path.name for path in candidate.iterdir()} != {_MANIFEST, _ASSET}:
+                    raise ValueError("unexpected package members")
+                manifest_raw = _read_regular(candidate / _MANIFEST, 64 * 1024)
+                asset_raw = _read_regular(candidate / _ASSET, _MAX_ASSET)
             manifest = _strict_object(manifest_raw)
             _validate_schema(manifest, RUNTIME_SCHEMA)
             validate_segment(manifest["version"])
@@ -307,16 +293,20 @@ class RuntimeUpdate:
         try:
             version = validate_segment(version)
             target = self.root / "components" / "ao2" / version
-            identities = _retain_windows_members(
-                target,
-                (_MANIFEST, _ASSET, _ANCHOR),
+            members = tuple(
+                target / name for name in (_MANIFEST, _ASSET, _ANCHOR)
             )
-            if target.is_symlink() or not target.is_dir() or {path.name for path in target.iterdir()} != {_MANIFEST, _ASSET, _ANCHOR}:
-                raise ValueError("missing staged package")
-            manifest_raw = _read_regular(target / _MANIFEST, 64 * 1024)
-            asset_raw = _read_regular(target / _ASSET, _MAX_ASSET)
-            anchor_raw = _read_regular(target / _ANCHOR, 2048)
-            _recheck_windows_members(identities)
+            retained = (
+                retain_identities(target, members)
+                if os.name == "nt"
+                else nullcontext()
+            )
+            with retained:
+                if target.is_symlink() or not target.is_dir() or {path.name for path in target.iterdir()} != {_MANIFEST, _ASSET, _ANCHOR}:
+                    raise ValueError("missing staged package")
+                manifest_raw = _read_regular(target / _MANIFEST, 64 * 1024)
+                asset_raw = _read_regular(target / _ASSET, _MAX_ASSET)
+                anchor_raw = _read_regular(target / _ANCHOR, 2048)
             manifest = _strict_object(manifest_raw)
             _validate_schema(manifest, RUNTIME_SCHEMA)
             anchor = _strict_object(anchor_raw)

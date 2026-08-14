@@ -2,12 +2,21 @@ import os
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest import mock
+
+import internal.windows_identity as windows_identity
 
 try:
     from internal.windows_identity import FileIdentity, open_identity, require_within
 except ImportError:
     FileIdentity = open_identity = require_within = None
+
+RetainedIdentity = getattr(windows_identity, "RetainedIdentity", None)
+open_retained_identity = getattr(windows_identity, "open_retained_identity", None)
+require_path_identity = getattr(windows_identity, "require_path_identity", None)
+require_retained_within = getattr(windows_identity, "require_retained_within", None)
+retain_identities = getattr(windows_identity, "retain_identities", None)
 
 try:
     from internal.mission_bridge import (
@@ -25,6 +34,11 @@ class WindowsIdentityApiTests(unittest.TestCase):
         self.assertIsNotNone(FileIdentity)
         self.assertIsNotNone(open_identity)
         self.assertIsNotNone(require_within)
+        self.assertIsNotNone(RetainedIdentity)
+        self.assertIsNotNone(open_retained_identity)
+        self.assertIsNotNone(require_path_identity)
+        self.assertIsNotNone(require_retained_within)
+        self.assertIsNotNone(retain_identities)
         self.assertIsNotNone(_open_retained_file)
 
     @unittest.skipIf(open_identity is None or os.name == "nt", "off-Windows behavior only")
@@ -34,6 +48,113 @@ class WindowsIdentityApiTests(unittest.TestCase):
             open_identity(Path.cwd())
         with self.assertRaises(OSError):
             require_within(None, None)
+
+
+@unittest.skipIf(
+    open_retained_identity is None,
+    "retained Windows identity API is missing",
+)
+class RetainedWindowsIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _identity(path: Path, marker: int, *, directory: bool = False):
+        key = (marker, marker.to_bytes(16, "big"))
+        return FileIdentity(
+            path=path,
+            final_path=PureWindowsPath("C:/fixture") / path.name,
+            volume_serial_number=key[0],
+            file_id=key[1],
+            ancestor_ids=(key,),
+            link_count=1,
+            is_directory=directory,
+            traversed_reparse_point=False,
+        )
+
+    def test_retained_handle_denies_write_delete_sharing_and_closes(self):
+        # MUTATION: permitting write/delete sharing reopens the ABA window.
+        path = Path("C:/fixture/candidate.json")
+        identity = self._identity(path, 7)
+        library = mock.Mock()
+        library.CloseHandle.return_value = 1
+        with (
+            mock.patch("internal.windows_identity._require_windows"),
+            mock.patch(
+                "internal.windows_identity._open_handle",
+                return_value=(library, 41),
+            ) as opened,
+            mock.patch(
+                "internal.windows_identity._identity_from_handle",
+                return_value=identity,
+            ),
+        ):
+            with open_retained_identity(path) as retained:
+                self.assertEqual(retained.identity, identity)
+
+        opened.assert_called_once_with(
+            PureWindowsPath("C:/fixture/candidate.json"),
+            share_mode=windows_identity._FILE_SHARE_READ,
+        )
+        library.CloseHandle.assert_called_once_with(41)
+
+    def test_identity_failure_closes_the_new_native_handle(self):
+        # MUTATION: an exception during identity capture leaks the blocking handle.
+        library = mock.Mock()
+        library.CloseHandle.return_value = 1
+        with (
+            mock.patch("internal.windows_identity._require_windows"),
+            mock.patch(
+                "internal.windows_identity._open_handle",
+                return_value=(library, 52),
+            ),
+            mock.patch(
+                "internal.windows_identity._identity_from_handle",
+                side_effect=OSError("identity failed"),
+            ),
+        ):
+            with self.assertRaises(OSError):
+                open_retained_identity(Path("C:/fixture/member.json"))
+
+        library.CloseHandle.assert_called_once_with(52)
+
+    def test_aba_snapshots_match_but_path_to_retained_handle_rejects(self):
+        # MUTATION: comparing only equal pre/post path snapshots accepts bytes
+        # read from a replacement that was restored before the second snapshot.
+        path = Path("C:/fixture/member.json")
+        original = self._identity(path, 11)
+        replacement = self._identity(path, 12)
+        library = mock.Mock()
+        library.CloseHandle.return_value = 1
+        with (
+            mock.patch("internal.windows_identity._require_windows"),
+            mock.patch(
+                "internal.windows_identity._open_handle",
+                return_value=(library, 63),
+            ),
+            mock.patch(
+                "internal.windows_identity._identity_from_handle",
+                return_value=replacement,
+            ),
+            mock.patch(
+                "internal.windows_identity._handle_snapshot",
+                return_value=(
+                    replacement.key,
+                    replacement.final_path,
+                    0,
+                    replacement.link_count,
+                ),
+            ),
+        ):
+            with open_retained_identity(path) as retained:
+                before = original
+                replacement_bytes = b"malicious replacement bytes"
+                after = original
+                self.assertEqual(before, after)
+                self.assertNotEqual(replacement_bytes, b"original bytes")
+                with mock.patch(
+                    "internal.windows_identity.open_identity",
+                    return_value=after,
+                ):
+                    with self.assertRaises(ValueError):
+                        require_path_identity(retained)
 
 
 @unittest.skipUnless(os.name == "nt", "physical NTFS tests require Windows")

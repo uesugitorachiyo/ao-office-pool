@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import stat
+from contextlib import nullcontext
 from pathlib import Path
 
 from internal import governance_witness
@@ -16,7 +17,7 @@ from internal.mission_bridge import (
 )
 from internal.pool import AUTHORITY_FIELDS, OFFICE_IDS, Pool, PoolError
 from internal.transactions import atomic_write_json, read_json
-from internal.windows_identity import open_identity, require_within
+from internal.windows_identity import retain_identities
 from scripts.verify_requirements import verify_requirements_data
 
 
@@ -96,26 +97,6 @@ def _read_regular(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _retain_windows_members(root: Path, names: tuple[str, ...]):
-    if os.name != "nt":
-        return None
-    root_identity = open_identity(root)
-    member_identities = tuple(open_identity(root / name) for name in names)
-    require_within(root_identity, root_identity)
-    for member_identity in member_identities:
-        require_within(member_identity, root_identity)
-    return root_identity, member_identities
-
-
-def _recheck_windows_members(identities) -> None:
-    if identities is None:
-        return
-    root_identity, member_identities = identities
-    require_within(root_identity, root_identity)
-    for member_identity in member_identities:
-        require_within(member_identity, root_identity)
-
-
 class Qualification:
     def __init__(self, root: Path):
         if not isinstance(root, Path):
@@ -142,12 +123,17 @@ class Qualification:
             root = evidence_set.resolve(strict=True)
             expected = {*_INPUTS, "semantic-inputs.json"}
             member_names = tuple(sorted(expected))
-            identities = _retain_windows_members(root, member_names)
-            members = {path.name for path in root.iterdir()}
-            if not root.is_dir() or members != expected:
-                raise QualificationError("qualification-evidence-set-mismatch")
-            raw = {name: _read_regular(root / name) for name in member_names}
-            _recheck_windows_members(identities)
+            member_paths = tuple(root / name for name in member_names)
+            retained = (
+                retain_identities(root, member_paths)
+                if os.name == "nt"
+                else nullcontext()
+            )
+            with retained:
+                members = {path.name for path in root.iterdir()}
+                if not root.is_dir() or members != expected:
+                    raise QualificationError("qualification-evidence-set-mismatch")
+                raw = {name: _read_regular(root / name) for name in member_names}
             values = {name: _strict_object(member) for name, member in raw.items()}
             semantic = values["semantic-inputs.json"]
             if set(semantic) != {"schema_version", "inputs"} or semantic["schema_version"] != 1 or not isinstance(semantic["inputs"], list):
