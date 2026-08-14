@@ -1,15 +1,22 @@
 import hashlib
+import hmac
 import json
 import multiprocessing
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from internal import runtime_update as runtime_update_module
 from internal.pool import OFFICE_IDS, Pool, PoolError
 from internal.runtime_update import RuntimeUpdate, RuntimeUpdateError
+
+
+def _canonical(value: dict) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -109,6 +116,16 @@ class RuntimeUpdateTests(unittest.TestCase):
             for office_id in OFFICE_IDS
         ]
 
+    def _runtime_snapshot(self) -> dict[str, list[tuple[str, bytes]]]:
+        return {
+            office: [
+                (path.relative_to(self.root / "offices" / office).as_posix(), path.read_bytes())
+                for path in sorted((self.root / "offices" / office).rglob("*"))
+                if path.is_file()
+            ]
+            for office in OFFICE_IDS
+        }
+
     def _assert_v1_unchanged(self):
         self.assertEqual(json.loads((self.root / "pool.json").read_text())["runtime_version"], "v1")
         self.assertEqual(self._runtime_bytes("v1"), [self.old_bytes] * 5)
@@ -195,19 +212,35 @@ class RuntimeUpdateTests(unittest.TestCase):
     def test_windows_candidate_root_reparse_ancestors_fail_closed(self):
         # MUTATION: resolve plus leaf checks do not reject a junction ancestor on Windows.
         updater = RuntimeUpdate(self.root)
-        identity = object()
+        paths = (
+            self.candidate,
+            self.candidate / "runtime-package.json",
+            self.candidate / "ao2",
+        )
+        identities = {path: object() for path in paths}
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
-                "internal.runtime_update.open_identity", return_value=identity, create=True
+                "internal.runtime_update.open_identity",
+                side_effect=lambda path: identities[path],
+                create=True,
             ) as opened,
             mock.patch("internal.runtime_update.require_within", create=True) as contained,
         ):
             manifest, _, _ = updater._package(self.candidate)
         self.assertEqual(manifest["version"], "v2")
-        opened.assert_called_once_with(self.candidate)
-        contained.assert_called_once_with(identity, identity)
+        self.assertEqual(opened.call_args_list, [mock.call(path) for path in paths])
+        expected_containment = [
+            mock.call(identities[paths[0]], identities[paths[0]]),
+            mock.call(identities[paths[1]], identities[paths[0]]),
+            mock.call(identities[paths[2]], identities[paths[0]]),
+        ]
+        self.assertEqual(
+            contained.call_args_list,
+            expected_containment + expected_containment,
+        )
 
+        identity = object()
         with (
             mock.patch("internal.runtime_update.os.name", "nt"),
             mock.patch(
@@ -223,6 +256,115 @@ class RuntimeUpdateTests(unittest.TestCase):
                 updater._package(self.candidate)
 
         self.assertEqual(raised.exception.code, "runtime-package-invalid")
+
+    def test_windows_candidate_member_replacement_after_read_fails_closed(self):
+        # MUTATION: entry-only containment accepts a manifest replaced after
+        # its identity was captured but before the package is consumed.
+        updater = RuntimeUpdate(self.root)
+        paths = (
+            self.candidate,
+            self.candidate / "runtime-package.json",
+            self.candidate / "ao2",
+        )
+        identities = {path: object() for path in paths}
+        manifest_checks = 0
+
+        def reject_replaced_manifest(child, _root):
+            nonlocal manifest_checks
+            if child is identities[paths[1]]:
+                manifest_checks += 1
+                if manifest_checks == 2:
+                    raise ValueError("manifest identity changed")
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
+            mock.patch(
+                "internal.runtime_update.open_identity",
+                side_effect=lambda path: identities[path],
+            ),
+            mock.patch(
+                "internal.runtime_update.require_within",
+                side_effect=reject_replaced_manifest,
+            ),
+        ):
+            with self.assertRaises(RuntimeUpdateError) as raised:
+                updater._package(self.candidate)
+
+        self.assertEqual(raised.exception.code, "runtime-package-invalid")
+
+    def test_windows_staged_package_retains_root_and_member_identities(self):
+        # MUTATION: descriptor stability alone does not retain the Windows
+        # physical identities of the staged root and its named members.
+        updater = RuntimeUpdate(self.root)
+        staged = updater.stage(self.candidate)
+        paths = (
+            staged,
+            staged / "runtime-package.json",
+            staged / "ao2",
+            staged / "runtime-anchor.json",
+        )
+        identities = {path: object() for path in paths}
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
+            mock.patch(
+                "internal.runtime_update.open_identity",
+                side_effect=lambda path: identities[path],
+            ) as opened,
+            mock.patch("internal.runtime_update.require_within") as contained,
+        ):
+            manifest, _, _ = updater._staged("v2")
+
+        self.assertEqual(manifest["version"], "v2")
+        self.assertEqual(opened.call_args_list, [mock.call(path) for path in paths])
+        expected_containment = [
+            mock.call(identities[paths[0]], identities[paths[0]]),
+            *[
+                mock.call(identities[path], identities[paths[0]])
+                for path in paths[1:]
+            ],
+        ]
+        self.assertEqual(
+            contained.call_args_list,
+            expected_containment + expected_containment,
+        )
+
+    def test_windows_staged_anchor_replacement_after_read_fails_closed(self):
+        # MUTATION: omitting the final staged-member identity check accepts an
+        # anchor path replaced after its descriptor read.
+        updater = RuntimeUpdate(self.root)
+        staged = updater.stage(self.candidate)
+        paths = (
+            staged,
+            staged / "runtime-package.json",
+            staged / "ao2",
+            staged / "runtime-anchor.json",
+        )
+        identities = {path: object() for path in paths}
+        anchor_checks = 0
+
+        def reject_replaced_anchor(child, _root):
+            nonlocal anchor_checks
+            if child is identities[paths[3]]:
+                anchor_checks += 1
+                if anchor_checks == 2:
+                    raise ValueError("anchor identity changed")
+
+        with (
+            mock.patch("internal.runtime_update.os.name", "nt"),
+            mock.patch(
+                "internal.runtime_update.open_identity",
+                side_effect=lambda path: identities[path],
+            ),
+            mock.patch(
+                "internal.runtime_update.require_within",
+                side_effect=reject_replaced_anchor,
+            ),
+        ):
+            with self.assertRaises(RuntimeUpdateError) as raised:
+                updater._staged("v2")
+
+        self.assertEqual(raised.exception.code, "runtime-package-tampered")
 
     def test_independent_trust_anchor_detects_substitution(self):
         # MUTATION: rechecking only the staged manifest accepts executable-plus-manifest replacement.
@@ -258,6 +400,68 @@ class RuntimeUpdateTests(unittest.TestCase):
             {path.name for path in staged.iterdir()},
             {"runtime-package.json", "ao2", "runtime-anchor.json"},
         )
+
+    def test_stage_captures_package_and_component_authority_inside_pool_lock(self):
+        # MUTATION: reading either input before the Pool lock permits a stale
+        # candidate/authority pair to be staged after a concurrent transition.
+        updater = RuntimeUpdate(self.root)
+        real_locked = Pool._locked
+        real_package = updater._package
+        real_read_regular = runtime_update_module._read_regular
+        state = {"lock_depth": 0, "package": False, "component_lock": False}
+
+        @contextmanager
+        def tracked_locked(pool, *args, **kwargs):
+            with real_locked(pool, *args, **kwargs):
+                state["lock_depth"] += 1
+                try:
+                    yield
+                finally:
+                    state["lock_depth"] -= 1
+
+        def tracked_package(candidate):
+            self.assertGreater(state["lock_depth"], 0)
+            state["package"] = True
+            return real_package(candidate)
+
+        def tracked_read_regular(path, limit):
+            if Path(path) == updater._lock_manifest:
+                self.assertGreater(state["lock_depth"], 0)
+                state["component_lock"] = True
+            return real_read_regular(path, limit)
+
+        with (
+            mock.patch.object(Pool, "_locked", new=tracked_locked),
+            mock.patch.object(updater, "_package", side_effect=tracked_package),
+            mock.patch(
+                "internal.runtime_update._read_regular",
+                side_effect=tracked_read_regular,
+            ),
+        ):
+            updater.stage(self.candidate)
+
+        self.assertTrue(state["package"])
+        self.assertTrue(state["component_lock"])
+
+    def test_activation_rejects_component_authority_drift_after_stage(self):
+        # MUTATION: authenticating only the staged manifest and asset lets an
+        # obsolete installed component authority activate later.
+        updater = RuntimeUpdate(self.root)
+        updater.stage(self.candidate)
+        replacement = b"future runtime v3\n"
+        _write_json(
+            self.root / "manifests" / "components.lock.json",
+            {
+                "schema_version": 1,
+                "components": [self._component("v3", replacement)],
+            },
+        )
+
+        with self.assertRaises(RuntimeUpdateError) as raised:
+            updater.activate("v2")
+
+        self.assertEqual(raised.exception.code, "runtime-package-tampered")
+        self._assert_v1_unchanged()
 
     def test_staged_anchor_is_authenticated_against_coordinated_substitution(self):
         # MUTATION: an unkeyed digest anchor can be rewritten with package and executable.
@@ -341,6 +545,46 @@ class RuntimeUpdateTests(unittest.TestCase):
 
         self.assertTrue(all(office["status"] == "free" for office in status["offices"]))
         self._assert_v1_unchanged()
+
+    def test_pending_recovery_rejects_empty_rekeyed_hmac_before_runtime_mutation(self):
+        # MUTATION: validating the exact key only after recovery lets an empty key
+        # authenticate a rewritten journal and mutate runtime bytes before rejection.
+        RuntimeUpdate(self.root).stage(self.candidate)
+        process = multiprocessing.Process(target=_abrupt_activation, args=(str(self.root),))
+        process.start()
+        process.join(10)
+        self.assertEqual(process.exitcode, 98)
+
+        key = self.root / "operator-secrets" / "governance-witness.key"
+        key.write_bytes(b"")
+        journal_path = self.root / "updates" / "runtime-transaction.json"
+        journal = json.loads(journal_path.read_bytes())
+        journal_payload = {
+            name: member for name, member in journal.items() if name != "journal_tag"
+        }
+        journal["journal_tag"] = hmac.new(
+            b"",
+            b"runtime-update-journal\0" + _canonical(journal_payload),
+            hashlib.sha256,
+        ).hexdigest()
+        _write_json(journal_path, journal)
+
+        state_path = self.root / "runtime" / "runtime-update-state.json"
+        state = json.loads(state_path.read_bytes())
+        state_payload = {"schema_version": 1, "completed": state["completed"]}
+        state["state_tag"] = hmac.new(
+            b"",
+            b"runtime-update-state\0" + _canonical(state_payload),
+            hashlib.sha256,
+        ).hexdigest()
+        _write_json(state_path, state)
+        before = self._runtime_snapshot()
+
+        with self.assertRaises(PoolError) as raised:
+            Pool(self.root, runtime_version="v1").public_status()
+
+        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertEqual(self._runtime_snapshot(), before)
 
     def test_linked_component_root_never_receives_staged_bytes(self):
         # MUTATION: lexical component containment writes a verified package through a link.
@@ -438,15 +682,70 @@ class RuntimeUpdateTests(unittest.TestCase):
         transaction.mkdir(parents=True)
         (self.root / "updates" / "runtime-transaction.json").write_bytes(captured)
 
-        with self.assertRaises(PoolError) as raised:
-            Pool(self.root, runtime_version="v2").public_status()
+        status = Pool(self.root, runtime_version="v2").public_status()
 
-        self.assertEqual(raised.exception.code, "recovery-required")
+        self.assertTrue(all(office["status"] == "free" for office in status["offices"]))
         self.assertEqual(
             json.loads((self.root / "pool.json").read_text())["runtime_version"],
             "v2",
         )
         self.assertEqual(self._runtime_bytes("v2"), [self.new_bytes] * 5)
+        self.assertFalse(transaction.exists())
+        self.assertFalse(
+            (self.root / "updates" / "runtime-transaction.json").exists()
+        )
+
+    def test_applying_journal_and_rolled_back_registry_cannot_rewind_exact_target(self):
+        # MUTATION: choosing restore from an applying phase plus rollbackable
+        # registry absence rewinds a later state that exactly matches the target.
+        updater = RuntimeUpdate(self.root, crash_after="activate:office:O5")
+        updater.stage(self.candidate)
+        captured = self.base / "captured-runtime-transaction"
+        evidence = {}
+        restore = updater._restore
+
+        def capture_then_restore(journal):
+            evidence["journal"] = (
+                self.root / "updates" / "runtime-transaction.json"
+            ).read_bytes()
+            evidence["state"] = (
+                self.root / "runtime" / "runtime-update-state.json"
+            ).read_bytes()
+            shutil.copytree(updater._transaction_root(journal), captured)
+            restore(journal)
+
+        with mock.patch.object(updater, "_restore", side_effect=capture_then_restore):
+            with self.assertRaises(RuntimeUpdateError):
+                updater.activate("v2")
+
+        RuntimeUpdate(self.root).activate("v2")
+        journal = json.loads(evidence["journal"])
+        transaction = (
+            self.root
+            / "updates"
+            / "runtime-transactions"
+            / journal["operation_id"]
+        )
+        shutil.copytree(captured, transaction)
+        (self.root / "updates" / "runtime-transaction.json").write_bytes(
+            evidence["journal"]
+        )
+        (self.root / "runtime" / "runtime-update-state.json").write_bytes(
+            evidence["state"]
+        )
+
+        status = Pool(self.root, runtime_version="v2").public_status()
+
+        self.assertTrue(all(office["status"] == "free" for office in status["offices"]))
+        self.assertEqual(
+            json.loads((self.root / "pool.json").read_bytes())["runtime_version"],
+            "v2",
+        )
+        self.assertEqual(self._runtime_bytes("v2"), [self.new_bytes] * 5)
+        self.assertFalse(transaction.exists())
+        self.assertFalse(
+            (self.root / "updates" / "runtime-transaction.json").exists()
+        )
 
     def test_missing_required_backup_cannot_authorize_restore(self):
         # MUTATION: previous_present=True is not proof when its backup has disappeared.

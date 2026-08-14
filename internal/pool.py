@@ -423,102 +423,11 @@ class Pool:
         lease: AuthorityLease,
         witness_id: str,
         authority_digest: str,
-        request_digest: str,
-    ):
+    ) -> bool:
         lease.require_active()
-        if (
-            not isinstance(request_digest, str)
-            or len(request_digest) != 64
-            or any(character not in "0123456789abcdef" for character in request_digest)
-        ):
-            raise PoolError("unauthorized")
-        if not self._create_governance_marker(
-            lease, "consumed", witness_id, authority_digest
-        ):
-            return None
-        path = self._governance_marker_path(
+        return self._create_governance_marker(
             lease, "consumed", witness_id, authority_digest
         )
-
-        def complete(validated) -> None:
-            lease.require_active()
-            if not callable(validated):
-                raise PoolError("unauthorized")
-            value = validated()
-            try:
-                if not isinstance(value, dict) or set(value) != {
-                    "record",
-                    "execution_sha256",
-                }:
-                    raise ValueError("invalid execution completion")
-                record = value["record"]
-                execution_sha256 = value["execution_sha256"]
-                expected = {
-                    "request_digest": request_digest,
-                    "authority_digest": authority_digest,
-                    "office_id": lease.authority["office_id"],
-                    "generation": lease.authority["generation"],
-                    "project_path": lease.authority["project_path"],
-                    "target_path": lease.authority["project_path"],
-                    "phase": "completed",
-                    "diagnostics": {
-                        "status": "accepted",
-                        "run_id": record["run_id"],
-                    },
-                    "exit_code": 0,
-                    "failure_code": None,
-                }
-                if (
-                    not isinstance(record, dict)
-                    or any(record.get(name) != member for name, member in expected.items())
-                    or not isinstance(record.get("execution_id"), str)
-                    or not record["execution_id"].startswith("execution-")
-                    or len(record["execution_id"]) != 42
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in record["execution_id"][10:]
-                    )
-                    or not isinstance(execution_sha256, str)
-                    or len(execution_sha256) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in execution_sha256
-                    )
-                    or self._read_governance_marker(path) != b"1\n"
-                ):
-                    raise ValueError("invalid execution completion")
-                payload = {
-                    "schema_version": 1,
-                    "witness_id": witness_id,
-                    "authority_digest": authority_digest,
-                    "request_digest": request_digest,
-                    "execution_id": record["execution_id"],
-                    "execution_sha256": execution_sha256,
-                }
-                raw = (
-                    json.dumps(payload, sort_keys=True, separators=(",", ":"))
-                    + "\n"
-                ).encode("utf-8")
-                commitment = {
-                    **payload,
-                    "tag": self._governance_tag(
-                        b"governance-execution-completion\0" + raw
-                    ).decode("ascii"),
-                }
-                atomic_write_json(path, commitment)
-                if not self.validate_governance_execution(
-                    lease,
-                    witness_id,
-                    authority_digest,
-                    request_digest,
-                    record["execution_id"],
-                    execution_sha256,
-                ):
-                    raise ValueError("execution completion readback mismatch")
-            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise PoolError("recovery-required") from error
-
-        return complete
 
     def validate_governance_execution(
         self,
@@ -567,6 +476,128 @@ class Pool:
             return False
         except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
             raise PoolError("recovery-required") from error
+
+    def execute_governance_witness(
+        self, receipt: Path, envelope: Path, *, timeout_seconds: int = 30
+    ):
+        from internal.execution import execute
+
+        if not isinstance(receipt, Path) or not isinstance(envelope, Path):
+            raise PoolError("unauthorized")
+        with self.authority_lease(receipt) as lease:
+            def authenticate(validated) -> None:
+                lease.require_active()
+                if not callable(validated):
+                    raise PoolError("unauthorized")
+                value = validated()
+                try:
+                    if not isinstance(value, dict) or set(value) != {
+                        "witness_id",
+                        "authority_digest",
+                        "request_digest",
+                        "record",
+                        "execution_sha256",
+                    }:
+                        raise ValueError("invalid execution proof")
+                    witness_id = value["witness_id"]
+                    authority_digest = value["authority_digest"]
+                    request_digest = value["request_digest"]
+                    record = value["record"]
+                    execution_sha256 = value["execution_sha256"]
+                    expected = {
+                        "request_digest": request_digest,
+                        "authority_digest": authority_digest,
+                        "office_id": lease.authority["office_id"],
+                        "generation": lease.authority["generation"],
+                        "project_path": lease.authority["project_path"],
+                        "target_path": lease.authority["project_path"],
+                        "phase": "completed",
+                        "diagnostics": {
+                            "status": "accepted",
+                            "run_id": record["run_id"],
+                        },
+                        "exit_code": 0,
+                        "failure_code": None,
+                    }
+                    if (
+                        not isinstance(witness_id, str)
+                        or not isinstance(authority_digest, str)
+                        or authority_digest != _bytes_digest(lease.authority_bytes)
+                        or not isinstance(request_digest, str)
+                        or len(request_digest) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in request_digest
+                        )
+                        or not isinstance(record, dict)
+                        or any(
+                            record.get(name) != member
+                            for name, member in expected.items()
+                        )
+                        or not isinstance(record.get("execution_id"), str)
+                        or not record["execution_id"].startswith("execution-")
+                        or len(record["execution_id"]) != 42
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in record["execution_id"][10:]
+                        )
+                        or not isinstance(execution_sha256, str)
+                        or len(execution_sha256) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in execution_sha256
+                        )
+                    ):
+                        raise ValueError("invalid execution proof")
+                    path = self._governance_marker_path(
+                        lease, "consumed", witness_id, authority_digest
+                    )
+                    if self._read_governance_marker(path) != b"1\n":
+                        raise ValueError("invalid execution marker")
+                    payload = {
+                        "schema_version": 1,
+                        "witness_id": witness_id,
+                        "authority_digest": authority_digest,
+                        "request_digest": request_digest,
+                        "execution_id": record["execution_id"],
+                        "execution_sha256": execution_sha256,
+                    }
+                    raw = (
+                        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                        + "\n"
+                    ).encode("utf-8")
+                    commitment = {
+                        **payload,
+                        "tag": self._governance_tag(
+                            b"governance-execution-completion\0" + raw
+                        ).decode("ascii"),
+                    }
+                    atomic_write_json(path, commitment)
+                    if not self.validate_governance_execution(
+                        lease,
+                        witness_id,
+                        authority_digest,
+                        request_digest,
+                        record["execution_id"],
+                        execution_sha256,
+                    ):
+                        raise ValueError("execution completion readback mismatch")
+                except (
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as error:
+                    raise PoolError("recovery-required") from error
+
+            return execute(
+                receipt,
+                envelope,
+                timeout_seconds=timeout_seconds,
+                _lease=lease,
+                _authenticate=authenticate,
+            )
 
     def issue_governance_witness(
         self, receipt: Path, objective: str, artifacts, *, lifetime_seconds: int = 60
@@ -740,6 +771,7 @@ class Pool:
                 self._validate_protected_paths(allow_missing=allow_missing)
                 if (self.root / "updates" / "runtime-transaction.json").exists():
                     try:
+                        self._validate_witness_key()
                         from internal.runtime_update import recover_pending_runtime_update
 
                         recover_pending_runtime_update(self)

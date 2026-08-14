@@ -1215,6 +1215,19 @@ class GovernanceWitnessTests(unittest.TestCase):
             "governance-envelope-consumed", lambda: self._consume(envelope)
         )
 
+    def test_consumption_exposes_no_caller_selected_completion_capability(self):
+        # MUTATION: storing the Pool completion authenticator on the consumed
+        # result lets a caller submit a self-selected record/digest thunk.
+        envelope = issue_witness(
+            self.claim_path, self.task_text, self.valid_artifacts()
+        )
+        with self.pool.authority_lease(self.claim_path) as lease:
+            governed = _consume_witness(lease, envelope)
+            try:
+                self.assertFalse(hasattr(governed, "_complete"))
+            finally:
+                governed.target.close()
+
     def test_consumed_marker_wins_over_later_expiry(self):
         start = datetime(2026, 8, 12, tzinfo=timezone.utc)
         with mock.patch.object(governance, "_now", return_value=start):

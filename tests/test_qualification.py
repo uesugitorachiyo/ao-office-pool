@@ -1,16 +1,23 @@
 import hashlib
+import importlib
 import json
 import os
 import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from internal import qualification as qualification_module
 from internal.execution import execute
 from internal.governance_witness import issue_witness
 from internal.pool import OFFICE_IDS, Pool
 from internal.qualification import Qualification, QualificationError
+from scripts.build_release import build_release
 from tests import test_execution as execution_tests
 
 
@@ -23,6 +30,13 @@ def _digest_value(value) -> str:
 
 
 class QualificationTests(unittest.TestCase):
+    @staticmethod
+    def _release_contract_module():
+        try:
+            return importlib.import_module("scripts.verify_release_contract")
+        except ModuleNotFoundError as error:
+            raise AssertionError("release contract verifier is missing") from error
+
     def setUp(self):
         self.execution_fixture = execution_tests.ExecutionTests(
             "test_executes_only_envelope_bound_objects_and_relative_target"
@@ -284,14 +298,14 @@ class QualificationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
 
-    def test_locked_snapshot_is_not_reopened_after_capture(self):
-        # MUTATION: reopening requirements or the installed lock mixes two snapshots.
+    def test_installed_lock_drift_after_capture_rejects_promotion(self):
+        # MUTATION: trusting only the captured installed lock promotes after
+        # the live component authority has changed.
         qualification = Qualification(self.root)
         capture = qualification._evidence
 
         def capture_then_replace(evidence_set):
             snapshot = capture(evidence_set)
-            (self.evidence / "requirements.json").write_text("{}\n", encoding="utf-8")
             (self.root / "manifests/components.lock.json").write_text(
                 "{}\n", encoding="utf-8"
             )
@@ -302,9 +316,11 @@ class QualificationTests(unittest.TestCase):
             "_evidence",
             side_effect=capture_then_replace,
         ):
-            record = qualification.promote(self.evidence, "candidate")
+            with self.assertRaises(QualificationError) as raised:
+                qualification.promote(self.evidence, "candidate")
 
-        self.assertTrue(record.is_file())
+        self.assertEqual(raised.exception.code, "qualification-identity-mismatch")
+        self.assertFalse(qualification._record_path.exists())
 
     def test_evidence_capture_occurs_while_pool_lock_is_held(self):
         # MUTATION: pre-lock capture permits an activation or rollback to split authority.
@@ -342,19 +358,34 @@ class QualificationTests(unittest.TestCase):
     def test_windows_evidence_root_reparse_ancestors_fail_closed(self):
         # MUTATION: a resolved evidence root can still traverse a Windows junction.
         qualification = Qualification(self.root)
-        identity = object()
+        member_names = tuple(sorted({*qualification_module._INPUTS, "semantic-inputs.json"}))
+        paths = (self.evidence, *(self.evidence / name for name in member_names))
+        identities = {path: object() for path in paths}
         with (
             mock.patch("internal.qualification.os.name", "nt"),
             mock.patch(
-                "internal.qualification.open_identity", return_value=identity, create=True
+                "internal.qualification.open_identity",
+                side_effect=lambda path: identities[path],
+                create=True,
             ) as opened,
             mock.patch("internal.qualification.require_within", create=True) as contained,
         ):
             values, _, _, _ = qualification._evidence(self.evidence)
         self.assertEqual(values["runtime-package.json"]["name"], "ao2")
-        opened.assert_called_once_with(self.evidence)
-        contained.assert_called_once_with(identity, identity)
+        self.assertEqual(opened.call_args_list, [mock.call(path) for path in paths])
+        expected_containment = [
+            mock.call(identities[paths[0]], identities[paths[0]]),
+            *[
+                mock.call(identities[path], identities[paths[0]])
+                for path in paths[1:]
+            ],
+        ]
+        self.assertEqual(
+            contained.call_args_list,
+            expected_containment + expected_containment,
+        )
 
+        identity = object()
         with (
             mock.patch("internal.qualification.os.name", "nt"),
             mock.patch(
@@ -364,6 +395,41 @@ class QualificationTests(unittest.TestCase):
                 "internal.qualification.require_within",
                 side_effect=ValueError("reparse-point ancestor"),
                 create=True,
+            ),
+        ):
+            with self.assertRaises(QualificationError) as raised:
+                qualification._evidence(self.evidence)
+
+        self.assertEqual(
+            raised.exception.code, "qualification-evidence-set-mismatch"
+        )
+
+    def test_windows_semantic_manifest_replacement_after_read_fails_closed(self):
+        # MUTATION: entry-only evidence containment accepts a semantic manifest
+        # replaced after its identity was captured.
+        qualification = Qualification(self.root)
+        member_names = tuple(sorted({*qualification_module._INPUTS, "semantic-inputs.json"}))
+        paths = (self.evidence, *(self.evidence / name for name in member_names))
+        identities = {path: object() for path in paths}
+        semantic = self.evidence / "semantic-inputs.json"
+        semantic_checks = 0
+
+        def reject_replaced_semantic(child, _root):
+            nonlocal semantic_checks
+            if child is identities[semantic]:
+                semantic_checks += 1
+                if semantic_checks == 2:
+                    raise ValueError("semantic manifest identity changed")
+
+        with (
+            mock.patch("internal.qualification.os.name", "nt"),
+            mock.patch(
+                "internal.qualification.open_identity",
+                side_effect=lambda path: identities[path],
+            ),
+            mock.patch(
+                "internal.qualification.require_within",
+                side_effect=reject_replaced_semantic,
             ),
         ):
             with self.assertRaises(QualificationError) as raised:
@@ -437,37 +503,162 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "qualification-critical-matrix-mismatch")
 
     def test_readability_gates_preserve_semantics(self):
-        # MUTATION: dropping B14 from the exact matrix silently drops its semantic gate.
-        matrix_path = self.evidence / "critical-matrix.json"
-        matrix = json.loads(matrix_path.read_text())
-        matrix["assertions"] = [row for row in matrix["assertions"] if row["requirement_id"] != "B14"]
-        self._write("critical-matrix.json", matrix)
-        self._rewrite_semantic_manifest()
-        with self.assertRaises(QualificationError):
-            Qualification(self.root).promote(self.evidence, "candidate")
+        # MUTATION: a token-only gate permits unreadable physical-line compression.
+        verifier = self._release_contract_module()
+        repository = Path(__file__).parents[1]
+        metrics = verifier.verify_instruction_contract(repository)
+        root_metrics = metrics["AGENTS.md"]
+        self.assertLessEqual(root_metrics["lines"], 200)
+        self.assertLessEqual(root_metrics["words"], 2000)
+        self.assertLessEqual(root_metrics["max_line"], 100)
+
+        original = (repository / "AGENTS.md").read_text(encoding="utf-8")
+        lines = original.splitlines()
+        violations = {
+            "physical-lines": "\n".join(lines + [""] * (201 - len(lines))) + "\n",
+            "word-count": original + (("word " * 19 + "word\n") * 100),
+            "line-length": original + ("x" * 101 + "\n"),
+        }
+        for name, content in violations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                sample = Path(directory)
+                (sample / "AGENTS.md").write_text(content, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    verifier.verify_instruction_contract(sample)
 
     def test_root_authority_order(self):
-        # MUTATION: rebinding B15 to another assertion loses the recorded authority gate.
-        self._replace_binding("B15", "tests.test_pool.PoolTests.test_atomic_first_free_claims")
-        with self.assertRaises(QualificationError):
-            Qualification(self.root).promote(self.evidence, "candidate")
+        # MUTATION: allowing a descendant to override root authority weakens
+        # repository-wide privacy and verification rules.
+        verifier = self._release_contract_module()
+        repository = Path(__file__).parents[1]
+        verifier.verify_instruction_contract(repository)
+
+        with tempfile.TemporaryDirectory() as directory:
+            sample = Path(directory)
+            shutil.copy2(repository / "AGENTS.md", sample / "AGENTS.md")
+            leaf = sample / "internal" / "AGENTS.md"
+            leaf.parent.mkdir()
+            leaf.write_text(
+                "# Internal scope\n\n"
+                "Authority: inherit-root\n"
+                "Descendants: narrow-only\n\n"
+                "- Require focused internal tests.\n",
+                encoding="utf-8",
+            )
+            verifier.verify_instruction_contract(sample)
+            leaf.write_text(
+                "# Internal scope\n\n"
+                "Authority: override-root\n"
+                "Descendants: may-weaken\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                verifier.verify_instruction_contract(sample)
 
     def test_specifications_bind_real_code_and_tests(self):
-        # MUTATION: a plausible but absent method cannot qualify an acceptance row.
-        self._replace_binding("B16", "tests.test_qualification.QualificationTests.test_absent")
-        with self.assertRaises(QualificationError) as raised:
-            Qualification(self.root).promote(self.evidence, "candidate")
-        self.assertEqual(raised.exception.code, "qualification-test-binding-mismatch")
+        # MUTATION: naming an abstract builder without executing the release
+        # surface lets the specification drift from the produced archive.
+        verifier = self._release_contract_module()
+        repository = Path(__file__).parents[1]
+        contract = verifier.verify_release_contract(repository)
+        self.assertEqual(
+            contract["surfaces"]["manifest_builder"],
+            "scripts.build_release.build_release",
+        )
+        self.assertEqual(
+            contract["surfaces"]["builder_tests"],
+            "tests.test_release_tree.BuildReleaseTests",
+        )
+
+        with tempfile.TemporaryDirectory(
+            dir=Path(tempfile.gettempdir()).resolve()
+        ) as directory:
+            workspace = Path(directory)
+            source = workspace / "source"
+            (source / "scripts").mkdir(parents=True)
+            (source / "tests").mkdir()
+            shutil.copy2(repository / "AGENTS.md", source / "AGENTS.md")
+            shutil.copy2(
+                repository / "scripts" / "build_release.py",
+                source / "scripts" / "build_release.py",
+            )
+            shutil.copy2(
+                repository / "tests" / "test_release_tree.py",
+                source / "tests" / "test_release_tree.py",
+            )
+            allowlist = workspace / "public-tree.json"
+            allowlist.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "tracked_root_files": ["AGENTS.md"],
+                        "tracked_roots": ["scripts", "tests"],
+                        "excluded_roots": [],
+                        "excluded_names": [],
+                        "excluded_patterns": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            archive_path = workspace / "release.zip"
+            build_release(source, archive_path, allowlist)
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(
+                    archive.namelist(),
+                    [
+                        "AGENTS.md",
+                        "scripts/build_release.py",
+                        "tests/test_release_tree.py",
+                    ],
+                )
 
     def test_acceptance_rows_bind_existing_modules(self):
-        # MUTATION: checking only dotted syntax accepts a nonexistent test module.
-        self._replace_binding("B17", "tests.test_missing.MissingTests.test_missing")
-        with self.assertRaises(QualificationError) as raised:
-            Qualification(self.root).promote(self.evidence, "candidate")
-        self.assertEqual(raised.exception.code, "qualification-test-binding-mismatch")
+        # MUTATION: validating dotted syntax alone accepts missing methods or
+        # extra blocker rows that never execute.
+        verifier = self._release_contract_module()
+        contract = verifier.verify_release_contract(Path(__file__).parents[1])
+        blockers = tuple(f"B{number:02d}" for number in range(1, 20))
+        self.assertEqual(contract["blockers"], blockers)
+        self.assertEqual(len(contract["test_ids"]), 19)
+        self.assertEqual(len(set(contract["test_ids"])), 19)
+        self.assertTrue(all(contract["callable_tests"].values()))
+        command = subprocess.run(
+            [
+                sys.executable,
+                str(
+                    Path(__file__).parents[1]
+                    / "scripts"
+                    / "verify_release_contract.py"
+                ),
+            ],
+            cwd=Path(__file__).parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(command.returncode, 0, command.stderr)
+        self.assertEqual(
+            tuple(json.loads(command.stdout)["blockers"]), blockers
+        )
 
     def test_lifecycle_authorities_agree(self):
-        # MUTATION: accepting execution evidence for another runtime breaks durable lifecycle agreement.
+        # MUTATION: architecture that omits the verifier, runtime finalizer, or
+        # qualification lifecycle can accept evidence for another runtime.
+        verifier = self._release_contract_module()
+        contract = verifier.verify_release_contract(Path(__file__).parents[1])
+        self.assertEqual(
+            contract["surfaces"]["contract_verifier"],
+            "scripts.verify_release_contract.verify_release_contract",
+        )
+        self.assertEqual(
+            contract["surfaces"]["runtime_finalizer"],
+            "internal.runtime_update.RuntimeUpdate",
+        )
+        self.assertEqual(
+            contract["surfaces"]["qualification_lifecycle"],
+            "internal.qualification.Qualification",
+        )
+
         execution = json.loads((self.evidence / "execution-record.json").read_text())
         execution["ao2_sha256"] = "f" * 64
         execution["record_digest"] = _digest_value({key: value for key, value in execution.items() if key != "record_digest"})

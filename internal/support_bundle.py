@@ -3,7 +3,7 @@ import os
 import stat
 from pathlib import Path
 
-from internal.readback import _active_snapshot, _offices, public_record
+from internal.readback import _offices, _with_active_snapshot, public_record
 from internal.windows_paths import validate_segment
 
 
@@ -46,14 +46,19 @@ def support_record(
     }
 
 
-def _require_active_support(root: Path, record: dict) -> None:
-    selected, offices = _active_snapshot(root)
-    if (
-        record["runtime_version"] != selected["runtime_version"]
-        or record["qualification_state"] != selected["qualification_state"]
-        or record["offices"] != offices
-    ):
-        raise SupportBundleError("support-record-stale")
+def _require_active_support(root: Path, record: dict, callback=None):
+    def require(selected, offices):
+        if (
+            record["runtime_version"] != selected["runtime_version"]
+            or record["qualification_state"] != selected["qualification_state"]
+            or record["offices"] != offices
+        ):
+            raise SupportBundleError("support-record-stale")
+        if callback is None:
+            return None
+        return callback()
+
+    return _with_active_snapshot(root, None, None, require)
 
 
 def _file_identity(information) -> tuple[int, int]:
@@ -104,46 +109,52 @@ def write_support_bundle(root: Path, destination: Path, record: dict) -> Path:
             raise ValueError("invalid support record")
     except (AttributeError, KeyError, TypeError, ValueError):
         raise SupportBundleError("support-record-invalid")
+    raw = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    def publish():
+        descriptor = None
+        created_identity = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+            )
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(destination, flags, 0o600)
+            created_identity = _file_identity(os.fstat(descriptor))
+            view = memoryview(raw)
+            while view:
+                count = os.write(descriptor, view)
+                if count <= 0:
+                    raise OSError("support write made no progress")
+                view = view[count:]
+            os.fsync(descriptor)
+            if (
+                _file_identity(os.fstat(descriptor)) != created_identity
+                or _path_identity(destination) != created_identity
+            ):
+                raise OSError("support destination identity changed")
+            os.close(descriptor)
+            descriptor = None
+            if os.name != "nt":
+                parent = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+            return destination
+        except FileExistsError as error:
+            raise SupportBundleError("support-bundle-exists") from error
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise SupportBundleError("support-bundle-failed") from error
+
     try:
-        _require_active_support(root, record)
+        return _require_active_support(root, record, publish)
     except ValueError as error:
         raise SupportBundleError("support-record-stale") from error
-    raw = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    descriptor = None
-    created_identity = None
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(destination, flags, 0o600)
-        created_identity = _file_identity(os.fstat(descriptor))
-        view = memoryview(raw)
-        while view:
-            count = os.write(descriptor, view)
-            if count <= 0:
-                raise OSError("support write made no progress")
-            view = view[count:]
-        os.fsync(descriptor)
-        if (
-            _file_identity(os.fstat(descriptor)) != created_identity
-            or _path_identity(destination) != created_identity
-        ):
-            raise OSError("support destination identity changed")
-        os.close(descriptor)
-        descriptor = None
-        if os.name != "nt":
-            parent = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(parent)
-            finally:
-                os.close(parent)
-        return destination
-    except FileExistsError as error:
-        raise SupportBundleError("support-bundle-exists") from error
-    except OSError as error:
-        if descriptor is not None:
-            os.close(descriptor)
-        if created_identity is not None and _path_identity(destination) == created_identity:
-            destination.unlink(missing_ok=True)
-        raise SupportBundleError("support-bundle-failed") from error

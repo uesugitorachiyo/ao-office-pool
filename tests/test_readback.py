@@ -1,12 +1,16 @@
 import hashlib
 import json
 import os
+import shutil
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 from internal import readback as readback_module
+from internal.pool import Pool
 from internal.qualification import Qualification
 from internal.readback import protected_record, public_record
 from internal.runtime_update import RuntimeUpdate
@@ -45,6 +49,7 @@ class ReadbackTests(unittest.TestCase):
             "runtime_sha256": "a" * 64,
             "runtime_state": "activated",
             "qualification_state": "candidate",
+            "components_sha256": "d" * 64,
             "semantic_fingerprint": "b" * 64,
             "record_digest": "c" * 64,
             **_private_seed(),
@@ -59,7 +64,10 @@ class ReadbackTests(unittest.TestCase):
         self.active_snapshot.start()
         self.addCleanup(self.active_snapshot.stop)
         self.active_support = mock.patch(
-            "internal.support_bundle._require_active_support"
+            "internal.support_bundle._require_active_support",
+            side_effect=lambda _root, _record, callback=None: (
+                callback() if callback is not None else None
+            ),
         )
         self.active_support.start()
         self.addCleanup(self.active_support.stop)
@@ -243,19 +251,31 @@ class ReadbackTests(unittest.TestCase):
 
             self.assertEqual(destination.read_bytes(), sentinel)
 
-    def test_support_bundle_failure_removes_its_unchanged_created_file(self):
-        # Legitimate control: failed private output does not leave partial bytes.
+    def test_support_bundle_failure_retains_its_exact_partial_created_file(self):
+        # MUTATION: identity-check then pathname-unlink can delete a replacement
+        # that lands between the check and the cleanup unlink.
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "support.json"
             record = support_record(self.root, self.status, self.qualification, [])
+            real_write = os.write
+            writes = 0
+
+            def partial_then_fail(descriptor, data):
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return real_write(descriptor, data[:8])
+                raise OSError("injected write failure")
+
             with mock.patch(
                 "internal.support_bundle.os.write",
-                side_effect=OSError("injected write failure"),
+                side_effect=partial_then_fail,
             ):
                 with self.assertRaises(SupportBundleError):
                     write_support_bundle(self.root, destination, record)
 
-            self.assertFalse(destination.exists())
+            self.assertTrue(destination.exists())
+            self.assertEqual(destination.read_bytes(), b'{"diagno')
 
     def test_unknown_status_or_qualification_values_fail_closed(self):
         # MUTATION: reflecting uncontrolled status text turns a safe field into a leak channel.
@@ -305,16 +325,23 @@ class ActiveReadbackTests(unittest.TestCase):
             for component in component_lock["components"]
             if component["name"] == "ao2"
         )
-        ao2.update(
-            {
-                "version": version,
-                "commit": commit,
-                "sha256": hashlib.sha256(asset).hexdigest(),
-            }
-        )
-        (self.root / "manifests/components.lock.json").write_bytes(
-            (json.dumps(component_lock, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        )
+        changed = {
+            "version": version,
+            "commit": commit,
+            "sha256": hashlib.sha256(asset).hexdigest(),
+        }
+        if any(ao2[name] != value for name, value in changed.items()):
+            ao2.update(changed)
+            (self.root / "manifests/components.lock.json").write_bytes(
+                (
+                    json.dumps(
+                        component_lock,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+            )
         candidate = self.fixture.base / ("readback-" + version)
         candidate.mkdir()
         manifest = {
@@ -359,6 +386,111 @@ class ActiveReadbackTests(unittest.TestCase):
         self.assertEqual(
             write_support_bundle(self.root, destination, support), destination
         )
+
+    def test_release_remains_blocked_through_support_bundle_durability(self):
+        # MUTATION: releasing the Pool lock after validation lets a concurrent
+        # release invalidate the record before file and parent durability.
+        destination = self.fixture.base / "locked-support.json"
+        real_locked = Pool._locked
+        real_write = os.write
+        real_fsync = os.fsync
+        release_attempted = threading.Event()
+        release_acquired = threading.Event()
+        release_finished = threading.Event()
+        release_errors = []
+        release_thread = None
+
+        @contextmanager
+        def tracked_locked(pool, *args, **kwargs):
+            is_release = threading.current_thread() is release_thread
+            if is_release:
+                release_attempted.set()
+            with real_locked(pool, *args, **kwargs):
+                if is_release:
+                    release_acquired.set()
+                yield
+
+        def release_claim():
+            try:
+                self.pool.release(self.fixture.claim_path)
+            except BaseException as error:
+                release_errors.append(error)
+            finally:
+                release_finished.set()
+
+        def write_then_release(descriptor, data):
+            nonlocal release_thread
+            if release_thread is None:
+                release_thread = threading.Thread(target=release_claim)
+                release_thread.start()
+                self.assertTrue(release_attempted.wait(5))
+                self.assertFalse(release_acquired.wait(0.5))
+            return real_write(descriptor, data)
+
+        def fsync_while_locked(descriptor):
+            if threading.current_thread() is threading.main_thread():
+                self.assertFalse(release_acquired.is_set())
+            return real_fsync(descriptor)
+
+        try:
+            with (
+                mock.patch.object(Pool, "_locked", new=tracked_locked),
+                mock.patch(
+                    "internal.support_bundle.os.write",
+                    side_effect=write_then_release,
+                ),
+                mock.patch(
+                    "internal.support_bundle.os.fsync",
+                    side_effect=fsync_while_locked,
+                ),
+            ):
+                self.assertEqual(
+                    write_support_bundle(self.root, destination, self.support),
+                    destination,
+                )
+        finally:
+            if release_thread is not None:
+                release_thread.join(5)
+
+        self.assertEqual(release_errors, [])
+        self.assertTrue(release_acquired.is_set())
+        self.assertTrue(release_finished.is_set())
+
+    def test_reanchored_component_authority_after_qualification_invalidates_exports(self):
+        # MUTATION: omitting components_sha256 from readback accepts a package
+        # anchored to component authority that never qualified this record.
+        component = self.fixture._component()
+        staged = self.root / "components" / "ao2" / component["version"]
+        shutil.rmtree(staged)
+        shutil.rmtree(
+            self.fixture.base / ("readback-" + component["version"])
+        )
+        component_lock = json.loads(
+            (self.root / "manifests/components.lock.json").read_bytes()
+        )
+        producer = next(
+            row
+            for row in component_lock["components"]
+            if row["name"] == "ao-blueprint"
+        )
+        producer["commit"] = "f" * 40
+        (self.root / "manifests/components.lock.json").write_bytes(
+            (
+                json.dumps(
+                    component_lock,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+        )
+        self._stage(
+            component["version"],
+            self.fixture.runtime_bytes,
+            component["commit"],
+        )
+
+        self._assert_stale_exports_fail()
 
     def test_activation_invalidates_detached_qualification_exports(self):
         self._change_runtime("v0.5.12", RuntimeUpdate(self.root).activate)

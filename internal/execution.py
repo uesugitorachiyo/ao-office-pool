@@ -25,7 +25,7 @@ from internal.mission_bridge import (
     _run_output,
     _validate_schema,
 )
-from internal.pool import Pool, PoolError
+from internal.pool import AuthorityLease, Pool, PoolError
 
 
 MAX_WORKFLOW = 64 * 1024 * 1024
@@ -51,8 +51,6 @@ class ExecutionResult:
 @dataclass(frozen=True)
 class _WrittenRecord:
     path: Path
-    value: dict
-    sha256: str
 
 
 def _canonical(value) -> bytes:
@@ -540,6 +538,7 @@ def _write_record(
     diagnostics: dict,
     failure_code: str | None,
     exit_code: int | None,
+    authenticate=None,
 ) -> _WrittenRecord:
     workflow_path = project.joinpath(
         ".ao",
@@ -641,11 +640,24 @@ def _write_record(
             or raw != expected
         ):
             raise ValueError("execution record readback mismatch")
-        return _WrittenRecord(
-            record.path,
-            readback,
-            hashlib.sha256(raw).hexdigest(),
-        )
+        if diagnostics.get("status") == "accepted":
+            if not callable(authenticate):
+                raise ValueError("missing execution authenticator")
+
+            def validated():
+                return {
+                    "witness_id": governed.witness_id,
+                    "authority_digest": governed.authority_digest,
+                    "request_digest": governed.request_digest,
+                    "record": readback,
+                    "execution_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+
+            try:
+                authenticate(validated)
+            except PoolError as error:
+                raise ExecutionError("recovery-required", record.path) from error
+        return _WrittenRecord(record.path)
     except ExecutionError:
         raise
     except (
@@ -676,7 +688,9 @@ def _process_error_code(error: MissionBridgeError) -> str:
     }.get(error.reason, "execution-launch-failed")
 
 
-def _execute_governed(receipt, lease, governed, timeout_seconds) -> ExecutionResult:
+def _execute_governed(
+    receipt, lease, governed, timeout_seconds, authenticate
+) -> ExecutionResult:
     executable_path = _ao2_path(receipt, lease.authority, governed)
     try:
         executable_manager = _open_verified_file(
@@ -736,17 +750,8 @@ def _execute_governed(receipt, lease, governed, timeout_seconds) -> ExecutionRes
         diagnostics=diagnostics,
         failure_code=None,
         exit_code=0,
+        authenticate=authenticate,
     )
-    if diagnostics["status"] == "accepted":
-        try:
-            governed._complete(
-                lambda: {
-                    "record": written.value,
-                    "execution_sha256": written.sha256,
-                }
-            )
-        except PoolError as error:
-            raise ExecutionError("recovery-required", written.path) from error
     return ExecutionResult(
         diagnostics["status"],
         written.path,
@@ -760,6 +765,8 @@ def execute(
     envelope: Path,
     *,
     timeout_seconds: int = 30,
+    _lease: AuthorityLease | None = None,
+    _authenticate=None,
 ) -> ExecutionResult:
     if (
         not isinstance(receipt, Path)
@@ -770,14 +777,19 @@ def execute(
         raise ExecutionError("invalid-request")
     try:
         pool = _pool(receipt)
-        with pool.authority_lease(receipt) as lease:
-            governed = _consume_witness(lease, envelope)
-            try:
-                return _execute_governed(
-                    receipt, lease, governed, timeout_seconds
-                )
-            finally:
-                governed.target.close()
+        if _lease is None:
+            return pool.execute_governance_witness(
+                receipt, envelope, timeout_seconds=timeout_seconds
+            )
+        if type(_lease) is not AuthorityLease or not callable(_authenticate):
+            raise ExecutionError("invalid-request")
+        governed = _consume_witness(_lease, envelope)
+        try:
+            return _execute_governed(
+                receipt, _lease, governed, timeout_seconds, _authenticate
+            )
+        finally:
+            governed.target.close()
     except ExecutionError:
         raise
     except GovernanceError as error:

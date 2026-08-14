@@ -96,6 +96,26 @@ def _read_regular(path: Path) -> bytes:
         os.close(descriptor)
 
 
+def _retain_windows_members(root: Path, names: tuple[str, ...]):
+    if os.name != "nt":
+        return None
+    root_identity = open_identity(root)
+    member_identities = tuple(open_identity(root / name) for name in names)
+    require_within(root_identity, root_identity)
+    for member_identity in member_identities:
+        require_within(member_identity, root_identity)
+    return root_identity, member_identities
+
+
+def _recheck_windows_members(identities) -> None:
+    if identities is None:
+        return
+    root_identity, member_identities = identities
+    require_within(root_identity, root_identity)
+    for member_identity in member_identities:
+        require_within(member_identity, root_identity)
+
+
 class Qualification:
     def __init__(self, root: Path):
         if not isinstance(root, Path):
@@ -120,14 +140,14 @@ class Qualification:
             if not isinstance(evidence_set, Path) or evidence_set.is_symlink():
                 raise ValueError("unsafe evidence root")
             root = evidence_set.resolve(strict=True)
-            if os.name == "nt":
-                identity = open_identity(root)
-                require_within(identity, identity)
             expected = {*_INPUTS, "semantic-inputs.json"}
+            member_names = tuple(sorted(expected))
+            identities = _retain_windows_members(root, member_names)
             members = {path.name for path in root.iterdir()}
             if not root.is_dir() or members != expected:
                 raise QualificationError("qualification-evidence-set-mismatch")
-            raw = {name: _read_regular(root / name) for name in expected}
+            raw = {name: _read_regular(root / name) for name in member_names}
+            _recheck_windows_members(identities)
             values = {name: _strict_object(member) for name, member in raw.items()}
             semantic = values["semantic-inputs.json"]
             if set(semantic) != {"schema_version", "inputs"} or semantic["schema_version"] != 1 or not isinstance(semantic["inputs"], list):
@@ -148,10 +168,12 @@ class Qualification:
             if supplied != actual:
                 raise QualificationError("qualification-fingerprint-mismatch")
             fingerprint = _digest_value([{"name": name, "sha256": actual[name]} for name in sorted(actual)])
+            installed_components_raw = _read_regular(
+                self.root / "manifests" / "components.lock.json"
+            )
             snapshots = {
-                "installed_components": _strict_object(
-                    _read_regular(self.root / "manifests" / "components.lock.json")
-                ),
+                "installed_components": _strict_object(installed_components_raw),
+                "installed_components_raw": installed_components_raw,
                 "released_components": _strict_object(
                     _read_regular(governance_witness.COMPONENT_LOCK)
                 ),
@@ -475,6 +497,15 @@ class Qualification:
                 ) as lease:
                     self._identity(values, raw, pool)
                     self._authenticated_task_six(values, raw, pool, lease)
+                    try:
+                        if _read_regular(
+                            self.root / "manifests" / "components.lock.json"
+                        ) != snapshots["installed_components_raw"]:
+                            raise ValueError("installed component authority changed")
+                    except (OSError, TypeError, ValueError) as error:
+                        raise QualificationError(
+                            "qualification-identity-mismatch"
+                        ) from error
                     existing = self._existing()
                     if existing is not None:
                         current = existing["qualification_state"]

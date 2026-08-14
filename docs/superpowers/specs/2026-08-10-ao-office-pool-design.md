@@ -204,6 +204,16 @@ regression, and a durable requirement-to-test record:
 
 No older P01–P75, 152/152, 171-pass, or independent score can close these rows.
 
+The executable release contract names these surfaces:
+
+- `scripts.build_release.build_release` builds the allowlisted archive;
+- `tests.test_release_tree.BuildReleaseTests` tests archive construction;
+- `scripts.verify_release_contract.verify_release_contract` resolves blocker
+  tests and the named architecture surfaces;
+- `internal.runtime_update.RuntimeUpdate` finalizes the active runtime;
+- `internal.qualification.Qualification` records the durable qualification
+  lifecycle.
+
 ## Skills and context economy
 
 V1.1 contains 24 archived `SKILL.md` files but only seven canonical product

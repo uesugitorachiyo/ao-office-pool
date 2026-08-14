@@ -100,8 +100,9 @@ class GovernedExecution:
     producer_artifacts: MappingProxyType
     requirements_evidence_digest: str
     ao2: MappingProxyType
+    witness_id: str
+    authority_digest: str
     request_digest: str
-    _complete: Callable
 
 
 @dataclass
@@ -1788,13 +1789,12 @@ def _consume_witness(
                 "authority_digest": value["authority_digest"],
             }
         )
-        complete = pool._consume_governance_execution(
+        consumed_by_pool = pool._consume_governance_execution(
             lease,
             value["witness_id"],
             value["authority_digest"],
-            value["request_digest"],
         )
-        if complete is None:
+        if not consumed_by_pool:
             raise GovernanceError("governance-envelope-consumed")
         try:
             _create_private(consumed, marker)
@@ -1809,8 +1809,9 @@ def _consume_witness(
             _freeze(value["producer_artifacts"]),
             value["requirements_evidence_digest"],
             _freeze(value["ao2"]),
+            value["witness_id"],
+            value["authority_digest"],
             value["request_digest"],
-            complete,
         )
     except BaseException:
         project.close()
