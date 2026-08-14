@@ -453,6 +453,13 @@ class Pool:
         try:
             with pool_lock(self._lock_path, self.root):
                 self._validate_protected_paths(allow_missing=allow_missing)
+                if (self.root / "updates" / "runtime-transaction.json").exists():
+                    try:
+                        from internal.runtime_update import recover_pending_runtime_update
+
+                        recover_pending_runtime_update(self)
+                    except Exception as error:
+                        raise PoolError("recovery-required") from error
                 yield
         except LockError as error:
             raise PoolError("recovery-required") from error
@@ -559,7 +566,13 @@ class Pool:
                 self._runtime,
                 self.root / "offices",
                 self.root / "operator-secrets",
+                self.root / "components",
+                self.root / "updates",
             ):
+                if parent.name in {"components", "updates"} and not (
+                    parent.exists() or parent.is_symlink()
+                ):
+                    continue
                 paths.append(parent)
                 if not parent.is_symlink():
                     for directory, names, files in os.walk(parent, followlinks=False):
@@ -586,7 +599,12 @@ class Pool:
         try:
             root_identity = open_identity(self.root)
             require_within(root_identity, root_identity)
-            for path in (self._runtime, self.root / "offices"):
+            for path in (
+                self._runtime,
+                self.root / "offices",
+                self.root / "components",
+                self.root / "updates",
+            ):
                 if path.exists():
                     require_within(open_identity(path), root_identity)
         except (OSError, ValueError) as error:
@@ -597,8 +615,14 @@ class Pool:
             return
         try:
             root_identity = open_identity(self.root)
-            for path in (self._runtime, self.root / "offices"):
-                require_within(open_identity(path), root_identity)
+            for path in (
+                self._runtime,
+                self.root / "offices",
+                self.root / "components",
+                self.root / "updates",
+            ):
+                if path.exists():
+                    require_within(open_identity(path), root_identity)
         except (OSError, ValueError) as error:
             raise PoolError("recovery-required") from error
 
