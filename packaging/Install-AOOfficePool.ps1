@@ -276,39 +276,58 @@ function Enter-PoolLock {
 
 function Write-ActivationTransaction {
     param([string]$Root, [string]$Backup, [string]$Staging, [ValidateSet('prepared', 'backup', 'staging-locked', 'active')][string]$Phase)
-    [System.IO.File]::WriteAllText("$Root$ActivationName", (@{ schema_version = 1; backup = $Backup; staging = $Staging; phase = $Phase } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8)
+    $path = "$Root$ActivationName"
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).new"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes((@{ schema_version = 1; backup = $Backup; staging = $Staging; phase = $Phase } | ConvertTo-Json -Compress))
+    $stream = [System.IO.FileStream]::new($temporary, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    if (Test-Path -LiteralPath $path) {
+        [System.IO.File]::Replace($temporary, $path, $null)
+    }
+    else {
+        [System.IO.File]::Move($temporary, $path)
+    }
 }
 
 function Recover-PendingActivation {
     param([string]$Root)
     $path = "$Root$ActivationName"
     if (-not (Test-Path -LiteralPath $path)) { return }
-    $transaction = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    try { $transaction = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
+    catch { throw 'invalid activation transaction' }
     Assert-ExactProperties $transaction @('schema_version', 'backup', 'staging', 'phase') 'activation transaction'
-    if ($transaction.schema_version -ne 1) { throw 'invalid activation transaction' }
-    switch ([string]$transaction.phase) {
-        'prepared' {
-            if (-not (Test-Path -LiteralPath $Root) -or (Test-Path -LiteralPath $transaction.backup)) { throw 'invalid prepared activation state' }
-        }
-        'backup' {
-            if ((Test-Path -LiteralPath $Root) -or -not (Test-Path -LiteralPath $transaction.backup)) { throw 'invalid backup activation state' }
-            Move-Item -LiteralPath $transaction.backup -Destination $Root
-        }
-        'staging-locked' {
-            $stagedLock = Join-Path $transaction.staging '.pool.lock'
-            if ((Test-Path -LiteralPath $Root) -or -not (Test-Path -LiteralPath $transaction.backup) -or -not (Test-Path -LiteralPath $stagedLock)) { throw 'invalid staged-lock activation state' }
-            Move-Item -LiteralPath $stagedLock -Destination (Join-Path $transaction.backup '.pool.lock')
-            Move-Item -LiteralPath $transaction.backup -Destination $Root
-        }
-        'active' {
-            $failed = "$Root.failed.recovery.$([guid]::NewGuid().ToString('N'))"
-            if (-not (Test-Path -LiteralPath $Root) -or -not (Test-Path -LiteralPath $transaction.backup)) { throw 'invalid active activation state' }
-            Move-Item -LiteralPath $Root -Destination $failed
-            Move-Item -LiteralPath (Join-Path $failed '.pool.lock') -Destination (Join-Path $transaction.backup '.pool.lock')
-            Move-Item -LiteralPath $transaction.backup -Destination $Root
-        }
-        default { throw 'invalid activation phase' }
+    if ($transaction.schema_version -ne 1 -or [string]$transaction.phase -notin @('prepared', 'backup', 'staging-locked', 'active')) { throw 'invalid activation transaction' }
+    $hasRoot = Test-Path -LiteralPath $Root
+    $hasBackup = Test-Path -LiteralPath $transaction.backup
+    $backupLock = Join-Path $transaction.backup '.pool.lock'
+    $stagedLock = Join-Path $transaction.staging '.pool.lock'
+    if ($hasRoot -and -not $hasBackup) {
+        # The original root is still authoritative, whether the journal was
+        # written just before the first rename or a later phase write failed.
     }
+    elseif (-not $hasRoot -and $hasBackup) {
+        if (Test-Path -LiteralPath $backupLock) {
+            Move-Item -LiteralPath $transaction.backup -Destination $Root
+        }
+        elseif (Test-Path -LiteralPath $stagedLock) {
+            Move-Item -LiteralPath $stagedLock -Destination $backupLock
+            Move-Item -LiteralPath $transaction.backup -Destination $Root
+        }
+        else { throw 'activation recovery has no authoritative lock' }
+    }
+    elseif ($hasRoot -and $hasBackup) {
+        $rootLock = Join-Path $Root '.pool.lock'
+        if (-not (Test-Path -LiteralPath $rootLock)) { throw 'activation recovery has no authoritative lock' }
+        $failed = "$Root.failed.recovery.$([guid]::NewGuid().ToString('N'))"
+        Move-Item -LiteralPath $Root -Destination $failed
+        Move-Item -LiteralPath (Join-Path $failed '.pool.lock') -Destination $backupLock
+        Move-Item -LiteralPath $transaction.backup -Destination $Root
+    }
+    else { throw 'invalid activation recovery state' }
     [System.IO.File]::Delete($path)
 }
 
