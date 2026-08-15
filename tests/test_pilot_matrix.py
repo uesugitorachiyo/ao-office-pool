@@ -1,0 +1,198 @@
+import importlib
+import json
+import re
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[1]
+
+PILOT_ASSERTIONS = (
+    ("P01", "tests.test_pool.PoolTests.test_atomic_first_free_claims"),
+    ("P02", "tests.test_pool.PoolTests.test_exact_authorization"),
+    ("P03", "tests.test_pool.PoolTests.test_private_same_task_resume"),
+    ("P04", "tests.test_pool.PoolTests.test_public_status_is_secret_free_and_nonmutating"),
+    ("P05", "tests.test_pool.PoolTests.test_pinned_work_does_not_expire"),
+    ("P06", "tests.test_execution.ExecutionTests.test_project_delete_recreate_never_redirects_child_cwd"),
+    ("P07", "tests.test_pool_crash.PoolCrashTests.test_unknown_residue_requires_recovery"),
+    ("P08", "tests.test_pool.PoolTests.test_emergency_release_requires_exact_authority"),
+    ("P09", "tests.test_runtime_update.RuntimeUpdateTests.test_activation_rolls_back_all_offices"),
+    ("P10", "tests.test_runtime_update.RuntimeUpdateTests.test_independent_trust_anchor_detects_substitution"),
+    ("P11", "tests.test_qualification.QualificationTests.test_capability_states_are_truthful"),
+    ("P12", "tests.test_pool.PoolTests.test_no_automatic_office_lifecycle"),
+    ("P13", "tests.test_conversation_lifecycle.ConversationLifecycleTests.test_continuation_is_not_pinned"),
+    ("P14", "tests.test_conversation_lifecycle.ConversationLifecycleTests.test_conversation_completion_needs_no_file"),
+    ("P15", "tests.test_conversation_lifecycle.ConversationLifecycleTests.test_goal_state_conflict_stops"),
+    ("P16", "tests.test_pool.PoolTests.test_runtime_version_is_contained"),
+    ("P17", "tests.test_pool.PoolTests.test_corrupt_pointer_cannot_duplicate_claim"),
+    ("P18", "tests.test_pool.PoolTests.test_claim_hides_owner_key"),
+    ("P19", "tests.test_conversation_lifecycle.ConversationLifecycleTests.test_resume_proves_all_identities"),
+    ("P20", "tests.test_conversation_lifecycle.ConversationLifecycleTests.test_cancel_checkpoints_before_release"),
+    ("P21", "tests.test_pool_crash.PoolCrashTests.test_release_retires_receipt_and_pointer_atomically"),
+    ("P22", "tests.test_pool.PoolTests.test_dirty_release_requires_recovery"),
+    ("P23", "tests.test_qualification.QualificationTests.test_fingerprint_binds_semantic_inputs"),
+    ("P24", "tests.test_qualification.QualificationTests.test_promotion_state_is_hash_bound"),
+    ("P25", "tests.test_qualification.QualificationTests.test_critical_matrix_is_exact"),
+    ("P26", "tests.test_qualification.QualificationTests.test_readability_gates_preserve_semantics"),
+    ("P27", "tests.test_qualification.QualificationTests.test_root_authority_order"),
+    ("P28", "tests.test_qualification.QualificationTests.test_specifications_bind_real_code_and_tests"),
+    ("P29", "tests.test_qualification.QualificationTests.test_acceptance_rows_bind_existing_modules"),
+    ("P30", "tests.test_qualification.QualificationTests.test_lifecycle_authorities_agree"),
+    ("P31", "tests.test_pool.PoolTests.test_public_claim_requires_project_binding"),
+    ("P32", "tests.test_pool.PoolTests.test_initialize_requires_exactly_five_offices"),
+    ("P33", "tests.test_pool_crash.PoolCrashTests.test_unknown_state_fields_are_preserved_before_reuse"),
+    ("P34", "tests.test_pool_crash.PoolCrashTests.test_claim_transitions_are_restart_safe"),
+    ("P35", "tests.test_pool_crash.PoolCrashTests.test_unknown_journal_bytes_are_quarantined_without_overwrite"),
+    ("P36", "tests.test_pool_crash.PoolCrashTests.test_every_unexpected_runtime_member_stops_before_reuse"),
+    ("P37", "tests.test_pool_crash.PoolCrashTests.test_recovery_transitions_preserve_every_unknown_byte"),
+    ("P38", "tests.test_runtime_update.RuntimeUpdateTests.test_valid_update_stages_and_activates_five_independent_equal_copies"),
+    ("P39", "tests.test_runtime_update.RuntimeUpdateTests.test_rejects_unsafe_versions_and_malformed_manifests_before_staging"),
+    ("P40", "tests.test_runtime_update.RuntimeUpdateTests.test_incompatible_or_tampered_package_fails_closed"),
+    ("P41", "tests.test_runtime_update.RuntimeUpdateTests.test_occupied_activation_is_rejected_without_runtime_mutation"),
+    ("P42", "tests.test_runtime_update.RuntimeUpdateTests.test_rollback_reactivates_a_previously_anchored_version"),
+    ("P43", "tests.test_runtime_update.RuntimeUpdateTests.test_abrupt_partial_activation_is_recovered_before_any_pool_caller"),
+    ("P44", "tests.test_runtime_update.RuntimeUpdateTests.test_transaction_cleanup_failure_is_recovery_required"),
+    ("P45", "tests.test_planning_routes.PlanningRouteTests.test_bounded_work_routes_to_forge_without_atlas"),
+    ("P46", "tests.test_planning_routes.PlanningRouteTests.test_oversized_mutation_and_long_work_require_atlas"),
+    ("P47", "tests.test_planning_routes.PlanningRouteTests.test_blocked_mission_cannot_become_execution_candidate"),
+    ("P48", "tests.test_planning_routes.PlanningRouteTests.test_source_only_capability_fails_closed"),
+    ("P49", "tests.test_mission_bridge.MissionBridgeTests.test_starts_verified_mission_with_argument_array_and_project_owned_state"),
+    ("P50", "tests.test_mission_bridge.MissionBridgeTests.test_authenticated_route_tampering_is_rejected"),
+    ("P51", "tests.test_mission_bridge.MissionBridgeTests.test_verified_open_executable_survives_path_substitution"),
+    ("P52", "tests.test_mission_bridge.MissionBridgeTests.test_rejects_wrong_objective_or_receipt_before_launch"),
+    ("P53", "tests.test_mission_bridge.MissionBridgeTests.test_mission_record_schema_has_exact_persisted_shape"),
+    ("P54", "tests.test_governance_witness.GovernanceWitnessTests.test_issues_closed_detached_authenticated_envelope_from_native_producers"),
+    ("P55", "tests.test_governance_witness.GovernanceWitnessTests.test_native_covenant_pack_and_ledger_are_bound_after_locked_verification"),
+    ("P56", "tests.test_governance_witness.GovernanceWitnessTests.test_only_pool_issued_witness_pairs_are_consumed"),
+    ("P57", "tests.test_governance_witness.GovernanceWitnessTests.test_non_executable_atlas_route_cannot_mint_authority"),
+    ("P58", "tests.test_governance_witness.GovernanceWitnessTests.test_requirements_evidence_requires_exact_closed_B01_through_B19"),
+    ("P59", "tests.test_governance_witness.GovernanceWitnessTests.test_private_key_receipt_prompt_and_raw_outputs_are_not_disclosed"),
+    ("P60", "tests.test_execution.ExecutionTests.test_executes_only_envelope_bound_objects_and_relative_target"),
+    ("P61", "tests.test_execution.ExecutionTests.test_verified_ao2_path_replacement_never_runs_substituted_bytes"),
+    ("P62", "tests.test_execution.ExecutionTests.test_timeout_kills_complete_process_tree"),
+    ("P63", "tests.test_execution.ExecutionTests.test_envelope_is_one_use"),
+    ("P64", "tests.test_execution.ExecutionTests.test_runtime_tampering_fails_before_launch"),
+    ("P65", "tests.test_qualification.QualificationTests.test_exact_qualification_binding_promotes_candidate"),
+    ("P66", "tests.test_qualification.QualificationTests.test_missing_pool_governance_issuance_cannot_qualify"),
+    ("P67", "tests.test_qualification.QualificationTests.test_nonreleased_producer_identity_cannot_qualify"),
+    ("P68", "tests.test_qualification.QualificationTests.test_semantic_evidence_omissions_and_extra_files_fail_closed"),
+    ("P69", "tests.test_readback.ReadbackTests.test_public_and_protected_records_are_exact_field_constructors"),
+    ("P70", "tests.test_readback.ReadbackTests.test_support_record_redacts_private_seeds_and_allowlists_actionable_codes"),
+    ("P71", "tests.test_readback.ReadbackTests.test_support_bundle_is_create_only_canonical_allowlisted_json"),
+    ("P72", "tests.test_readback.ActiveReadbackTests.test_activation_invalidates_detached_qualification_exports"),
+    ("P73", "tests.test_release_tree.BuildReleaseTests.test_archives_exact_allowlist_and_unique_names"),
+    ("P74", "tests.test_release_tree.BuildReleaseTests.test_rejects_private_selected_members_before_output"),
+    ("P75", "tests.test_scan_public_tree.ScanPublicTreeTests.test_reports_existing_public_boundary_leaks"),
+    ("P76", "tests.test_verify_components.VerifyLockTests.test_returns_component_digests_for_the_exact_component_set"),
+)
+
+
+def resolve_test(test_id):
+    module_name, class_name, method_name = test_id.rsplit(".", 2)
+    test_class = getattr(importlib.import_module(module_name), class_name)
+    method = getattr(test_class, method_name)
+    if not isinstance(test_class, type) or not callable(method):
+        raise TypeError(test_id)
+    return method
+
+
+def function_body(source, name):
+    match = re.search(
+        rf"(?ms)^function\s+{re.escape(name)}\s*\{{(?P<body>.*?)(?=^function\s+|^\[CmdletBinding\(\)|\Z)",
+        source,
+    )
+    if not match:
+        raise AssertionError(f"missing PowerShell function: {name}")
+    return match.group("body")
+
+
+class PilotMatrixTests(unittest.TestCase):
+    def test_inherited_and_blocker_rows_resolve_to_real_pilot_tests(self):
+        requirements = json.loads((ROOT / "manifests" / "requirements.json").read_text())["requirements"]
+        self.assertEqual(
+            [row["id"] for row in requirements],
+            [f"V11-{number:02d}" for number in range(1, 13)]
+            + [f"B{number:02d}" for number in range(1, 20)],
+        )
+        pilot_targets = dict(PILOT_ASSERTIONS).values()
+        for row in requirements:
+            with self.subTest(requirement=row["id"]):
+                self.assertIn(row["test_id"], pilot_targets)
+                self.assertTrue(callable(resolve_test(row["test_id"])))
+
+    def test_p01_through_p76_are_unique_callable_assertions(self):
+        self.assertEqual([item[0] for item in PILOT_ASSERTIONS], [f"P{number:02d}" for number in range(1, 77)])
+        targets = [item[1] for item in PILOT_ASSERTIONS]
+        self.assertEqual(len(targets), len(set(targets)))
+        self.assertTrue(all(callable(resolve_test(target)) for target in targets))
+
+    def test_powershell_lifecycle_has_fail_closed_operation_order(self):
+        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text()
+        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text()
+        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text()
+
+        for source in (install, verify, uninstall):
+            self.assertIn("Set-StrictMode -Version Latest", source)
+            self.assertIn("$ErrorActionPreference = 'Stop'", source)
+            self.assertIn("Assert-NtfsPath", source)
+            self.assertIn("Assert-AllFree", source)
+
+        self.assertRegex(install, r"ValidateSet\('Install', 'Update', 'Rollback'\)")
+        for name in ("Assert-SafeRoot", "Assert-ArchiveChecksum", "Read-PreviewManifest", "Expand-VerifiedArchive", "Assert-InstalledTree", "Invoke-AtomicInstall"):
+            function_body(install, name)
+        operation = function_body(install, "Invoke-AtomicInstall")
+        self.assertLess(operation.index("Assert-InstalledTree"), operation.index("Assert-AllFree"))
+        self.assertLess(operation.index("Assert-AllFree"), operation.index("Move-Item"))
+        self.assertIn("Restore-PreviousInstall", operation)
+
+        for name in ("Assert-SafeRoot", "Assert-NtfsPath", "Assert-AllFree", "Assert-InstalledTree", "Invoke-Verification"):
+            function_body(verify, name)
+        verification = function_body(verify, "Invoke-Verification")
+        self.assertLess(verification.index("Assert-InstalledTree"), verification.index("Assert-AllFree"))
+
+        removal = function_body(uninstall, "Invoke-AtomicUninstall")
+        self.assertLess(removal.index("Assert-InstalledTree"), removal.index("Assert-AllFree"))
+        self.assertLess(removal.index("Assert-AllFree"), removal.index("Move-Item"))
+        self.assertIn("Restore-PreviousInstall", removal)
+
+    def test_powershell_rejects_alias_reparse_and_hard_link_paths(self):
+        sources = [
+            (ROOT / "packaging" / name).read_text()
+            for name in (
+                "Install-AOOfficePool.ps1",
+                "Verify-AOOfficePool.ps1",
+                "Uninstall-AOOfficePool.ps1",
+            )
+        ]
+        for source in sources:
+            with self.subTest(script=source[:40]):
+                safe_path = function_body(source, "Assert-SafeRelativePath")
+                self.assertIn("short-name aliases are not accepted", safe_path)
+                self.assertIn("reserved device name", safe_path)
+                self.assertIn("ReparsePoint", source)
+                self.assertIn("HardLink", source)
+                installed_tree = function_body(source, "Assert-InstalledTree")
+                self.assertNotIn("-File -Recurse", installed_tree)
+                self.assertIn("-not $item.PSIsContainer", installed_tree)
+        archive_check = function_body(sources[0], "Assert-ArchiveChecksum")
+        self.assertIn("ReparsePoint", archive_check)
+        self.assertIn("Test-HardLink", archive_check)
+
+    def test_operator_docs_keep_preview_outputs_private_and_claims_truthful(self):
+        guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text()
+        qualification = (ROOT / "docs" / "PILOT_QUALIFICATION.md").read_text()
+        combined = guide + qualification
+        self.assertIn("developer-preview", combined)
+        self.assertIn("O1, O2, O3, O4, and O5", combined)
+        self.assertIn("source-present", combined)
+        self.assertIn("does not establish executable", combined)
+        self.assertIn("all five offices are free", combined)
+        for output in ("archive", "checksums", "SBOM", "provenance", "B01–B19 ledger", "pilot qualification record"):
+            with self.subTest(output=output):
+                self.assertIn(output, qualification)
+        self.assertIn("generated privately and remain untracked", qualification)
+        self.assertNotIn("public v1.2.0 release", qualification)
+
+
+if __name__ == "__main__":
+    unittest.main()
