@@ -322,9 +322,8 @@ function Recover-PendingActivation {
     elseif ($hasRoot -and $hasBackup) {
         $rootLock = Join-Path $Root '.pool.lock'
         if (-not (Test-Path -LiteralPath $rootLock)) { throw 'activation recovery has no authoritative lock' }
-        $failed = "$Root.failed.recovery.$([guid]::NewGuid().ToString('N'))"
-        Move-Item -LiteralPath $Root -Destination $failed
-        Move-Item -LiteralPath (Join-Path $failed '.pool.lock') -Destination $backupLock
+        Move-Item -LiteralPath $Root -Destination $transaction.staging
+        Move-Item -LiteralPath $stagedLock -Destination $backupLock
         Move-Item -LiteralPath $transaction.backup -Destination $Root
     }
     else { throw 'invalid activation recovery state' }

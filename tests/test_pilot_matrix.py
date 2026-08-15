@@ -236,59 +236,103 @@ class PilotMatrixTests(unittest.TestCase):
             self.assertIn(primitive, writer)
         for shape in ("$hasRoot", "$hasBackup", "$backupLock", "$stagedLock"):
             self.assertIn(shape, recovery)
+        active_recovery = recovery[recovery.index("elseif ($hasRoot -and $hasBackup)") :]
+        source_recovery_moves = (
+            "Move-Item -LiteralPath $Root -Destination $transaction.staging",
+            "Move-Item -LiteralPath $stagedLock -Destination $backupLock",
+            "Move-Item -LiteralPath $transaction.backup -Destination $Root",
+        )
+        self.assertNotIn("NewGuid", recovery)
+        source_move_offsets = [active_recovery.index(operation) for operation in source_recovery_moves]
+        self.assertEqual(source_move_offsets, sorted(source_move_offsets))
 
         for source in (install, verify, uninstall):
             all_free = function_body(source, "Assert-AllFree")
             self.assertIn("ExpectedRuntimeVersion", all_free)
             self.assertIn("runtime version differs", all_free)
 
-        # This models the filesystem (not PowerShell) after every journal
-        # write and rename. Recovery must return the last accepted tree and
-        # its lock for every interruption prefix, including the three moves
-        # that occur between journal records.
-        def recover_prefix(state):
+        # This models the filesystem (not PowerShell) after every activation
+        # operation and each individual recovery move. Restarting before or
+        # after any move must preserve both byte trees and the accepted lock.
+        accepted = b"accepted-bytes"
+        candidate = b"candidate-bytes"
+        lock = "accepted-lock-identity"
+
+        def move(state, source, destination, lock_only=False):
             state = state.copy()
+            keys = ("lock",) if lock_only else ("tree", "lock")
+            if any(state[f"{destination}_{key}"] is not None for key in keys):
+                raise ValueError("occupied recovery destination")
+            for key in keys:
+                state[f"{destination}_{key}"] = state[f"{source}_{key}"]
+                state[f"{source}_{key}"] = None
+            return state
+
+        def recover_once(state):
+            state = state.copy()
+            if state["phase"] is None:
+                return state, None
             if state["phase"] not in {"prepared", "backup", "staging-locked", "active"}:
                 raise ValueError("invalid transaction")
             if state["root_tree"] and not state["backup_tree"]:
-                return state
+                state["phase"] = None
+                return state, "delete-journal"
             if not state["root_tree"] and state["backup_tree"]:
-                if state["backup_lock"] == "accepted":
-                    state["root_tree"], state["root_lock"] = state["backup_tree"], state["backup_lock"]
-                    state["backup_tree"] = state["backup_lock"] = None
-                    return state
-                if state["staging_lock"] == "accepted":
-                    state["backup_lock"], state["staging_lock"] = state["staging_lock"], None
-                    state["root_tree"], state["root_lock"] = state["backup_tree"], state["backup_lock"]
-                    state["backup_tree"] = state["backup_lock"] = None
-                    return state
-            if state["root_tree"] and state["backup_tree"] and state["root_lock"] == "accepted":
-                state["root_tree"], state["root_lock"] = state["backup_tree"], "accepted"
-                state["backup_tree"] = None
-                return state
+                if state["backup_lock"] == lock:
+                    return move(state, "backup", "root"), "backup-to-root"
+                if state["staging_lock"] == lock:
+                    return move(state, "staging", "backup", lock_only=True), "staging-lock-to-backup"
+            if state["root_tree"] and state["backup_tree"] and state["root_lock"] == lock:
+                return move(state, "root", "staging"), "root-to-staging"
             raise ValueError("unrecoverable transaction shape")
+
+        def assert_preserved(state):
+            self.assertCountEqual(
+                [state[f"{place}_tree"] for place in ("root", "backup", "staging") if state[f"{place}_tree"] is not None],
+                [accepted, candidate],
+            )
+            self.assertEqual(
+                [state[f"{place}_lock"] for place in ("root", "backup", "staging") if state[f"{place}_lock"] is not None],
+                [lock],
+            )
+
+        def converge(state):
+            operations = []
+            for _ in range(5):
+                state, operation = recover_once(state)
+                if operation is None:
+                    return state, operations
+                operations.append(operation)
+            self.fail("recovery did not converge")
+
+        def assert_converged(state):
+            recovered, _ = converge(state)
+            self.assertEqual(recovered["root_tree"], accepted)
+            self.assertEqual(recovered["root_lock"], lock)
+            self.assertEqual(recovered["staging_tree"], candidate)
+            self.assertIsNone(recovered["backup_tree"])
+            self.assertIsNone(recovered["phase"])
 
         state = {
             "phase": None,
-            "root_tree": "accepted",
+            "root_tree": accepted,
             "backup_tree": None,
-            "root_lock": "accepted",
+            "staging_tree": candidate,
+            "root_lock": lock,
             "backup_lock": None,
-            "staging_lock": "candidate",
+            "staging_lock": None,
         }
-
         def write(phase):
             state["phase"] = phase
 
         def move_root_to_backup():
-            state["backup_tree"], state["backup_lock"] = state["root_tree"], state["root_lock"]
-            state["root_tree"] = state["root_lock"] = None
+            state.update(move(state, "root", "backup"))
 
         def move_lock_to_staging():
-            state["staging_lock"], state["backup_lock"] = state["backup_lock"], None
+            state.update(move(state, "backup", "staging", lock_only=True))
 
         def move_staging_to_root():
-            state["root_tree"], state["root_lock"] = "candidate", state["staging_lock"]
+            state.update(move(state, "staging", "root"))
 
         transitions = (
             ("after-prepared-write", lambda: write("prepared")),
@@ -299,18 +343,30 @@ class PilotMatrixTests(unittest.TestCase):
             ("after-staging-to-root", move_staging_to_root),
             ("after-active-write", lambda: write("active")),
         )
+        activation_prefixes = []
         for prefix, transition in transitions:
             transition()
+            assert_preserved(state)
+            activation_prefixes.append((prefix, state.copy()))
+
+        recovery_moves = set()
+        for prefix, interrupted in activation_prefixes:
             with self.subTest(prefix=prefix):
-                recovered = recover_prefix(state)
-                self.assertEqual(recovered["root_tree"], "accepted")
-                self.assertEqual(recovered["root_lock"], "accepted")
-                self.assertIsNone(recovered["backup_tree"])
+                while interrupted["phase"] is not None:
+                    assert_converged(interrupted)  # interruption before move
+                    interrupted, operation = recover_once(interrupted)
+                    assert_preserved(interrupted)
+                    assert_converged(interrupted)  # interruption after move
+                    if operation != "delete-journal":
+                        recovery_moves.add(operation)
+                assert_converged(interrupted)
+        self.assertEqual(recovery_moves, {"root-to-staging", "staging-lock-to-backup", "backup-to-root"})
 
         bad = state.copy()
         bad["phase"] = "partial-json"
         with self.assertRaises(ValueError):
-            recover_prefix(bad)
+            recover_once(bad)
+        assert_preserved(bad)
 
     def test_operator_docs_keep_preview_outputs_private_and_claims_truthful(self):
         guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text()
