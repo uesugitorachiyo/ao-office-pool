@@ -13,9 +13,12 @@ SHA-256, manifest SHA-256, SBOM SHA-256, provenance SHA-256, qualification
 harness SHA-256, and test command. Label every generated artifact
 `developer-preview`. Reject an artifact labeled Production, GA, or v1.2.0.
 
-The preview manifest must list the exact installed file set. Recompute every
-member digest and size before installation and after each install, update,
-rollback, support export, and uninstall step. Source-present capability does
+The preview manifest must list the exact immutable installed file set; governed
+pool/runtime state is excluded and separately validated. Supply the frozen
+archive and checksum sidecar for every verify and uninstall step so the
+installation does not trust its own manifest. Recompute every immutable member
+digest and size before installation and after each install, update, rollback,
+support export, and uninstall step. Source-present capability does
 not establish executable, tested, accepted, activated, or routed capability.
 
 ## Callable assertion bindings
@@ -75,7 +78,8 @@ archive, sidecar, scripts, and qualification harness bytes for both runs.
 5. Complete all work. Require all five offices are free and no task-output
    residue remains in any office.
 6. Inject update interruption at every staged O1–O5, pool, decision, and
-   cleanup boundary. Require exact accepted bytes and state after recovery.
+   cleanup boundary. Require the sibling activation transaction to restore the
+   exact accepted prior bytes and state after recovery.
 7. Exercise dirty release and exact-authority emergency recovery. Require
    unknown bytes preserved and a distinct recovery state before reuse.
 8. Create the allowlisted support export. Scan it and all other generated

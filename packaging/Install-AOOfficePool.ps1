@@ -15,6 +15,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ExpectedOffices = @('O1', 'O2', 'O3', 'O4', 'O5')
 $ManifestName = 'developer-preview-manifest.json'
+$ActivationName = '.activation-transaction.json'
 
 function Assert-ExactProperties {
     param([object]$Value, [string[]]$Names, [string]$Kind)
@@ -84,8 +85,8 @@ function Assert-NtfsPath {
     $full = [System.IO.Path]::GetFullPath($Path)
     $drive = [System.IO.Path]::GetPathRoot($full)
     $information = [System.IO.DriveInfo]::new($drive)
-    if (-not $information.IsReady -or $information.DriveFormat -cne 'NTFS') {
-        throw 'developer preview requires an NTFS volume'
+    if (-not $information.IsReady -or $information.DriveType -ne [System.IO.DriveType]::Fixed -or $information.DriveFormat -cne 'NTFS') {
+        throw 'developer preview requires a local NTFS volume'
     }
 }
 
@@ -106,16 +107,34 @@ function Assert-ArchiveChecksum {
     if ($Matches[2] -cne $archiveItem.Name) {
         throw 'checksum sidecar names another archive'
     }
-    $actual = (Get-FileHash -LiteralPath $archiveItem.FullName -Algorithm SHA256).Hash
-    if ($actual -cne $Matches[1].ToUpperInvariant()) {
-        throw 'archive checksum mismatch'
+    $stream = [System.IO.FileStream]::new($archiveItem.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $actual = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)).Replace('-', '')
+        if ($actual -cne $Matches[1].ToUpperInvariant()) {
+            throw 'archive checksum mismatch'
+        }
+        $stream.Position = 0
+        return $stream
+    }
+    catch {
+        $stream.Dispose()
+        throw
     }
 }
 
-function Read-PreviewManifest {
-    param([string]$Root)
-    $path = Join-Path $Root $ManifestName
-    $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+function Assert-ArchiveManifest {
+    param([System.IO.Stream]$ArchiveStream)
+    [void](Add-Type -AssemblyName System.IO.Compression)
+    $ArchiveStream.Position = 0
+    $zip = [System.IO.Compression.ZipArchive]::new($ArchiveStream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+    try {
+        $entry = $zip.GetEntry($ManifestName)
+        if ($null -eq $entry) { throw 'archive has no preview manifest' }
+        $reader = [System.IO.StreamReader]::new($entry.Open())
+        try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    }
+    finally { $zip.Dispose() }
+    $manifest = $raw | ConvertFrom-Json
     Assert-ExactProperties $manifest @('schema_version', 'label', 'architecture', 'runtime_version', 'files') 'preview manifest'
     if ($manifest.schema_version -ne 1 -or $manifest.label -cne 'developer-preview' -or $manifest.architecture -cne 'windows-x86_64') {
         throw 'archive is not the Windows developer preview'
@@ -123,17 +142,26 @@ function Read-PreviewManifest {
     if ([string]::IsNullOrWhiteSpace([string]$manifest.runtime_version)) {
         throw 'preview manifest has no runtime version'
     }
-    return $manifest
+    [pscustomobject]@{
+        manifest = $manifest
+        manifest_sha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($raw))).Replace('-', '').ToLowerInvariant()
+    }
+}
+
+function Read-PreviewManifest {
+    param([string]$Root)
+    return (Get-Content -LiteralPath (Join-Path $Root $ManifestName) -Raw | ConvertFrom-Json)
 }
 
 function Expand-VerifiedArchive {
-    param([string]$ArchivePath, [string]$Destination)
+    param([System.IO.Stream]$ArchiveStream, [string]$Destination)
     [void](Add-Type -AssemblyName System.IO.Compression)
     [void](Add-Type -AssemblyName System.IO.Compression.FileSystem)
     [void][System.IO.Directory]::CreateDirectory($Destination)
     $root = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    $ArchiveStream.Position = 0
+    $zip = [System.IO.Compression.ZipArchive]::new($ArchiveStream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
     try {
         foreach ($entry in $zip.Entries) {
             $name = $entry.FullName
@@ -148,12 +176,25 @@ function Expand-VerifiedArchive {
             if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw 'archive path escapes staging root'
             }
+            if ($name.EndsWith('/')) {
+                [void][System.IO.Directory]::CreateDirectory($target)
+            }
+            else {
+                [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target))
+                $entry.ExtractToFile($target, $false)
+            }
         }
     }
     finally {
         $zip.Dispose()
     }
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $Destination)
+}
+
+function Test-MutableStatePath {
+    param([string]$Path)
+    return $Path -in @('pool.json', '.pool.lock') -or
+        $Path -match '^offices/O[1-5]/office-state\.json$' -or
+        $Path -match '^(runtime|operator-secrets|updates)/'
 }
 
 function Assert-AllFree {
@@ -177,98 +218,121 @@ function Assert-AllFree {
 }
 
 function Assert-InstalledTree {
-    param([string]$Root)
-    $manifest = Read-PreviewManifest $Root
+    param([string]$Root, [object]$ExpectedManifest = $null, [string]$ExpectedManifestSha256 = '')
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     $rootPrefix = $rootFull + '\'
+    $raw = Get-Content -LiteralPath (Join-Path $rootFull $ManifestName) -Raw
+    $manifestSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($raw))).Replace('-', '').ToLowerInvariant()
+    if (-not [string]::IsNullOrEmpty($ExpectedManifestSha256) -and $manifestSha256 -cne $ExpectedManifestSha256) { throw 'installed preview manifest does not match the checked archive' }
+    $manifest = if ($null -eq $ExpectedManifest) { $raw | ConvertFrom-Json } else { $ExpectedManifest }
+    Assert-ExactProperties $manifest @('schema_version', 'label', 'architecture', 'runtime_version', 'files') 'preview manifest'
+    if ($manifest.schema_version -ne 1 -or $manifest.label -cne 'developer-preview' -or $manifest.architecture -cne 'windows-x86_64' -or [string]::IsNullOrWhiteSpace([string]$manifest.runtime_version)) { throw 'invalid developer preview manifest' }
     $expected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     [void]$expected.Add($ManifestName)
     foreach ($file in @($manifest.files)) {
         Assert-ExactProperties $file @('path', 'sha256', 'size') 'manifest file'
         $relative = [string]$file.path
-        if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Contains('\') -or $relative.Contains(':') -or $relative.StartsWith('/') -or $relative -match '(^|/)\.\.(/|$)' -or -not $expected.Add($relative)) {
-            throw 'manifest contains an unsafe or duplicate path'
-        }
+        if ([string]::IsNullOrWhiteSpace($relative) -or (Test-MutableStatePath $relative) -or $relative.Contains('\') -or $relative.Contains(':') -or $relative.StartsWith('/') -or $relative -match '(^|/)\.\.(/|$)' -or -not $expected.Add($relative)) { throw 'manifest contains an unsafe or duplicate path' }
         [void](Assert-SafeRelativePath $relative)
-        if ([string]$file.sha256 -notmatch '^[0-9a-f]{64}$' -or $file.size -lt 0) {
-            throw 'manifest contains invalid file metadata'
-        }
+        if ([string]$file.sha256 -notmatch '^[0-9a-f]{64}$' -or $file.size -lt 0) { throw 'manifest contains invalid file metadata' }
         $target = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($rootFull, $relative.Replace('/', '\')))
-        if (-not $target.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw 'manifest path escapes install root'
-        }
+        if (-not $target.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'manifest path escapes install root' }
         $item = Get-Item -LiteralPath $target -Force
-        if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-HardLink $item) -or $item.Length -ne [long]$file.size) {
-            throw "unsafe installed member: $relative"
-        }
-        $digest = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($digest -cne [string]$file.sha256) {
-            throw "installed checksum mismatch: $relative"
-        }
+        if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-HardLink $item) -or $item.Length -ne [long]$file.size) { throw "unsafe installed member: $relative" }
+        if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$file.sha256) { throw "installed checksum mismatch: $relative" }
     }
     $actual = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($item in Get-ChildItem -LiteralPath $rootFull -Recurse -Force) {
-        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (-not $item.PSIsContainer -and (Test-HardLink $item))) {
-            throw 'installed tree contains a reparse point or hard link'
-        }
-        if (-not $item.PSIsContainer) {
-            [void]$actual.Add($item.FullName.Substring($rootPrefix.Length).Replace('\', '/'))
-        }
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (-not $item.PSIsContainer -and (Test-HardLink $item))) { throw 'installed tree contains a reparse point or hard link' }
+        $relative = $item.FullName.Substring($rootPrefix.Length).Replace('\', '/')
+        if (-not $item.PSIsContainer -and -not (Test-MutableStatePath $relative)) { [void]$actual.Add($relative) }
     }
-    if ($actual.Count -ne $expected.Count -or @($actual | Where-Object { -not $expected.Contains($_) }).Count -ne 0) {
-        throw 'installed tree contains unknown or missing bytes'
-    }
-    $pool = Get-Content -LiteralPath (Join-Path $rootFull 'pool.json') -Raw | ConvertFrom-Json
-    if ([string]$pool.runtime_version -cne [string]$manifest.runtime_version) {
-        throw 'manifest and pool runtime versions differ'
-    }
+    if ($actual.Count -ne $expected.Count -or @($actual | Where-Object { -not $expected.Contains($_) }).Count -ne 0) { throw 'installed tree contains unknown or missing bytes' }
+    return $manifest
 }
 
 function Restore-PreviousInstall {
     param([string]$Root, [string]$Backup, [string]$Failed)
-    if (Test-Path -LiteralPath $Root) {
+    if ((Test-Path -LiteralPath $Backup) -and (Test-Path -LiteralPath $Root)) {
         Move-Item -LiteralPath $Root -Destination $Failed
     }
     if (Test-Path -LiteralPath $Backup) {
         Move-Item -LiteralPath $Backup -Destination $Root
     }
+    if (Test-Path -LiteralPath $Root) { [System.IO.File]::Delete("$Root$ActivationName") }
+}
+
+function Enter-PoolLock {
+    param([string]$Root)
+    $stream = [System.IO.FileStream]::new((Join-Path $Root '.pool.lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    try { $stream.Lock(0, 1); return $stream } catch { $stream.Dispose(); throw }
+}
+
+function Write-ActivationTransaction {
+    param([string]$Root, [string]$Backup, [string]$Staging)
+    [System.IO.File]::WriteAllText("$Root$ActivationName", (@{ schema_version = 1; backup = $Backup; staging = $Staging } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8)
+}
+
+function Recover-PendingActivation {
+    param([string]$Root)
+    $path = "$Root$ActivationName"
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $transaction = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    Assert-ExactProperties $transaction @('schema_version', 'backup', 'staging') 'activation transaction'
+    if ($transaction.schema_version -ne 1 -or -not (Test-Path -LiteralPath $transaction.backup)) { throw 'activation recovery has no prior tree' }
+    if (Test-Path -LiteralPath $Root) { Move-Item -LiteralPath $Root -Destination "$Root.failed.recovery.$([guid]::NewGuid().ToString('N'))" }
+    Move-Item -LiteralPath $transaction.backup -Destination $Root
+    [System.IO.File]::Delete($path)
 }
 
 function Invoke-AtomicInstall {
     param([string]$Operation, [string]$ArchivePath, [string]$SidecarPath, [string]$Root)
     $safeRoot = Assert-SafeRoot $Root
     Assert-NtfsPath $safeRoot
-    Assert-ArchiveChecksum $ArchivePath $SidecarPath
+    Recover-PendingActivation $safeRoot
+    $archiveStream = Assert-ArchiveChecksum $ArchivePath $SidecarPath
+    try {
+        $archiveManifest = Assert-ArchiveManifest $archiveStream
     $exists = Test-Path -LiteralPath $safeRoot
     if ($Operation -ceq 'Install' -and $exists) { throw 'install root already exists' }
     if ($Operation -cne 'Install' -and -not $exists) { throw 'update or rollback requires an existing install' }
-    if ($exists) {
-        Assert-InstalledTree $safeRoot
-        Assert-AllFree $safeRoot
-    }
     $suffix = [guid]::NewGuid().ToString('N')
     $staging = "$safeRoot.staging.$suffix"
     $backup = "$safeRoot.previous.$suffix"
     $failed = "$safeRoot.failed.$suffix"
-    Expand-VerifiedArchive $ArchivePath $staging
+    Expand-VerifiedArchive $archiveStream $staging
     Assert-NtfsPath $staging
-    Assert-InstalledTree $staging
+    Assert-InstalledTree $staging $archiveManifest.manifest $archiveManifest.manifest_sha256
     Assert-AllFree $staging
     try {
-        if ($exists) { Move-Item -LiteralPath $safeRoot -Destination $backup }
+        $lock = $null
+        if ($exists) {
+            $lock = Enter-PoolLock $safeRoot
+            Assert-InstalledTree $safeRoot
+            Assert-AllFree $safeRoot
+            Write-ActivationTransaction $safeRoot $backup $staging
+            Move-Item -LiteralPath $safeRoot -Destination $backup
+        }
         Move-Item -LiteralPath $staging -Destination $safeRoot
-        Assert-InstalledTree $safeRoot
+        if ($exists -and (Test-Path -LiteralPath (Join-Path $backup '.pool.lock'))) { Move-Item -LiteralPath (Join-Path $backup '.pool.lock') -Destination (Join-Path $safeRoot '.pool.lock') }
+        Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
         Assert-AllFree $safeRoot
+        if ($exists) { [System.IO.File]::Delete("$safeRoot$ActivationName") }
     }
     catch {
         Restore-PreviousInstall $safeRoot $backup $failed
         throw
+    }
+    finally {
+        if ($null -ne $lock) { $lock.Dispose() }
+        $archiveStream.Dispose()
     }
     [pscustomobject]@{
         action = $Operation
         label = 'developer-preview'
         install_root = $safeRoot
         previous_install = $(if ($exists) { $backup } else { $null })
+    }
     }
 }
 

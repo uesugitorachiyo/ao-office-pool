@@ -1,7 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$InstallRoot
+    [string]$InstallRoot,
+    [Parameter(Mandatory = $true)]
+    [string]$Archive,
+    [Parameter(Mandatory = $true)]
+    [string]$ChecksumFile
 )
 
 Set-StrictMode -Version Latest
@@ -9,11 +13,36 @@ $ErrorActionPreference = 'Stop'
 $ExpectedOffices = @('O1', 'O2', 'O3', 'O4', 'O5')
 $ManifestName = 'developer-preview-manifest.json'
 
+function Test-MutableStatePath {
+    param([string]$Path)
+    return $Path -in @('pool.json', '.pool.lock') -or $Path -match '^offices/O[1-5]/office-state\.json$' -or $Path -match '^(runtime|operator-secrets|updates)/'
+}
+
 function Assert-ExactProperties {
     param([object]$Value, [string[]]$Names, [string]$Kind)
     $actual = @($Value.PSObject.Properties.Name | Sort-Object)
     $expected = @($Names | Sort-Object)
     if (($actual -join "`n") -cne ($expected -join "`n")) { throw "invalid $Kind fields" }
+}
+
+function Assert-ArchiveManifest {
+    param([string]$ArchivePath, [string]$SidecarPath)
+    $line = (Get-Content -LiteralPath $SidecarPath -Raw).Trim()
+    if ($line -notmatch '^([0-9A-Fa-f]{64})[ \t]+\*?([^\\/:]+)$' -or $Matches[2] -cne (Split-Path $ArchivePath -Leaf)) { throw 'archive checksum mismatch' }
+    $stream = [System.IO.FileStream]::new($ArchivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    if ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)).Replace('-', '') -cne $Matches[1].ToUpperInvariant()) { $stream.Dispose(); throw 'archive checksum mismatch' }
+    $stream.Position = 0
+    $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+    try {
+        $entry = $zip.GetEntry($ManifestName)
+        if ($null -eq $entry) { throw 'archive has no preview manifest' }
+        $reader = [System.IO.StreamReader]::new($entry.Open())
+        try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $zip.Dispose(); $stream.Dispose() }
+    $manifest = $raw | ConvertFrom-Json
+    Assert-ExactProperties $manifest @('schema_version', 'label', 'architecture', 'runtime_version', 'files') 'preview manifest'
+    if ($manifest.schema_version -ne 1 -or $manifest.label -cne 'developer-preview' -or $manifest.architecture -cne 'windows-x86_64' -or [string]::IsNullOrWhiteSpace([string]$manifest.runtime_version)) { throw 'invalid developer preview manifest' }
+    [pscustomobject]@{ manifest = $manifest; manifest_sha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($raw))).Replace('-', '').ToLowerInvariant() }
 }
 
 function Assert-SafeRelativePath {
@@ -66,8 +95,8 @@ function Assert-NtfsPath {
     param([string]$Path)
     $drive = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
     $information = [System.IO.DriveInfo]::new($drive)
-    if (-not $information.IsReady -or $information.DriveFormat -cne 'NTFS') {
-        throw 'developer preview requires an NTFS volume'
+    if (-not $information.IsReady -or $information.DriveType -ne [System.IO.DriveType]::Fixed -or $information.DriveFormat -cne 'NTFS') {
+        throw 'developer preview requires a local NTFS volume'
     }
 }
 
@@ -91,7 +120,7 @@ function Assert-AllFree {
 }
 
 function Assert-InstalledTree {
-    param([string]$Root)
+    param([string]$Root, [object]$ExpectedManifest = $null, [string]$ExpectedManifestSha256 = '')
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     $rootPrefix = $rootFull + '\'
     $manifestPath = Join-Path $rootFull $ManifestName
@@ -99,7 +128,10 @@ function Assert-InstalledTree {
     if ($manifestItem.PSIsContainer -or ($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw 'unsafe preview manifest'
     }
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $raw = Get-Content -LiteralPath $manifestPath -Raw
+    $manifestSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($raw))).Replace('-', '').ToLowerInvariant()
+    if (-not [string]::IsNullOrEmpty($ExpectedManifestSha256) -and $manifestSha256 -cne $ExpectedManifestSha256) { throw 'installed preview manifest does not match the checked archive' }
+    $manifest = if ($null -eq $ExpectedManifest) { $raw | ConvertFrom-Json } else { $ExpectedManifest }
     Assert-ExactProperties $manifest @('schema_version', 'label', 'architecture', 'runtime_version', 'files') 'preview manifest'
     if ($manifest.schema_version -ne 1 -or $manifest.label -cne 'developer-preview' -or $manifest.architecture -cne 'windows-x86_64' -or [string]::IsNullOrWhiteSpace([string]$manifest.runtime_version)) {
         throw 'invalid developer preview manifest'
@@ -109,7 +141,7 @@ function Assert-InstalledTree {
     foreach ($file in @($manifest.files)) {
         Assert-ExactProperties $file @('path', 'sha256', 'size') 'manifest file'
         $relative = [string]$file.path
-        if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Contains('\') -or $relative.Contains(':') -or $relative.StartsWith('/') -or $relative -match '(^|/)\.\.(/|$)' -or -not $expected.Add($relative)) {
+        if ([string]::IsNullOrWhiteSpace($relative) -or (Test-MutableStatePath $relative) -or $relative.Contains('\') -or $relative.Contains(':') -or $relative.StartsWith('/') -or $relative -match '(^|/)\.\.(/|$)' -or -not $expected.Add($relative)) {
             throw 'manifest contains an unsafe or duplicate path'
         }
         [void](Assert-SafeRelativePath $relative)
@@ -133,16 +165,12 @@ function Assert-InstalledTree {
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (-not $item.PSIsContainer -and (Test-HardLink $item))) {
             throw 'installed tree contains a reparse point'
         }
-        if (-not $item.PSIsContainer) {
+        if (-not $item.PSIsContainer -and -not (Test-MutableStatePath $item.FullName.Substring($rootPrefix.Length).Replace('\\', '/'))) {
             [void]$actual.Add($item.FullName.Substring($rootPrefix.Length).Replace('\', '/'))
         }
     }
     if ($actual.Count -ne $expected.Count -or @($actual | Where-Object { -not $expected.Contains($_) }).Count -ne 0) {
         throw 'installed tree contains unknown or missing bytes'
-    }
-    $pool = Get-Content -LiteralPath (Join-Path $rootFull 'pool.json') -Raw | ConvertFrom-Json
-    if ([string]$pool.runtime_version -cne [string]$manifest.runtime_version) {
-        throw 'manifest and pool runtime versions differ'
     }
     return $manifest
 }
@@ -151,7 +179,8 @@ function Invoke-Verification {
     param([string]$Root)
     $safeRoot = Assert-SafeRoot $Root
     Assert-NtfsPath $safeRoot
-    $manifest = Assert-InstalledTree $safeRoot
+    $archiveManifest = Assert-ArchiveManifest $Archive $ChecksumFile
+    $manifest = Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
     Assert-AllFree $safeRoot
     [pscustomobject]@{
         label = $manifest.label

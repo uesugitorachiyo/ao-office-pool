@@ -20,8 +20,11 @@ The archive root contains `developer-preview-manifest.json` with fields exactly
 `schema_version`, `label`, `architecture`, `runtime_version`, and `files`.
 `label` is `developer-preview`; `architecture` is `windows-x86_64`; each file
 row contains exactly `path`, `sha256`, and `size`. Paths use forward slashes.
-The manifest lists every installed file except itself. The scripts reject
-missing files, extra files, digest or size drift, traversal, duplicate names,
+The manifest lists immutable package files except itself. It must not list the
+governed mutable pool state (`pool.json`, office states, runtime,
+operator-secrets, updates, or `.pool.lock`); that state is separately checked
+for the exact O1--O5 all-free shape. The scripts reject missing immutable
+files, extra immutable files, digest or size drift, traversal, duplicate names,
 and reparse points.
 
 Install, verify, update, rollback, and uninstall stop unless the pool contains
@@ -38,12 +41,16 @@ Run PowerShell from the directory containing the scripts:
   -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256 `
   -InstallRoot C:\AOOfficePool
 
-.\Verify-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool
+.\Verify-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool `
+  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
+  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256
 ```
 
-The installer checks the archive checksum before extraction, validates every
-ZIP member before writing a staging tree, verifies the staged manifest and
-file hashes, then renames the staged tree into place on the same NTFS volume.
+The installer retains one checked archive handle through member validation and
+extraction, verifies the staged manifest and immutable file hashes, then takes
+the pool byte-range lock, checks all five offices free again, and records a
+private sibling recovery transaction before replacement. A later invocation
+restores the accepted prior tree if an interrupted replacement is found.
 It does not start a service, create a queue, or schedule work.
 
 ## Update and rollback
@@ -90,8 +97,12 @@ Those states require their own existing qualification records.
 Verify first, then remove the active path:
 
 ```powershell
-.\Verify-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool
-.\Uninstall-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool
+.\Verify-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool `
+  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
+  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256
+.\Uninstall-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool `
+  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
+  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256
 ```
 
 Uninstall verifies unchanged manifest-bound bytes and the all-free state, then
@@ -102,7 +113,9 @@ operator retention decision after the pilot record is complete.
 
 ## Claims and limits
 
-Portable tests can validate script structure and fail-closed ordering. They do
+Verification requires the accepted archive and checksum sidecar as an
+independent immutable anchor; a self-consistent replacement manifest inside
+the installation is not sufficient. Portable tests can validate script structure and fail-closed ordering. They do
 not prove NTFS identity behavior or native Windows execution. Only a pilot run
 against unchanged archive bytes on the required Windows hosts can record those
 results. The preview has no scheduler, hardware controller, automatic queue,

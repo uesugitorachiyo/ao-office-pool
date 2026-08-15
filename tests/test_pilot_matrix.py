@@ -178,6 +178,38 @@ class PilotMatrixTests(unittest.TestCase):
         self.assertIn("ReparsePoint", archive_check)
         self.assertIn("Test-HardLink", archive_check)
 
+    def test_powershell_preview_lifecycle_preserves_state_and_binds_trusted_bytes(self):
+        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text()
+        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text()
+        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text()
+
+        for source in (install, verify, uninstall):
+            self.assertIn("DriveType -ne [System.IO.DriveType]::Fixed", source)
+            self.assertIn("Test-MutableStatePath", source)
+            self.assertIn("manifest_sha256", source)
+            self.assertIn("Assert-ArchiveManifest", source)
+            tree = function_body(source, "Assert-InstalledTree")
+            self.assertIn("Test-MutableStatePath", tree)
+            self.assertIn("ExpectedManifestSha256", tree)
+
+        self.assertIn("[string]$Archive", verify)
+        self.assertIn("[string]$ChecksumFile", verify)
+        self.assertIn("[string]$Archive", uninstall)
+        self.assertIn("[string]$ChecksumFile", uninstall)
+
+        expansion = function_body(install, "Expand-VerifiedArchive")
+        self.assertIn("[System.IO.Compression.ZipArchive]::new($ArchiveStream", expansion)
+        self.assertNotIn("ExtractToDirectory", expansion)
+        self.assertIn("$entry.ExtractToFile", expansion)
+
+        activation = function_body(install, "Invoke-AtomicInstall")
+        self.assertIn("Enter-PoolLock", activation)
+        self.assertLess(activation.index("Enter-PoolLock"), activation.index("Assert-AllFree $safeRoot"))
+        self.assertIn("Write-ActivationTransaction", activation)
+        self.assertIn("Recover-PendingActivation", install)
+        restore = function_body(install, "Restore-PreviousInstall")
+        self.assertIn("Test-Path -LiteralPath $Backup", restore)
+
     def test_operator_docs_keep_preview_outputs_private_and_claims_truthful(self):
         guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text()
         qualification = (ROOT / "docs" / "PILOT_QUALIFICATION.md").read_text()
