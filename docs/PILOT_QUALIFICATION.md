@@ -85,7 +85,12 @@ archive, sidecar, scripts, and qualification harness bytes for both runs.
 8. Create the allowlisted support export. Scan it and all other generated
    outputs for private fields and paths.
 9. Update, verify, roll back to the prior accepted archive, and verify again.
-   Every activation, update, and rollback requires all five offices free.
+   Every activation, update, and rollback requires all five offices free. Before
+   each package activation, record the exact mutable bytes and `.pool.lock`
+   identity. Require the active tree after update and rollback to retain them
+   unchanged. The archive runtime version must match the governed active
+   `pool.json`; complete any `internal.runtime_update.RuntimeUpdate` transition
+   before package activation.
 10. Uninstall against unchanged manifest-bound bytes. Confirm the active root
     is absent, the recoverable preserved tree is byte-exact, and no process or
     task residue remains.

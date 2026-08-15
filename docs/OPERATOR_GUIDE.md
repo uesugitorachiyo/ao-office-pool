@@ -21,9 +21,10 @@ The archive root contains `developer-preview-manifest.json` with fields exactly
 `label` is `developer-preview`; `architecture` is `windows-x86_64`; each file
 row contains exactly `path`, `sha256`, and `size`. Paths use forward slashes.
 The manifest lists immutable package files except itself. It must not list the
-governed mutable pool state (`pool.json`, office states, runtime,
-operator-secrets, updates, or `.pool.lock`); that state is separately checked
-for the exact O1--O5 all-free shape. The scripts reject missing immutable
+governed mutable pool state (`pool.json`, `.pool.lock`, root runtime state,
+operator secrets, optional updates, or each office's state, history, and work
+tree); that state is separately checked for the exact O1--O5 all-free shape.
+The scripts reject missing immutable
 files, extra immutable files, digest or size drift, traversal, duplicate names,
 and reparse points.
 
@@ -71,10 +72,20 @@ exact-tree, and all-free checks:
   -InstallRoot C:\AOOfficePool
 ```
 
+The archive manifest's `runtime_version` must already equal the active
+`pool.json.runtime_version`. Package activation does not change the governed
+runtime version. Complete the governed `internal.runtime_update.RuntimeUpdate`
+transition first, then use an archive built for that active version. A mismatch
+stops before the activation journal or any tree replacement.
+
+Update and rollback replace immutable package members only. They preserve the
+exact accepted mutable bytes listed above and the physical `.pool.lock`
+identity in the new active root.
+
 After a successful replacement, the command reports the preserved prior tree
 as `previous_install`. Keep it until verification and the required pilot smoke
 run finish. If replacement fails after the first rename, the installer restores
-the prior tree and preserves the rejected tree under a `.failed.<id>` sibling.
+the prior tree and preserves the rejected tree under its `.staging.<id>` sibling.
 Do not merge or delete either tree before recording the private incident.
 
 There is no network updater or background updater. The operator supplies and

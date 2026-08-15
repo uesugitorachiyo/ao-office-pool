@@ -12,10 +12,38 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ExpectedOffices = @('O1', 'O2', 'O3', 'O4', 'O5')
 $ManifestName = 'developer-preview-manifest.json'
+$MutableStateFiles = @(
+    'pool.json'
+    '.pool.lock'
+    'offices/O1/office-state.json'
+    'offices/O2/office-state.json'
+    'offices/O3/office-state.json'
+    'offices/O4/office-state.json'
+    'offices/O5/office-state.json'
+)
+$MutableStateDirectories = @(
+    'runtime'
+    'operator-secrets'
+    'updates'
+    'offices/O1/history'
+    'offices/O1/work'
+    'offices/O2/history'
+    'offices/O2/work'
+    'offices/O3/history'
+    'offices/O3/work'
+    'offices/O4/history'
+    'offices/O4/work'
+    'offices/O5/history'
+    'offices/O5/work'
+)
 
 function Test-MutableStatePath {
     param([string]$Path)
-    return $Path -in @('pool.json', '.pool.lock') -or $Path -match '^offices/O[1-5]/office-state\.json$' -or $Path -match '^(runtime|operator-secrets|updates)/'
+    if ($Path -cin $MutableStateFiles) { return $true }
+    foreach ($directory in $MutableStateDirectories) {
+        if ($Path -ceq $directory -or $Path.StartsWith("$directory/", [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
 }
 
 function Assert-ExactProperties {

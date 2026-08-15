@@ -16,6 +16,30 @@ $ErrorActionPreference = 'Stop'
 $ExpectedOffices = @('O1', 'O2', 'O3', 'O4', 'O5')
 $ManifestName = 'developer-preview-manifest.json'
 $ActivationName = '.activation-transaction.json'
+$MutableStateFiles = @(
+    'pool.json'
+    '.pool.lock'
+    'offices/O1/office-state.json'
+    'offices/O2/office-state.json'
+    'offices/O3/office-state.json'
+    'offices/O4/office-state.json'
+    'offices/O5/office-state.json'
+)
+$MutableStateDirectories = @(
+    'runtime'
+    'operator-secrets'
+    'updates'
+    'offices/O1/history'
+    'offices/O1/work'
+    'offices/O2/history'
+    'offices/O2/work'
+    'offices/O3/history'
+    'offices/O3/work'
+    'offices/O4/history'
+    'offices/O4/work'
+    'offices/O5/history'
+    'offices/O5/work'
+)
 
 function Assert-ExactProperties {
     param([object]$Value, [string[]]$Names, [string]$Kind)
@@ -192,9 +216,245 @@ function Expand-VerifiedArchive {
 
 function Test-MutableStatePath {
     param([string]$Path)
-    return $Path -in @('pool.json', '.pool.lock') -or
-        $Path -match '^offices/O[1-5]/office-state\.json$' -or
-        $Path -match '^(runtime|operator-secrets|updates)/'
+    if ($Path -cin $MutableStateFiles) { return $true }
+    foreach ($directory in $MutableStateDirectories) {
+        if ($Path -ceq $directory -or $Path.StartsWith("$directory/", [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+function Assert-ExactChildNames {
+    param([string]$Path, [string[]]$Names, [string]$Kind)
+    $actual = @(Get-ChildItem -LiteralPath $Path -Force | ForEach-Object { $_.Name } | Sort-Object)
+    $expected = @($Names | Sort-Object)
+    if (($actual -join "`n") -cne ($expected -join "`n")) { throw "invalid $Kind shape" }
+}
+
+function Assert-RegularStateFile {
+    param([string]$Path, [string]$Kind)
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-HardLink $item)) {
+        throw "invalid $Kind"
+    }
+}
+
+function Assert-SafeStateTree {
+    param([string]$Path)
+    $root = Get-Item -LiteralPath $Path -Force
+    if (-not $root.PSIsContainer -or ($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'mutable state root is not a regular directory'
+    }
+    $prefix = $root.FullName.TrimEnd('\') + '\'
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in Get-ChildItem -LiteralPath $root.FullName -Recurse -Force) {
+        $relative = $item.FullName.Substring($prefix.Length).Replace('\', '/')
+        [void](Assert-SafeRelativePath $relative)
+        if (-not $seen.Add($relative) -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            (-not $item.PSIsContainer -and (Test-HardLink $item))) {
+            throw 'mutable state contains an ambiguous path, reparse point, or hard link'
+        }
+    }
+}
+
+function Assert-MutableStateShape {
+    param([string]$Root, [switch]$AllowMissingLock)
+    foreach ($relative in $MutableStateFiles) {
+        if ($AllowMissingLock -and $relative -ceq '.pool.lock') { continue }
+        Assert-RegularStateFile (Join-Path $Root $relative) "mutable state file: $relative"
+    }
+    foreach ($relative in $MutableStateDirectories) {
+        $path = Join-Path $Root $relative
+        if ($relative -ceq 'updates' -and -not (Test-Path -LiteralPath $path)) { continue }
+        Assert-SafeStateTree $path
+    }
+    Assert-ExactChildNames (Join-Path $Root 'runtime') @(
+        'generations.json', 'governance', 'pointers', 'receipts', 'recovery',
+        'recovery-authority.json', 'runtime-update-state.json', 'transactions'
+    ) 'runtime state'
+    foreach ($relative in @(
+        'runtime\generations.json',
+        'runtime\recovery-authority.json',
+        'runtime\runtime-update-state.json'
+    )) {
+        Assert-RegularStateFile (Join-Path $Root $relative) "mutable state file: $relative"
+    }
+    foreach ($relative in @(
+        'runtime\governance',
+        'runtime\pointers',
+        'runtime\receipts',
+        'runtime\recovery',
+        'runtime\transactions'
+    )) {
+        Assert-SafeStateTree (Join-Path $Root $relative)
+    }
+    Assert-ExactChildNames (Join-Path $Root 'runtime\governance') @('consumed', 'issued', 'revoked') 'runtime governance'
+    foreach ($relative in @(
+        'runtime\governance\consumed',
+        'runtime\governance\issued',
+        'runtime\governance\revoked'
+    )) {
+        Assert-SafeStateTree (Join-Path $Root $relative)
+    }
+    Assert-ExactChildNames (Join-Path $Root 'operator-secrets') @(
+        'governance-witness.key', 'recovery-key-O1', 'recovery-key-O2',
+        'recovery-key-O3', 'recovery-key-O4', 'recovery-key-O5'
+    ) 'operator secrets'
+    foreach ($relative in @(
+        'operator-secrets\governance-witness.key',
+        'operator-secrets\recovery-key-O1',
+        'operator-secrets\recovery-key-O2',
+        'operator-secrets\recovery-key-O3',
+        'operator-secrets\recovery-key-O4',
+        'operator-secrets\recovery-key-O5'
+    )) {
+        Assert-RegularStateFile (Join-Path $Root $relative) "mutable state file: $relative"
+    }
+    foreach ($relative in @('runtime\pointers', 'runtime\receipts', 'runtime\recovery', 'runtime\transactions')) {
+        Assert-ExactChildNames (Join-Path $Root $relative) @() $relative
+    }
+    foreach ($office in $ExpectedOffices) {
+        Assert-ExactChildNames (Join-Path $Root "offices\$office\work") @() "office $office work"
+    }
+    $updates = Join-Path $Root 'updates'
+    if (Test-Path -LiteralPath $updates) {
+        Assert-ExactChildNames $updates @('runtime-transactions') 'runtime updates'
+        $transactions = Join-Path $updates 'runtime-transactions'
+        $transactionItem = Get-Item -LiteralPath $transactions -Force
+        if (-not $transactionItem.PSIsContainer -or ($transactionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'invalid runtime transaction directory'
+        }
+        Assert-ExactChildNames $transactions @() 'runtime transactions'
+    }
+}
+
+function Copy-StatePath {
+    param([string]$Source, [string]$Destination)
+    if (Test-Path -LiteralPath $Destination) { throw 'mutable state copy destination already exists' }
+    $item = Get-Item -LiteralPath $Source -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (-not $item.PSIsContainer -and (Test-HardLink $item))) {
+        throw 'unsafe mutable state copy source'
+    }
+    if ($item.PSIsContainer) {
+        [void][System.IO.Directory]::CreateDirectory($Destination)
+        foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force | Sort-Object Name) {
+            [void](Assert-SafeRelativePath $child.Name)
+            Copy-StatePath $child.FullName (Join-Path $Destination $child.Name)
+        }
+        return
+    }
+    [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($Destination))
+    $input = [System.IO.FileStream]::new($item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $output = [System.IO.FileStream]::new($Destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 1048576, [System.IO.FileOptions]::WriteThrough)
+        try {
+            $input.CopyTo($output)
+            $output.Flush($true)
+        }
+        finally { $output.Dispose() }
+    }
+    finally { $input.Dispose() }
+}
+
+function Remove-StatePath {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (-not $item.PSIsContainer -and (Test-HardLink $item))) {
+        throw 'unsafe mutable state removal target'
+    }
+    if ($item.PSIsContainer) {
+        foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force) { Remove-StatePath $child.FullName }
+        [System.IO.Directory]::Delete($item.FullName)
+    }
+    else { [System.IO.File]::Delete($item.FullName) }
+}
+
+function Copy-MutableStateRoots {
+    param([string]$Source, [string]$Destination, [switch]$IncludeLock)
+    foreach ($relative in @($MutableStateFiles + $MutableStateDirectories)) {
+        if (-not $IncludeLock -and $relative -ceq '.pool.lock') { continue }
+        $path = Join-Path $Source $relative
+        if (Test-Path -LiteralPath $path) { Copy-StatePath $path (Join-Path $Destination $relative) }
+    }
+}
+
+function Clear-MutableStateRoots {
+    param([string]$Root, [switch]$IncludeLock)
+    foreach ($relative in @($MutableStateFiles + $MutableStateDirectories)) {
+        if (-not $IncludeLock -and $relative -ceq '.pool.lock') { continue }
+        Remove-StatePath (Join-Path $Root $relative)
+    }
+}
+
+function Get-MutableStateInventory {
+    param([string]$Root, [switch]$IncludeLock)
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($relative in @($MutableStateFiles + $MutableStateDirectories)) {
+        if (-not $IncludeLock -and $relative -ceq '.pool.lock') { continue }
+        $path = Join-Path $Root $relative
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path -Force
+        $members = @($item)
+        if ($item.PSIsContainer) { $members += @(Get-ChildItem -LiteralPath $item.FullName -Recurse -Force) }
+        foreach ($member in $members) {
+            $memberRelative = $member.FullName.Substring([System.IO.Path]::GetFullPath($Root).TrimEnd('\').Length + 1).Replace('\', '/')
+            if ($member.PSIsContainer) {
+                $result.Add([pscustomobject]@{ path = $memberRelative; kind = 'directory'; size = 0; sha256 = '' })
+            }
+            else {
+                $result.Add([pscustomobject]@{
+                    path = $memberRelative
+                    kind = 'file'
+                    size = [long]$member.Length
+                    sha256 = (Get-FileHash -LiteralPath $member.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                })
+            }
+        }
+    }
+    return @($result | Sort-Object path)
+}
+
+function Assert-MutableStateEquivalent {
+    param([string]$Accepted, [string]$Candidate, [switch]$IncludeLock)
+    $acceptedInventory = @(Get-MutableStateInventory $Accepted -IncludeLock:$IncludeLock)
+    $candidateInventory = @(Get-MutableStateInventory $Candidate -IncludeLock:$IncludeLock)
+    $acceptedJson = ConvertTo-Json -InputObject $acceptedInventory -Depth 4 -Compress
+    $candidateJson = ConvertTo-Json -InputObject $candidateInventory -Depth 4 -Compress
+    if ($acceptedJson -cne $candidateJson) { throw 'mutable state bytes differ after transfer' }
+}
+
+function Save-CandidateMutableState {
+    param([string]$Staging, [string]$CandidateState)
+    if (Test-Path -LiteralPath $CandidateState) { throw 'candidate mutable state path already exists' }
+    [void][System.IO.Directory]::CreateDirectory($CandidateState)
+    Copy-MutableStateRoots $Staging $CandidateState -IncludeLock
+    Assert-MutableStateShape $CandidateState
+    Assert-MutableStateEquivalent $Staging $CandidateState -IncludeLock
+}
+
+function Copy-AcceptedMutableState {
+    param([string]$Accepted, [string]$Staging)
+    Clear-MutableStateRoots $Staging -IncludeLock
+    Copy-MutableStateRoots $Accepted $Staging
+    Assert-MutableStateShape $Staging -AllowMissingLock
+    Assert-MutableStateEquivalent $Accepted $Staging
+}
+
+function Restore-CandidateMutableState {
+    param([string]$Staging, [string]$CandidateState)
+    Assert-MutableStateShape $CandidateState
+    Clear-MutableStateRoots $Staging -IncludeLock
+    Copy-MutableStateRoots $CandidateState $Staging -IncludeLock
+    Assert-MutableStateShape $Staging
+    Assert-MutableStateEquivalent $CandidateState $Staging -IncludeLock
+}
+
+function Assert-MatchingRuntimeVersion {
+    param([string]$Root, [string]$ExpectedRuntimeVersion)
+    $active = Get-Content -LiteralPath (Join-Path $Root 'pool.json') -Raw | ConvertFrom-Json
+    if ([string]$active.runtime_version -cne $ExpectedRuntimeVersion) {
+        throw 'archive runtime version differs; complete the governed RuntimeUpdate transition before package activation'
+    }
 }
 
 function Assert-AllFree {
@@ -252,33 +512,43 @@ function Assert-InstalledTree {
 }
 
 function Restore-PreviousInstall {
-    param([string]$Root, [string]$Backup, [string]$Failed, [string]$Staging)
-    if ((Test-Path -LiteralPath $Backup) -and (Test-Path -LiteralPath $Root)) {
-        $rootLock = Join-Path $Root '.pool.lock'
-        if (Test-Path -LiteralPath $rootLock) { Move-Item -LiteralPath $rootLock -Destination (Join-Path $Backup '.pool.lock') }
-        Move-Item -LiteralPath $Root -Destination $Failed
+    param([string]$Root, [string]$Backup, [switch]$LockHeld)
+    if (Test-Path -LiteralPath "$Root$ActivationName") {
+        Recover-PendingActivation $Root -LockHeld:$LockHeld
     }
-    $stagedLock = Join-Path $Staging '.pool.lock'
-    if ((Test-Path -LiteralPath $Backup) -and -not (Test-Path -LiteralPath (Join-Path $Backup '.pool.lock')) -and (Test-Path -LiteralPath $stagedLock)) {
-        Move-Item -LiteralPath $stagedLock -Destination (Join-Path $Backup '.pool.lock')
+    elseif (Test-Path -LiteralPath $Backup) {
+        throw 'activation recovery is required'
     }
-    if (Test-Path -LiteralPath $Backup) {
-        Move-Item -LiteralPath $Backup -Destination $Root
-    }
-    if (Test-Path -LiteralPath $Root) { [System.IO.File]::Delete("$Root$ActivationName") }
 }
 
 function Enter-PoolLock {
     param([string]$Root)
-    $stream = [System.IO.FileStream]::new((Join-Path $Root '.pool.lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    $path = Join-Path $Root '.pool.lock'
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-HardLink $item)) {
+        throw 'pool lock is not a regular unique file'
+    }
+    $stream = [System.IO.FileStream]::new($item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
     try { $stream.Lock(0, 1); return $stream } catch { $stream.Dispose(); throw }
 }
 
 function Write-ActivationTransaction {
-    param([string]$Root, [string]$Backup, [string]$Staging, [ValidateSet('prepared', 'backup', 'staging-locked', 'active')][string]$Phase)
+    param(
+        [string]$Root,
+        [string]$Backup,
+        [string]$Staging,
+        [string]$CandidateState,
+        [ValidateSet('prepared', 'candidate-saved', 'state-copied', 'backup', 'staging-locked', 'active', 'committed')][string]$Phase
+    )
     $path = "$Root$ActivationName"
     $temporary = "$path.$([guid]::NewGuid().ToString('N')).new"
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes((@{ schema_version = 1; backup = $Backup; staging = $Staging; phase = $Phase } | ConvertTo-Json -Compress))
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(([ordered]@{
+        schema_version = 1
+        backup = $Backup
+        staging = $Staging
+        candidate_state = $CandidateState
+        phase = $Phase
+    } | ConvertTo-Json -Compress))
     $stream = [System.IO.FileStream]::new($temporary, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough)
     try {
         $stream.Write($bytes, 0, $bytes.Length)
@@ -293,40 +563,90 @@ function Write-ActivationTransaction {
     }
 }
 
+function Assert-ActivationTransactionPaths {
+    param([string]$Root, [object]$Transaction)
+    $prefix = "$Root.staging."
+    if (-not ([string]$Transaction.staging).StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+        throw 'invalid activation staging path'
+    }
+    $suffix = ([string]$Transaction.staging).Substring($prefix.Length)
+    if ($suffix -notmatch '^[0-9a-f]{32}$' -or [string]$Transaction.backup -cne "$Root.previous.$suffix" -or
+        [string]$Transaction.candidate_state -cne "$Root.staging.$suffix.mutable") {
+        throw 'invalid activation transaction paths'
+    }
+}
+
 function Recover-PendingActivation {
-    param([string]$Root)
+    param([string]$Root, [switch]$LockHeld)
     $path = "$Root$ActivationName"
     if (-not (Test-Path -LiteralPath $path)) { return }
+    $transactionItem = Get-Item -LiteralPath $path -Force
+    if ($transactionItem.PSIsContainer -or ($transactionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-HardLink $transactionItem)) {
+        throw 'invalid activation transaction file'
+    }
     try { $transaction = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
     catch { throw 'invalid activation transaction' }
-    Assert-ExactProperties $transaction @('schema_version', 'backup', 'staging', 'phase') 'activation transaction'
-    if ($transaction.schema_version -ne 1 -or [string]$transaction.phase -notin @('prepared', 'backup', 'staging-locked', 'active')) { throw 'invalid activation transaction' }
-    $hasRoot = Test-Path -LiteralPath $Root
-    $hasBackup = Test-Path -LiteralPath $transaction.backup
+    Assert-ExactProperties $transaction @('schema_version', 'backup', 'staging', 'candidate_state', 'phase') 'activation transaction'
+    if ($transaction.schema_version -ne 1 -or [string]$transaction.phase -notin @('prepared', 'candidate-saved', 'state-copied', 'backup', 'staging-locked', 'active', 'committed')) {
+        throw 'invalid activation transaction'
+    }
+    Assert-ActivationTransactionPaths $Root $transaction
+    $rootLock = Join-Path $Root '.pool.lock'
     $backupLock = Join-Path $transaction.backup '.pool.lock'
     $stagedLock = Join-Path $transaction.staging '.pool.lock'
-    if ($hasRoot -and -not $hasBackup) {
-        # The original root is still authoritative, whether the journal was
-        # written just before the first rename or a later phase write failed.
-    }
-    elseif (-not $hasRoot -and $hasBackup) {
-        if (Test-Path -LiteralPath $backupLock) {
-            Move-Item -LiteralPath $transaction.backup -Destination $Root
+    if (-not $LockHeld) {
+        $lockRoot = if (Test-Path -LiteralPath $rootLock) { $Root }
+        elseif (Test-Path -LiteralPath $backupLock) { [string]$transaction.backup }
+        elseif (Test-Path -LiteralPath $stagedLock) { [string]$transaction.staging }
+        else {
+            throw 'activation recovery has no authoritative lock'
         }
-        elseif (Test-Path -LiteralPath $stagedLock) {
-            Move-Item -LiteralPath $stagedLock -Destination $backupLock
-            Move-Item -LiteralPath $transaction.backup -Destination $Root
-        }
-        else { throw 'activation recovery has no authoritative lock' }
+        $recoveryLock = Enter-PoolLock $lockRoot
+        try { Recover-PendingActivation $Root -LockHeld } finally { $recoveryLock.Dispose() }
+        return
     }
-    elseif ($hasRoot -and $hasBackup) {
-        $rootLock = Join-Path $Root '.pool.lock'
-        if (-not (Test-Path -LiteralPath $rootLock)) { throw 'activation recovery has no authoritative lock' }
+    $hasRoot = Test-Path -LiteralPath $Root
+    $hasBackup = Test-Path -LiteralPath $transaction.backup
+    $hasStaging = Test-Path -LiteralPath $transaction.staging
+    if ([string]$transaction.phase -ceq 'committed') {
+        if (-not $hasRoot -or -not $hasBackup -or $hasStaging -or -not (Test-Path -LiteralPath (Join-Path $Root '.pool.lock'))) {
+            throw 'invalid committed activation state'
+        }
+        Remove-StatePath ([string]$transaction.candidate_state)
+        [System.IO.File]::Delete($path)
+        return
+    }
+    if ($hasRoot -and $hasBackup) {
+        if ($hasStaging -or -not (Test-Path -LiteralPath (Join-Path $Root '.pool.lock')) -or (Test-Path -LiteralPath $backupLock)) {
+            throw 'invalid active activation recovery state'
+        }
         Move-Item -LiteralPath $Root -Destination $transaction.staging
         Move-Item -LiteralPath $stagedLock -Destination $backupLock
         Move-Item -LiteralPath $transaction.backup -Destination $Root
     }
+    elseif (-not $hasRoot -and $hasBackup) {
+        if (-not $hasStaging) { throw 'activation recovery lost the candidate tree' }
+        if (-not (Test-Path -LiteralPath $backupLock)) {
+            if (-not (Test-Path -LiteralPath $stagedLock)) { throw 'activation recovery has no authoritative lock' }
+            Move-Item -LiteralPath $stagedLock -Destination $backupLock
+        }
+        Move-Item -LiteralPath $transaction.backup -Destination $Root
+    }
+    elseif ($hasRoot -and -not $hasBackup) {
+        if (-not $hasStaging -or -not (Test-Path -LiteralPath (Join-Path $Root '.pool.lock'))) {
+            throw 'activation recovery lost an installation tree or lock'
+        }
+    }
     else { throw 'invalid activation recovery state' }
+    if ([string]$transaction.phase -ceq 'prepared') {
+        Remove-StatePath ([string]$transaction.candidate_state)
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $transaction.candidate_state)) { throw 'activation recovery lost candidate mutable state' }
+        Restore-CandidateMutableState ([string]$transaction.staging) ([string]$transaction.candidate_state)
+        Write-ActivationTransaction $Root $transaction.backup $transaction.staging $transaction.candidate_state 'prepared'
+        Remove-StatePath ([string]$transaction.candidate_state)
+    }
     [System.IO.File]::Delete($path)
 }
 
@@ -340,7 +660,7 @@ function Invoke-AtomicInstall {
         $exists = Test-Path -LiteralPath $safeRoot
         if ($exists) {
             $recoveryLock = Enter-PoolLock $safeRoot
-            try { Recover-PendingActivation $safeRoot } finally { $recoveryLock.Dispose() }
+            try { Recover-PendingActivation $safeRoot -LockHeld } finally { $recoveryLock.Dispose() }
         }
         else { Recover-PendingActivation $safeRoot }
         $exists = Test-Path -LiteralPath $safeRoot
@@ -349,34 +669,56 @@ function Invoke-AtomicInstall {
         $suffix = [guid]::NewGuid().ToString('N')
         $staging = "$safeRoot.staging.$suffix"
         $backup = "$safeRoot.previous.$suffix"
-        $failed = "$safeRoot.failed.$suffix"
+        $candidateState = "$staging.mutable"
         Expand-VerifiedArchive $archiveStream $staging
         Assert-NtfsPath $staging
         Assert-InstalledTree $staging $archiveManifest.manifest $archiveManifest.manifest_sha256
         Assert-AllFree $staging $archiveManifest.manifest.runtime_version
+        Assert-MutableStateShape $staging
         if ($exists) {
             $lock = Enter-PoolLock $safeRoot
             try {
                 Assert-InstalledTree $safeRoot
                 Assert-AllFree $safeRoot
-                Write-ActivationTransaction $safeRoot $backup $staging 'prepared'
+                Assert-MutableStateShape $safeRoot
+                Assert-MatchingRuntimeVersion $safeRoot $archiveManifest.manifest.runtime_version
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'prepared'
+                Save-CandidateMutableState $staging $candidateState
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'candidate-saved'
+                Copy-AcceptedMutableState $safeRoot $staging
+                Assert-InstalledTree $safeRoot
+                Assert-AllFree $safeRoot
+                Assert-MutableStateShape $safeRoot
+                Assert-MatchingRuntimeVersion $safeRoot $archiveManifest.manifest.runtime_version
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'state-copied'
                 Move-Item -LiteralPath $safeRoot -Destination $backup
-                Write-ActivationTransaction $safeRoot $backup $staging 'backup'
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'backup'
                 Move-Item -LiteralPath (Join-Path $backup '.pool.lock') -Destination (Join-Path $staging '.pool.lock')
-                Write-ActivationTransaction $safeRoot $backup $staging 'staging-locked'
+                Assert-MutableStateShape $staging
+                Assert-MutableStateEquivalent $backup $staging
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'staging-locked'
                 Move-Item -LiteralPath $staging -Destination $safeRoot
-                Write-ActivationTransaction $safeRoot $backup $staging 'active'
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'active'
                 Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
                 Assert-AllFree $safeRoot $archiveManifest.manifest.runtime_version
+                Assert-MutableStateShape $safeRoot
+                Assert-MutableStateEquivalent $backup $safeRoot
+                Write-ActivationTransaction $safeRoot $backup $staging $candidateState 'committed'
+                Remove-StatePath $candidateState
                 [System.IO.File]::Delete("$safeRoot$ActivationName")
             }
-            catch { Restore-PreviousInstall $safeRoot $backup $failed $staging; throw }
+            catch {
+                $failure = $_
+                Restore-PreviousInstall $safeRoot $backup -LockHeld
+                throw $failure
+            }
             finally { $lock.Dispose() }
         }
         else {
             Move-Item -LiteralPath $staging -Destination $safeRoot
             Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
             Assert-AllFree $safeRoot $archiveManifest.manifest.runtime_version
+            Assert-MutableStateShape $safeRoot
         }
         [pscustomobject]@{
             action = $Operation

@@ -1,6 +1,10 @@
 import importlib
+import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -221,22 +225,96 @@ class PilotMatrixTests(unittest.TestCase):
             self.assertIn(normalized, source)
             self.assertNotIn(doubled, source)
 
+        def powershell_array(source, name):
+            match = re.search(
+                rf"(?ms)^\${re.escape(name)}\s*=\s*@\((?P<body>.*?)^\)",
+                source,
+            )
+            if not match:
+                self.fail(f"missing PowerShell array: {name}")
+            return re.findall(r"'([^']+)'", match.group("body"))
+
+        state_files = [
+            "pool.json",
+            ".pool.lock",
+            *(f"offices/O{number}/office-state.json" for number in range(1, 6)),
+        ]
+        state_directories = [
+            "runtime",
+            "operator-secrets",
+            "updates",
+            *(path for number in range(1, 6) for path in (
+                f"offices/O{number}/history",
+                f"offices/O{number}/work",
+            )),
+        ]
+        required_state_files = [
+            "runtime/generations.json",
+            "runtime/recovery-authority.json",
+            "runtime/runtime-update-state.json",
+            "operator-secrets/governance-witness.key",
+            *(f"operator-secrets/recovery-key-O{number}" for number in range(1, 6)),
+        ]
+        required_state_directories = [
+            "runtime/governance",
+            *(f"runtime/governance/{name}" for name in ("consumed", "issued", "revoked")),
+            *(f"runtime/{name}" for name in ("pointers", "receipts", "recovery", "transactions")),
+        ]
+        for source in (install, verify, uninstall):
+            self.assertEqual(powershell_array(source, "MutableStateFiles"), state_files)
+            self.assertEqual(powershell_array(source, "MutableStateDirectories"), state_directories)
+
+        state_shape = function_body(install, "Assert-MutableStateShape")
+        regular_state_file = function_body(install, "Assert-RegularStateFile")
+        for check in ("PSIsContainer", "ReparsePoint", "Test-HardLink"):
+            self.assertIn(check, regular_state_file)
+        self.assertIn("Assert-RegularStateFile", state_shape)
+        self.assertGreaterEqual(state_shape.count("Assert-SafeStateTree"), 2)
+        for relative in required_state_files + required_state_directories:
+            self.assertIn("'" + relative.replace("/", chr(92)) + "'", state_shape)
+
         activation = function_body(install, "Invoke-AtomicInstall")
         self.assertRegex(activation, r"(?s)try \{.*\}\s*finally \{\s*\$archiveStream\.Dispose\(\)\s*\}")
+        for operation in (
+            "Save-CandidateMutableState",
+            "Copy-AcceptedMutableState",
+            "Assert-MutableStateEquivalent",
+            "Assert-MatchingRuntimeVersion",
+        ):
+            self.assertIn(operation, activation)
+        self.assertLess(
+            activation.index("Assert-AllFree $safeRoot"),
+            activation.index("Assert-MatchingRuntimeVersion"),
+        )
+        self.assertLess(
+            activation.index("Assert-MatchingRuntimeVersion"),
+            activation.index("Write-ActivationTransaction"),
+        )
         self.assertLess(
             activation.index("Move-Item -LiteralPath (Join-Path $backup '.pool.lock') -Destination (Join-Path $staging '.pool.lock')"),
             activation.index("Move-Item -LiteralPath $staging -Destination $safeRoot"),
         )
         recovery = function_body(install, "Recover-PendingActivation")
-        for phase in ("prepared", "backup", "staging-locked", "active"):
+        for phase in ("prepared", "candidate-saved", "state-copied", "backup", "staging-locked", "active", "committed"):
             self.assertIn("'" + phase + "'", recovery)
         writer = function_body(install, "Write-ActivationTransaction")
         self.assertNotIn("WriteAllText", writer)
         for primitive in ("FileOptions]::WriteThrough", "Flush($true)", "File]::Replace", "File]::Move"):
             self.assertIn(primitive, writer)
-        for shape in ("$hasRoot", "$hasBackup", "$backupLock", "$stagedLock"):
+        for shape in ("$hasRoot", "$hasBackup", "$backupLock", "$stagedLock", "$transaction.candidate_state"):
             self.assertIn(shape, recovery)
-        active_recovery = recovery[recovery.index("elseif ($hasRoot -and $hasBackup)") :]
+        lock_selection = recovery[
+            recovery.index("if (-not $LockHeld)") : recovery.index("$hasRoot =")
+        ]
+        self.assertNotIn("$lockRoots", lock_selection)
+        lock_checks = (
+            "if (Test-Path -LiteralPath $rootLock)",
+            "elseif (Test-Path -LiteralPath $backupLock)",
+            "elseif (Test-Path -LiteralPath $stagedLock)",
+        )
+        lock_check_offsets = [lock_selection.index(check) for check in lock_checks]
+        self.assertEqual(lock_check_offsets, sorted(lock_check_offsets))
+        active_recovery = recovery[recovery.index("if ($hasRoot -and $hasBackup)") :]
         source_recovery_moves = (
             "Move-Item -LiteralPath $Root -Destination $transaction.staging",
             "Move-Item -LiteralPath $stagedLock -Destination $backupLock",
@@ -251,122 +329,360 @@ class PilotMatrixTests(unittest.TestCase):
             self.assertIn("ExpectedRuntimeVersion", all_free)
             self.assertIn("runtime version differs", all_free)
 
-        # This models the filesystem (not PowerShell) after every activation
-        # operation and each individual recovery move. Restarting before or
-        # after any move must preserve both byte trees and the accepted lock.
-        accepted = b"accepted-bytes"
-        candidate = b"candidate-bytes"
-        lock = "accepted-lock-identity"
+        roots = state_files + state_directories
 
-        def move(state, source, destination, lock_only=False):
-            state = state.copy()
-            keys = ("lock",) if lock_only else ("tree", "lock")
-            if any(state[f"{destination}_{key}"] is not None for key in keys):
-                raise ValueError("occupied recovery destination")
-            for key in keys:
-                state[f"{destination}_{key}"] = state[f"{source}_{key}"]
-                state[f"{source}_{key}"] = None
-            return state
+        def present(path):
+            return path.exists() or path.is_symlink()
 
-        def recover_once(state):
-            state = state.copy()
-            if state["phase"] is None:
-                return state, None
-            if state["phase"] not in {"prepared", "backup", "staging-locked", "active"}:
-                raise ValueError("invalid transaction")
-            if state["root_tree"] and not state["backup_tree"]:
-                state["phase"] = None
-                return state, "delete-journal"
-            if not state["root_tree"] and state["backup_tree"]:
-                if state["backup_lock"] == lock:
-                    return move(state, "backup", "root"), "backup-to-root"
-                if state["staging_lock"] == lock:
-                    return move(state, "staging", "backup", lock_only=True), "staging-lock-to-backup"
-            if state["root_tree"] and state["backup_tree"] and state["root_lock"] == lock:
-                return move(state, "root", "staging"), "root-to-staging"
-            raise ValueError("unrecoverable transaction shape")
+        def remove(path):
+            if not present(path):
+                return
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
 
-        def assert_preserved(state):
-            self.assertCountEqual(
-                [state[f"{place}_tree"] for place in ("root", "backup", "staging") if state[f"{place}_tree"] is not None],
-                [accepted, candidate],
+        def copy_path(source, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+
+        def copy_roots(source, destination, selected=roots):
+            for relative in selected:
+                candidate = source / relative
+                if present(candidate):
+                    copy_path(candidate, destination / relative)
+
+        def clear_roots(base):
+            for relative in roots:
+                remove(base / relative)
+
+        def mutable(relative):
+            return relative in state_files or any(
+                relative == directory or relative.startswith(directory + "/")
+                for directory in state_directories
             )
+
+        def snapshot(base, mutable_only=False):
+            result = {}
+            for path in sorted(base.rglob("*")):
+                relative = path.relative_to(base).as_posix()
+                if mutable_only and not mutable(relative):
+                    continue
+                information = path.lstat()
+                if path.is_symlink():
+                    value = ("link", os.readlink(path))
+                elif path.is_dir():
+                    value = ("directory",)
+                else:
+                    value = ("file", information.st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+                result[relative] = value
+            return result
+
+        def write_json(path, value):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+
+        def build_archive(path, immutable, runtime_version="v1"):
+            path.mkdir()
+            (path / ".pool.lock").write_bytes(b"candidate-lock")
+            write_json(path / "pool.json", {
+                "schema_version": 1,
+                "office_count": 5,
+                "offices": [f"O{number}" for number in range(1, 6)],
+                "runtime_version": runtime_version,
+            })
+            for name in ("receipts", "pointers", "transactions", "recovery"):
+                (path / "runtime" / name).mkdir(parents=True)
+            for name in ("consumed", "issued", "revoked"):
+                (path / "runtime" / "governance" / name).mkdir(parents=True)
+            write_json(path / "runtime" / "generations.json", {
+                "schema_version": 1,
+                "generations": {f"O{number}": 0 for number in range(1, 6)},
+            })
+            write_json(path / "runtime" / "recovery-authority.json", {"schema_version": 1, "digests": {}})
+            write_json(path / "runtime" / "runtime-update-state.json", {"schema_version": 1, "completed": {}, "state_tag": "0" * 64})
+            (path / "operator-secrets").mkdir()
+            (path / "operator-secrets" / "governance-witness.key").write_bytes(b"g" * 32)
+            for number in range(1, 6):
+                (path / "operator-secrets" / f"recovery-key-O{number}").write_bytes(f"key-O{number}\n".encode())
+            (path / "updates" / "runtime-transactions").mkdir(parents=True)
+            for number in range(1, 6):
+                office = path / "offices" / f"O{number}"
+                (office / "history").mkdir(parents=True)
+                (office / "work").mkdir()
+                write_json(office / "office-state.json", {
+                    "schema_version": 1,
+                    "office_id": f"O{number}",
+                    "generation": 0,
+                    "status": "free",
+                })
+                executable = office / "runtime" / "versions" / runtime_version / "ao2.exe"
+                executable.parent.mkdir(parents=True)
+                executable.write_bytes(("runtime-" + runtime_version).encode())
+            (path / "immutable.bin").write_bytes(immutable)
+
+        immutable_files = {"immutable.bin", *(f"offices/O{number}/runtime/versions/v1/ao2.exe" for number in range(1, 6))}
+
+        def validate(base):
+            for relative in state_files:
+                item = base / relative
+                if not item.is_file() or item.is_symlink() or item.stat().st_nlink != 1:
+                    raise ValueError("unsafe mutable file")
+            for relative in state_directories:
+                item = base / relative
+                if relative == "updates" and not present(item):
+                    continue
+                if not item.is_dir() or item.is_symlink():
+                    raise ValueError("unsafe mutable directory")
+            for relative in required_state_files:
+                item = base / relative
+                if not item.is_file() or item.is_symlink() or item.stat().st_nlink != 1:
+                    raise ValueError("unsafe mutable file")
+            for relative in required_state_directories:
+                item = base / relative
+                if not item.is_dir() or item.is_symlink():
+                    raise ValueError("unsafe mutable directory")
+            for path in base.rglob("*"):
+                relative = path.relative_to(base).as_posix()
+                information = path.lstat()
+                if path.is_symlink() or (path.is_file() and information.st_nlink != 1):
+                    raise ValueError("unsafe state member")
+                if path.is_file() and not mutable(relative) and relative not in immutable_files:
+                    raise ValueError("unknown state member")
+
+        def advance_generations(root):
+            write_json(root / "runtime" / "generations.json", {
+                "schema_version": 1,
+                "generations": {f"O{number}": number + 10 for number in range(1, 6)},
+            })
+            marker = "a" * 64 + "-witness-" + "b" * 32
+            (root / "runtime" / "governance" / "issued" / marker).write_bytes(b"authenticated-governance-history\n")
+            (root / "runtime" / "runtime-update-state.json").write_bytes(b"authenticated-runtime-update-history\n")
+            (root / "operator-secrets" / "governance-witness.key").write_bytes(b"accepted-secret".ljust(32, b"!"))
+            for number in range(1, 6):
+                write_json(root / "offices" / f"O{number}" / "office-state.json", {
+                    "schema_version": 1,
+                    "office_id": f"O{number}",
+                    "generation": number + 10,
+                    "status": "free",
+                })
+                evidence = root / "offices" / f"O{number}" / "history" / ("recovery-g1-" + f"{number:032x}") / "recovery.json"
+                evidence.parent.mkdir()
+                evidence.write_bytes(f"history-O{number}\n".encode())
+
+        def activate(root, archive, suffix):
+            active_version = json.loads((root / "pool.json").read_bytes())["runtime_version"]
+            archive_version = json.loads((archive / "pool.json").read_bytes())["runtime_version"]
+            if active_version != archive_version:
+                raise ValueError("unsupported runtime drift")
+            validate(root)
+            validate(archive)
+            staging = root.with_name(root.name + ".staging." + suffix)
+            backup = root.with_name(root.name + ".previous." + suffix)
+            candidate_state = staging.with_name(staging.name + ".mutable")
+            shutil.copytree(archive, staging)
+            candidate_state.mkdir()
+            copy_roots(staging, candidate_state)
+            clear_roots(staging)
+            copy_roots(root, staging, [path for path in roots if path != ".pool.lock"])
             self.assertEqual(
-                [state[f"{place}_lock"] for place in ("root", "backup", "staging") if state[f"{place}_lock"] is not None],
-                [lock],
+                {key: value for key, value in snapshot(root, True).items() if key != ".pool.lock"},
+                snapshot(staging, True),
             )
+            os.replace(root, backup)
+            os.replace(backup / ".pool.lock", staging / ".pool.lock")
+            os.replace(staging, root)
+            remove(candidate_state)
+            return backup
 
-        def converge(state):
-            operations = []
-            for _ in range(5):
-                state, operation = recover_once(state)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            original = base / "original"
+            update = base / "update"
+            root = base / "active"
+            build_archive(original, b"original-package")
+            build_archive(update, b"updated-package")
+            shutil.copytree(original, root)
+            advance_generations(root)
+            accepted_state = snapshot(root, True)
+            lock_identity = root.joinpath(".pool.lock").stat().st_ino
+
+            activate(root, update, "1" * 32)
+            self.assertEqual(snapshot(root, True), accepted_state)
+            self.assertEqual(root.joinpath(".pool.lock").stat().st_ino, lock_identity)
+            self.assertEqual((root / "immutable.bin").read_bytes(), b"updated-package")
+
+            before_rollback = snapshot(root, True)
+            activate(root, original, "2" * 32)
+            self.assertEqual(snapshot(root, True), before_rollback)
+            self.assertEqual(root.joinpath(".pool.lock").stat().st_ino, lock_identity)
+            self.assertEqual((root / "immutable.bin").read_bytes(), b"original-package")
+
+            unknown = base / "unknown"
+            shutil.copytree(root, unknown)
+            (unknown / "offices" / "O1" / "cache.bin").write_bytes(b"not governed")
+            with self.assertRaisesRegex(ValueError, "unknown"):
+                validate(unknown)
+
+            unsafe = base / "unsafe"
+            shutil.copytree(root, unsafe)
+            (unsafe / "offices" / "O1" / "history" / "link").symlink_to(unsafe / "pool.json")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                validate(unsafe)
+
+            wrong_kinds = (
+                ("runtime/generations.json", "directory"),
+                ("runtime/pointers", "file"),
+                ("runtime/governance/issued", "file"),
+                ("operator-secrets/recovery-key-O1", "directory"),
+            )
+            for number, (relative, replacement) in enumerate(wrong_kinds):
+                with self.subTest(wrong_kind=relative):
+                    invalid = base / f"wrong-kind-{number}"
+                    shutil.copytree(root, invalid)
+                    target = invalid / relative
+                    remove(target)
+                    if replacement == "directory":
+                        target.mkdir()
+                    else:
+                        target.write_bytes(b"wrong kind")
+                    with self.assertRaisesRegex(ValueError, "unsafe mutable"):
+                        validate(invalid)
+
+            drift = base / "drift"
+            build_archive(drift, b"future-package", "v2")
+            before_drift = snapshot(root)
+            with self.assertRaisesRegex(ValueError, "runtime drift"):
+                activate(root, drift, "3" * 32)
+            self.assertEqual(snapshot(root), before_drift)
+            self.assertFalse(root.with_name(root.name + ".staging." + "3" * 32).exists())
+
+        # Exercise real directories and bytes at every state-copy and rename
+        # prefix. Recovery itself is also restartable after each individual
+        # move because the journal and candidate-state copy remain durable.
+        def interrupted_case(base, stop):
+            base.mkdir()
+            accepted_archive = base / "accepted-archive"
+            archive = base / "archive"
+            root = base / "root"
+            staging = base / "root.staging"
+            backup = base / "root.previous"
+            candidate_state = base / "root.staging.mutable"
+            journal = base / "root.activation.json"
+            build_archive(accepted_archive, b"accepted-package")
+            build_archive(archive, b"candidate-package")
+            shutil.copytree(accepted_archive, root)
+            advance_generations(root)
+            accepted = snapshot(root)
+            candidate = snapshot(archive)
+            activated = dict(candidate)
+            activated.update({key: value for key, value in accepted.items() if mutable(key)})
+            accepted_lock = (root / ".pool.lock").stat().st_ino
+            shutil.copytree(archive, staging)
+
+            def phase(value):
+                write_json(journal, {"phase": value})
+
+            operations = [("prepared", lambda: phase("prepared"))]
+            for relative in roots:
+                operations.append(("save-" + relative, lambda relative=relative: (
+                    candidate_state.mkdir(exist_ok=True),
+                    copy_path(staging / relative, candidate_state / relative),
+                )))
+            operations.append(("candidate-saved", lambda: phase("candidate-saved")))
+            for relative in roots:
+                operations.append(("clear-" + relative, lambda relative=relative: remove(staging / relative)))
+                if relative != ".pool.lock":
+                    operations.append(("copy-" + relative, lambda relative=relative: copy_path(root / relative, staging / relative)))
+            operations.extend((
+                ("state-copied", lambda: phase("state-copied")),
+                ("root-to-backup", lambda: os.replace(root, backup)),
+                ("backup", lambda: phase("backup")),
+                ("lock-to-staging", lambda: os.replace(backup / ".pool.lock", staging / ".pool.lock")),
+                ("staging-locked", lambda: phase("staging-locked")),
+                ("staging-to-root", lambda: os.replace(staging, root)),
+                ("active", lambda: phase("active")),
+                ("committed", lambda: phase("committed")),
+                ("partial-commit-cleanup", lambda: remove(candidate_state / "runtime" / "generations.json")),
+                ("candidate-state-cleaned", lambda: remove(candidate_state)),
+                ("journal-cleaned", lambda: journal.unlink()),
+            ))
+            committed_stop = next(
+                number for number, (name, _) in enumerate(operations, 1)
+                if name == "committed"
+            )
+            for _, operation in operations[:stop]:
+                operation()
+
+            def recover_once():
+                if not journal.exists():
+                    return None
+                current = json.loads(journal.read_bytes())["phase"]
+                if current == "committed":
+                    if candidate_state.exists():
+                        remove(candidate_state)
+                        return "finish-commit-cleanup"
+                    journal.unlink()
+                    return "delete-committed-journal"
+                if current not in {"prepared", "candidate-saved", "state-copied", "backup", "staging-locked", "active"}:
+                    raise ValueError("invalid transaction")
+                if root.exists() and backup.exists():
+                    os.replace(root, staging)
+                    return "root-to-staging"
+                if not root.exists() and backup.exists():
+                    if not (backup / ".pool.lock").exists():
+                        os.replace(staging / ".pool.lock", backup / ".pool.lock")
+                        return "staging-lock-to-backup"
+                    os.replace(backup, root)
+                    return "backup-to-root"
+                if root.exists() and not backup.exists():
+                    if current != "prepared":
+                        clear_roots(staging)
+                        copy_roots(candidate_state, staging)
+                        phase("prepared")
+                        return "restore-candidate-state"
+                    if candidate_state.exists():
+                        remove(candidate_state)
+                        return "discard-candidate-state-copy"
+                    journal.unlink()
+                    return "delete-journal"
+                raise ValueError("unrecoverable transaction shape")
+
+            moves = []
+            for _ in range(10):
+                operation = recover_once()
                 if operation is None:
-                    return state, operations
-                operations.append(operation)
-            self.fail("recovery did not converge")
+                    break
+                moves.append(operation)
+            else:
+                self.fail("recovery did not converge")
+            if stop >= committed_stop:
+                self.assertEqual(snapshot(root), activated)
+                self.assertFalse(staging.exists())
+                self.assertTrue(backup.exists())
+            else:
+                self.assertEqual(snapshot(root), accepted)
+                self.assertEqual(snapshot(staging), candidate)
+                self.assertFalse(backup.exists())
+            self.assertEqual((root / ".pool.lock").stat().st_ino, accepted_lock)
+            self.assertFalse(candidate_state.exists())
+            return operations, moves
 
-        def assert_converged(state):
-            recovered, _ = converge(state)
-            self.assertEqual(recovered["root_tree"], accepted)
-            self.assertEqual(recovered["root_lock"], lock)
-            self.assertEqual(recovered["staging_tree"], candidate)
-            self.assertIsNone(recovered["backup_tree"])
-            self.assertIsNone(recovered["phase"])
-
-        state = {
-            "phase": None,
-            "root_tree": accepted,
-            "backup_tree": None,
-            "staging_tree": candidate,
-            "root_lock": lock,
-            "backup_lock": None,
-            "staging_lock": None,
-        }
-        def write(phase):
-            state["phase"] = phase
-
-        def move_root_to_backup():
-            state.update(move(state, "root", "backup"))
-
-        def move_lock_to_staging():
-            state.update(move(state, "backup", "staging", lock_only=True))
-
-        def move_staging_to_root():
-            state.update(move(state, "staging", "root"))
-
-        transitions = (
-            ("after-prepared-write", lambda: write("prepared")),
-            ("after-root-to-backup", move_root_to_backup),
-            ("after-backup-write", lambda: write("backup")),
-            ("after-lock-to-staging", move_lock_to_staging),
-            ("after-staging-locked-write", lambda: write("staging-locked")),
-            ("after-staging-to-root", move_staging_to_root),
-            ("after-active-write", lambda: write("active")),
-        )
-        activation_prefixes = []
-        for prefix, transition in transitions:
-            transition()
-            assert_preserved(state)
-            activation_prefixes.append((prefix, state.copy()))
-
-        recovery_moves = set()
-        for prefix, interrupted in activation_prefixes:
-            with self.subTest(prefix=prefix):
-                while interrupted["phase"] is not None:
-                    assert_converged(interrupted)  # interruption before move
-                    interrupted, operation = recover_once(interrupted)
-                    assert_preserved(interrupted)
-                    assert_converged(interrupted)  # interruption after move
-                    if operation != "delete-journal":
-                        recovery_moves.add(operation)
-                assert_converged(interrupted)
-        self.assertEqual(recovery_moves, {"root-to-staging", "staging-lock-to-backup", "backup-to-root"})
-
-        bad = state.copy()
-        bad["phase"] = "partial-json"
-        with self.assertRaises(ValueError):
-            recover_once(bad)
-        assert_preserved(bad)
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary)
+            operation_names = None
+            recovery_moves = set()
+            probe_operations, _ = interrupted_case(template / "probe", 0)
+            operation_names = [name for name, _ in probe_operations]
+            remove(template / "probe")
+            for stop, prefix in enumerate(operation_names, 1):
+                with self.subTest(prefix=prefix):
+                    _, moves = interrupted_case(template / f"case-{stop}", stop)
+                    recovery_moves.update(moves)
+            self.assertTrue({"root-to-staging", "staging-lock-to-backup", "backup-to-root", "restore-candidate-state"} <= recovery_moves)
 
     def test_operator_docs_keep_preview_outputs_private_and_claims_truthful(self):
         guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text()
