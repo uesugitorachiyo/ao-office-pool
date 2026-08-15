@@ -112,7 +112,7 @@ def function_body(source, name):
 
 class PilotMatrixTests(unittest.TestCase):
     def test_inherited_and_blocker_rows_resolve_to_real_pilot_tests(self):
-        requirements = json.loads((ROOT / "manifests" / "requirements.json").read_text())["requirements"]
+        requirements = json.loads((ROOT / "manifests" / "requirements.json").read_text(encoding="utf-8"))["requirements"]
         self.assertEqual(
             [row["id"] for row in requirements],
             [f"V11-{number:02d}" for number in range(1, 13)]
@@ -131,9 +131,9 @@ class PilotMatrixTests(unittest.TestCase):
         self.assertTrue(all(callable(resolve_test(target)) for target in targets))
 
     def test_powershell_lifecycle_has_fail_closed_operation_order(self):
-        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text()
-        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text()
-        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text()
+        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text(encoding="utf-8")
+        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text(encoding="utf-8")
+        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text(encoding="utf-8")
 
         for source in (install, verify, uninstall):
             self.assertIn("Set-StrictMode -Version Latest", source)
@@ -161,7 +161,7 @@ class PilotMatrixTests(unittest.TestCase):
 
     def test_powershell_rejects_alias_reparse_and_hard_link_paths(self):
         sources = [
-            (ROOT / "packaging" / name).read_text()
+            (ROOT / "packaging" / name).read_text(encoding="utf-8")
             for name in (
                 "Install-AOOfficePool.ps1",
                 "Verify-AOOfficePool.ps1",
@@ -183,9 +183,9 @@ class PilotMatrixTests(unittest.TestCase):
         self.assertIn("Test-HardLink", archive_check)
 
     def test_powershell_preview_lifecycle_preserves_state_and_binds_trusted_bytes(self):
-        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text()
-        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text()
-        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text()
+        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text(encoding="utf-8")
+        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text(encoding="utf-8")
+        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text(encoding="utf-8")
 
         for source in (install, verify, uninstall):
             self.assertIn("DriveType -ne [System.IO.DriveType]::Fixed", source)
@@ -216,9 +216,9 @@ class PilotMatrixTests(unittest.TestCase):
         self.assertIn("Test-Path -LiteralPath $Backup", restore)
 
     def test_powershell_activation_prefixes_keep_the_lock_and_runtime_binding(self):
-        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text()
-        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text()
-        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text()
+        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text(encoding="utf-8")
+        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text(encoding="utf-8")
+        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text(encoding="utf-8")
         normalized = ".Replace('" + chr(92) + "', '/')"
         doubled = ".Replace('" + chr(92) * 2 + "', '/')"
 
@@ -775,8 +775,8 @@ class PilotMatrixTests(unittest.TestCase):
             self.assertTrue({"root-to-staging", "staging-lock-to-backup", "backup-to-root", "restore-candidate-state"} <= recovery_moves)
 
     def test_operator_docs_keep_preview_outputs_private_and_claims_truthful(self):
-        guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text()
-        qualification = (ROOT / "docs" / "PILOT_QUALIFICATION.md").read_text()
+        guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text(encoding="utf-8")
+        qualification = (ROOT / "docs" / "PILOT_QUALIFICATION.md").read_text(encoding="utf-8")
         combined = guide + qualification
         self.assertIn("developer-preview", combined)
         self.assertIn("O1, O2, O3, O4, and O5", combined)
