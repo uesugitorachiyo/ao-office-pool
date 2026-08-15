@@ -543,6 +543,25 @@ function Enter-PoolLock {
     try { $stream.Lock(0, 1); return $stream } catch { $stream.Dispose(); throw }
 }
 
+function Publish-ActivationTransaction {
+    param([string]$Source, [string]$Destination)
+    if ($null -eq ('AOOfficePool.NativeJournalPublisher' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+namespace AOOfficePool {
+    public static class NativeJournalPublisher {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool MoveFileExW(string source, string destination, uint flags);
+    }
+}
+'@
+    }
+    if (-not [AOOfficePool.NativeJournalPublisher]::MoveFileExW($Source, $Destination, [uint32]9)) {
+        $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "activation transaction publication failed with Win32 error $errorCode"
+    }
+}
+
 function Write-ActivationTransaction {
     param(
         [string]$Root,
@@ -566,12 +585,7 @@ function Write-ActivationTransaction {
         $stream.Flush($true)
     }
     finally { $stream.Dispose() }
-    if (Test-Path -LiteralPath $path) {
-        [System.IO.File]::Replace($temporary, $path, $null)
-    }
-    else {
-        [System.IO.File]::Move($temporary, $path)
-    }
+    Publish-ActivationTransaction $temporary $path
 }
 
 function Assert-ActivationTransactionPaths {

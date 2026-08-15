@@ -318,8 +318,15 @@ class PilotMatrixTests(unittest.TestCase):
             self.assertIn("'" + phase + "'", recovery)
         writer = function_body(install, "Write-ActivationTransaction")
         self.assertNotIn("WriteAllText", writer)
-        for primitive in ("FileOptions]::WriteThrough", "Flush($true)", "File]::Replace", "File]::Move"):
+        for primitive in ("FileOptions]::WriteThrough", "Flush($true)"):
             self.assertIn(primitive, writer)
+        self.assertIn("Publish-ActivationTransaction $temporary $path", writer)
+        self.assertNotIn("[System.IO.File]::Replace", writer)
+        self.assertNotIn("[System.IO.File]::Move", writer)
+        publisher = function_body(install, "Publish-ActivationTransaction")
+        self.assertIn("MoveFileExW", publisher)
+        self.assertIn("[uint32]9", publisher)
+        self.assertIn("GetLastWin32Error()", publisher)
         for shape in ("$hasRoot", "$hasBackup", "$backupLock", "$stagedLock", "$transaction.candidate_state"):
             self.assertIn(shape, recovery)
         lock_selection = recovery[
