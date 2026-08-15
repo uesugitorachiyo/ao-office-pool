@@ -204,7 +204,8 @@ class PilotMatrixTests(unittest.TestCase):
         expansion = function_body(install, "Expand-VerifiedArchive")
         self.assertIn("[System.IO.Compression.ZipArchive]::new($ArchiveStream", expansion)
         self.assertNotIn("ExtractToDirectory", expansion)
-        self.assertIn("$entry.ExtractToFile", expansion)
+        self.assertIn("[System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)", expansion)
+        self.assertNotIn("$entry.ExtractToFile", expansion)
 
         activation = function_body(install, "Invoke-AtomicInstall")
         self.assertIn("Enter-PoolLock", activation)

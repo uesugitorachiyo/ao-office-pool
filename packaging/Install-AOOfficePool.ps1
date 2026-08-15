@@ -205,7 +205,7 @@ function Expand-VerifiedArchive {
             }
             else {
                 [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target))
-                $entry.ExtractToFile($target, $false)
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
             }
         }
     }
