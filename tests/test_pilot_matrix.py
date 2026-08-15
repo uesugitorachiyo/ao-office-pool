@@ -264,14 +264,32 @@ class PilotMatrixTests(unittest.TestCase):
             self.assertEqual(powershell_array(source, "MutableStateFiles"), state_files)
             self.assertEqual(powershell_array(source, "MutableStateDirectories"), state_directories)
 
-        state_shape = function_body(install, "Assert-MutableStateShape")
-        regular_state_file = function_body(install, "Assert-RegularStateFile")
-        for check in ("PSIsContainer", "ReparsePoint", "Test-HardLink"):
-            self.assertIn(check, regular_state_file)
-        self.assertIn("Assert-RegularStateFile", state_shape)
-        self.assertGreaterEqual(state_shape.count("Assert-SafeStateTree"), 2)
-        for relative in required_state_files + required_state_directories:
-            self.assertIn("'" + relative.replace("/", chr(92)) + "'", state_shape)
+        for source in (install, verify, uninstall):
+            state_shape = function_body(source, "Assert-MutableStateShape")
+            regular_state_file = function_body(source, "Assert-RegularStateFile")
+            governance_markers = function_body(source, "Assert-GovernanceMarkerDirectory")
+            for check in ("PSIsContainer", "ReparsePoint", "Test-HardLink"):
+                self.assertIn(check, regular_state_file)
+            self.assertIn("Assert-SafeStateTree $Path", governance_markers)
+            self.assertIn("^[0-9a-f]{64}-witness-[0-9a-f]{32}$", governance_markers)
+            self.assertIn("Assert-RegularStateFile", governance_markers)
+            self.assertIn("Assert-RegularStateFile", state_shape)
+            self.assertGreaterEqual(state_shape.count("Assert-SafeStateTree"), 2)
+            self.assertIn("Assert-GovernanceMarkerDirectory", state_shape)
+            for relative in required_state_files + required_state_directories:
+                self.assertIn("'" + relative.replace("/", chr(92)) + "'", state_shape)
+
+        verification = function_body(verify, "Invoke-Verification")
+        self.assertLess(
+            verification.index("Assert-MutableStateShape $safeRoot"),
+            verification.index("[pscustomobject]"),
+        )
+        removal = function_body(uninstall, "Invoke-AtomicUninstall")
+        self.assertGreaterEqual(removal.count("Assert-MutableStateShape"), 2)
+        self.assertLess(
+            removal.index("Assert-MutableStateShape $safeRoot"),
+            removal.index("Move-Item -LiteralPath $safeRoot"),
+        )
 
         activation = function_body(install, "Invoke-AtomicInstall")
         self.assertRegex(activation, r"(?s)try \{.*\}\s*finally \{\s*\$archiveStream\.Dispose\(\)\s*\}")
@@ -445,6 +463,19 @@ class PilotMatrixTests(unittest.TestCase):
                 item = base / relative
                 if not item.is_dir() or item.is_symlink():
                     raise ValueError("unsafe mutable directory")
+            for name in ("consumed", "issued", "revoked"):
+                for item in (base / "runtime" / "governance" / name).iterdir():
+                    information = item.lstat()
+                    if (
+                        item.is_symlink()
+                        or not item.is_file()
+                        or information.st_nlink != 1
+                        or re.fullmatch(r"[0-9a-f]{64}-witness-[0-9a-f]{32}", item.name) is None
+                    ):
+                        raise ValueError("unsafe governance marker")
+            for number in range(1, 6):
+                if any((base / "offices" / f"O{number}" / "work").iterdir()):
+                    raise ValueError("unsafe office work residue")
             for path in base.rglob("*"):
                 relative = path.relative_to(base).as_posix()
                 information = path.lstat()
@@ -551,6 +582,57 @@ class PilotMatrixTests(unittest.TestCase):
                         target.write_bytes(b"wrong kind")
                     with self.assertRaisesRegex(ValueError, "unsafe mutable"):
                         validate(invalid)
+
+            validate(root)
+            alternate_marker = "c" * 64 + "-witness-" + "d" * 32
+            for number, marker_case in enumerate(("wrong-name", "nested", "directory", "symlink", "hardlink")):
+                with self.subTest(governance_marker=marker_case):
+                    invalid = base / f"governance-{number}"
+                    shutil.copytree(root, invalid)
+                    issued = invalid / "runtime" / "governance" / "issued"
+                    if marker_case == "wrong-name":
+                        (issued / "unknown.bin").write_bytes(b"unknown governance bytes")
+                    elif marker_case == "nested":
+                        nested = issued / "nested"
+                        nested.mkdir()
+                        (nested / alternate_marker).write_bytes(b"nested governance bytes")
+                    elif marker_case == "directory":
+                        (issued / alternate_marker).mkdir()
+                    elif marker_case == "symlink":
+                        (issued / alternate_marker).symlink_to(invalid / "pool.json")
+                    else:
+                        source = base / f"governance-hardlink-source-{number}"
+                        source.write_bytes(b"hard-linked governance bytes")
+                        os.link(source, issued / alternate_marker)
+                    with self.assertRaisesRegex(ValueError, "unsafe governance marker"):
+                        validate(invalid)
+
+            def verify_state(candidate):
+                validate(candidate)
+                return "verified-all-free"
+
+            def uninstall_state(candidate, quarantine):
+                validate(candidate)
+                os.replace(candidate, quarantine)
+
+            for residue_kind in ("work", "history-link"):
+                for operation in ("verify", "uninstall"):
+                    with self.subTest(residue=residue_kind, operation=operation):
+                        invalid = base / f"{operation}-{residue_kind}"
+                        shutil.copytree(root, invalid)
+                        if residue_kind == "work":
+                            (invalid / "offices" / "O1" / "work" / "residue.bin").write_bytes(b"live task residue")
+                        else:
+                            (invalid / "offices" / "O1" / "history" / "residue").symlink_to(invalid / "pool.json")
+                        before = snapshot(invalid)
+                        quarantine = invalid.with_name(invalid.name + ".quarantine")
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            if operation == "verify":
+                                verify_state(invalid)
+                            else:
+                                uninstall_state(invalid, quarantine)
+                        self.assertEqual(snapshot(invalid), before)
+                        self.assertFalse(quarantine.exists())
 
             drift = base / "drift"
             build_archive(drift, b"future-package", "v2")

@@ -97,6 +97,121 @@ function Test-HardLink {
     return $Item.PSObject.Properties.Match('LinkType').Count -eq 1 -and [string]$Item.LinkType -ceq 'HardLink'
 }
 
+function Assert-ExactChildNames {
+    param([string]$Path, [string[]]$Names, [string]$Kind)
+    $actual = @(Get-ChildItem -LiteralPath $Path -Force | ForEach-Object { $_.Name } | Sort-Object)
+    $expected = @($Names | Sort-Object)
+    if (($actual -join "`n") -cne ($expected -join "`n")) { throw "invalid $Kind shape" }
+}
+
+function Assert-RegularStateFile {
+    param([string]$Path, [string]$Kind)
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (Test-HardLink $item)) {
+        throw "invalid $Kind"
+    }
+}
+
+function Assert-SafeStateTree {
+    param([string]$Path)
+    $root = Get-Item -LiteralPath $Path -Force
+    if (-not $root.PSIsContainer -or ($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'mutable state root is not a regular directory'
+    }
+    $prefix = $root.FullName.TrimEnd('\') + '\'
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in Get-ChildItem -LiteralPath $root.FullName -Recurse -Force) {
+        $relative = $item.FullName.Substring($prefix.Length).Replace('\', '/')
+        [void](Assert-SafeRelativePath $relative)
+        if (-not $seen.Add($relative) -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            (-not $item.PSIsContainer -and (Test-HardLink $item))) {
+            throw 'mutable state contains an ambiguous path, reparse point, or hard link'
+        }
+    }
+}
+
+function Assert-GovernanceMarkerDirectory {
+    param([string]$Path)
+    Assert-SafeStateTree $Path
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force) {
+        if ($item.Name -cnotmatch '^[0-9a-f]{64}-witness-[0-9a-f]{32}$') {
+            throw 'invalid governance marker name'
+        }
+        Assert-RegularStateFile $item.FullName "governance marker: $($item.Name)"
+    }
+}
+
+function Assert-MutableStateShape {
+    param([string]$Root, [switch]$AllowMissingLock)
+    foreach ($relative in $MutableStateFiles) {
+        if ($AllowMissingLock -and $relative -ceq '.pool.lock') { continue }
+        Assert-RegularStateFile (Join-Path $Root $relative) "mutable state file: $relative"
+    }
+    foreach ($relative in $MutableStateDirectories) {
+        $path = Join-Path $Root $relative
+        if ($relative -ceq 'updates' -and -not (Test-Path -LiteralPath $path)) { continue }
+        Assert-SafeStateTree $path
+    }
+    Assert-ExactChildNames (Join-Path $Root 'runtime') @(
+        'generations.json', 'governance', 'pointers', 'receipts', 'recovery',
+        'recovery-authority.json', 'runtime-update-state.json', 'transactions'
+    ) 'runtime state'
+    foreach ($relative in @(
+        'runtime\generations.json',
+        'runtime\recovery-authority.json',
+        'runtime\runtime-update-state.json'
+    )) {
+        Assert-RegularStateFile (Join-Path $Root $relative) "mutable state file: $relative"
+    }
+    foreach ($relative in @(
+        'runtime\governance',
+        'runtime\pointers',
+        'runtime\receipts',
+        'runtime\recovery',
+        'runtime\transactions'
+    )) {
+        Assert-SafeStateTree (Join-Path $Root $relative)
+    }
+    Assert-ExactChildNames (Join-Path $Root 'runtime\governance') @('consumed', 'issued', 'revoked') 'runtime governance'
+    foreach ($relative in @(
+        'runtime\governance\consumed',
+        'runtime\governance\issued',
+        'runtime\governance\revoked'
+    )) {
+        Assert-GovernanceMarkerDirectory (Join-Path $Root $relative)
+    }
+    Assert-ExactChildNames (Join-Path $Root 'operator-secrets') @(
+        'governance-witness.key', 'recovery-key-O1', 'recovery-key-O2',
+        'recovery-key-O3', 'recovery-key-O4', 'recovery-key-O5'
+    ) 'operator secrets'
+    foreach ($relative in @(
+        'operator-secrets\governance-witness.key',
+        'operator-secrets\recovery-key-O1',
+        'operator-secrets\recovery-key-O2',
+        'operator-secrets\recovery-key-O3',
+        'operator-secrets\recovery-key-O4',
+        'operator-secrets\recovery-key-O5'
+    )) {
+        Assert-RegularStateFile (Join-Path $Root $relative) "mutable state file: $relative"
+    }
+    foreach ($relative in @('runtime\pointers', 'runtime\receipts', 'runtime\recovery', 'runtime\transactions')) {
+        Assert-ExactChildNames (Join-Path $Root $relative) @() $relative
+    }
+    foreach ($office in $ExpectedOffices) {
+        Assert-ExactChildNames (Join-Path $Root "offices\$office\work") @() "office $office work"
+    }
+    $updates = Join-Path $Root 'updates'
+    if (Test-Path -LiteralPath $updates) {
+        Assert-ExactChildNames $updates @('runtime-transactions') 'runtime updates'
+        $transactions = Join-Path $updates 'runtime-transactions'
+        $transactionItem = Get-Item -LiteralPath $transactions -Force
+        if (-not $transactionItem.PSIsContainer -or ($transactionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'invalid runtime transaction directory'
+        }
+        Assert-ExactChildNames $transactions @() 'runtime transactions'
+    }
+}
+
 function Assert-SafeRoot {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^[A-Za-z]:\\') {
@@ -210,6 +325,7 @@ function Invoke-Verification {
     $archiveManifest = Assert-ArchiveManifest $Archive $ChecksumFile
     $manifest = Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
     Assert-AllFree $safeRoot $manifest.runtime_version
+    Assert-MutableStateShape $safeRoot
     [pscustomobject]@{
         label = $manifest.label
         architecture = $manifest.architecture

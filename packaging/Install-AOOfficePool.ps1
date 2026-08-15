@@ -256,6 +256,17 @@ function Assert-SafeStateTree {
     }
 }
 
+function Assert-GovernanceMarkerDirectory {
+    param([string]$Path)
+    Assert-SafeStateTree $Path
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force) {
+        if ($item.Name -cnotmatch '^[0-9a-f]{64}-witness-[0-9a-f]{32}$') {
+            throw 'invalid governance marker name'
+        }
+        Assert-RegularStateFile $item.FullName "governance marker: $($item.Name)"
+    }
+}
+
 function Assert-MutableStateShape {
     param([string]$Root, [switch]$AllowMissingLock)
     foreach ($relative in $MutableStateFiles) {
@@ -293,7 +304,7 @@ function Assert-MutableStateShape {
         'runtime\governance\issued',
         'runtime\governance\revoked'
     )) {
-        Assert-SafeStateTree (Join-Path $Root $relative)
+        Assert-GovernanceMarkerDirectory (Join-Path $Root $relative)
     }
     Assert-ExactChildNames (Join-Path $Root 'operator-secrets') @(
         'governance-witness.key', 'recovery-key-O1', 'recovery-key-O2',
