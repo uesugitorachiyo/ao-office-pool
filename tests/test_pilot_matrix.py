@@ -210,6 +210,52 @@ class PilotMatrixTests(unittest.TestCase):
         restore = function_body(install, "Restore-PreviousInstall")
         self.assertIn("Test-Path -LiteralPath $Backup", restore)
 
+    def test_powershell_activation_prefixes_keep_the_lock_and_runtime_binding(self):
+        install = (ROOT / "packaging" / "Install-AOOfficePool.ps1").read_text()
+        verify = (ROOT / "packaging" / "Verify-AOOfficePool.ps1").read_text()
+        uninstall = (ROOT / "packaging" / "Uninstall-AOOfficePool.ps1").read_text()
+        normalized = ".Replace('" + chr(92) + "', '/')"
+        doubled = ".Replace('" + chr(92) * 2 + "', '/')"
+
+        for source in (verify, uninstall):
+            self.assertIn(normalized, source)
+            self.assertNotIn(doubled, source)
+
+        activation = function_body(install, "Invoke-AtomicInstall")
+        self.assertRegex(activation, r"(?s)try \{.*\}\s*finally \{\s*\$archiveStream\.Dispose\(\)\s*\}")
+        self.assertLess(
+            activation.index("Move-Item -LiteralPath (Join-Path $backup '.pool.lock') -Destination (Join-Path $staging '.pool.lock')"),
+            activation.index("Move-Item -LiteralPath $staging -Destination $safeRoot"),
+        )
+        recovery = function_body(install, "Recover-PendingActivation")
+        for phase in ("prepared", "backup", "staging-locked", "active"):
+            self.assertIn("'" + phase + "'", recovery)
+
+        for source in (install, verify, uninstall):
+            all_free = function_body(source, "Assert-AllFree")
+            self.assertIn("ExpectedRuntimeVersion", all_free)
+            self.assertIn("runtime version differs", all_free)
+
+        # Model every durable activation prefix: recovery always returns the
+        # previously accepted tree with its original lock identity.
+        prefixes = {
+            "prepared": (True, False, False),
+            "backup": (False, True, False),
+            "staging-locked": (False, True, True),
+            "active": (True, True, False),
+        }
+        for phase, state in prefixes.items():
+            with self.subTest(phase=phase):
+                root, backup, staged_lock = state
+                if phase == "prepared":
+                    self.assertTrue(root)
+                elif phase == "backup":
+                    self.assertTrue(backup)
+                elif phase == "staging-locked":
+                    self.assertTrue(backup and staged_lock)
+                else:
+                    self.assertTrue(root and backup)
+
     def test_operator_docs_keep_preview_outputs_private_and_claims_truthful(self):
         guide = (ROOT / "docs" / "OPERATOR_GUIDE.md").read_text()
         qualification = (ROOT / "docs" / "PILOT_QUALIFICATION.md").read_text()

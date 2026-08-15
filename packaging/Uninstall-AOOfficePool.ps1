@@ -96,11 +96,11 @@ function Assert-NtfsPath {
 }
 
 function Assert-AllFree {
-    param([string]$Root)
+    param([string]$Root, [string]$ExpectedRuntimeVersion = '')
     $pool = Get-Content -LiteralPath (Join-Path $Root 'pool.json') -Raw | ConvertFrom-Json
     Assert-ExactProperties $pool @('schema_version', 'office_count', 'offices', 'runtime_version') 'pool'
-    if ($pool.schema_version -ne 1 -or $pool.office_count -ne 5 -or (@($pool.offices) -join ',') -cne ($ExpectedOffices -join ',')) {
-        throw 'pool must contain exactly O1 through O5'
+    if ($pool.schema_version -ne 1 -or $pool.office_count -ne 5 -or (@($pool.offices) -join ',') -cne ($ExpectedOffices -join ',') -or (-not [string]::IsNullOrEmpty($ExpectedRuntimeVersion) -and [string]$pool.runtime_version -cne $ExpectedRuntimeVersion)) {
+        throw 'pool must contain exactly O1 through O5 and runtime version differs'
     }
     if (Test-Path -LiteralPath (Join-Path $Root 'updates\runtime-transaction.json')) {
         throw 'runtime recovery is pending'
@@ -160,7 +160,7 @@ function Assert-InstalledTree {
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or (-not $item.PSIsContainer -and (Test-HardLink $item))) {
             throw 'installed tree contains a reparse point'
         }
-        if (-not $item.PSIsContainer -and -not (Test-MutableStatePath $item.FullName.Substring($rootPrefix.Length).Replace('\\', '/'))) {
+        if (-not $item.PSIsContainer -and -not (Test-MutableStatePath $item.FullName.Substring($rootPrefix.Length).Replace('\', '/'))) {
             [void]$actual.Add($item.FullName.Substring($rootPrefix.Length).Replace('\', '/'))
         }
     }
@@ -182,12 +182,12 @@ function Invoke-AtomicUninstall {
     Assert-NtfsPath $safeRoot
     $archiveManifest = Assert-ArchiveManifest $Archive $ChecksumFile
     Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
-    Assert-AllFree $safeRoot
+    Assert-AllFree $safeRoot $archiveManifest.manifest.runtime_version
     $quarantine = "$safeRoot.uninstalled.$([guid]::NewGuid().ToString('N'))"
     try {
         Move-Item -LiteralPath $safeRoot -Destination $quarantine
         Assert-InstalledTree $quarantine $archiveManifest.manifest $archiveManifest.manifest_sha256
-        Assert-AllFree $quarantine
+        Assert-AllFree $quarantine $archiveManifest.manifest.runtime_version
     }
     catch {
         Restore-PreviousInstall $safeRoot $quarantine

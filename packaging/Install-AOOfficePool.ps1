@@ -198,11 +198,11 @@ function Test-MutableStatePath {
 }
 
 function Assert-AllFree {
-    param([string]$Root)
+    param([string]$Root, [string]$ExpectedRuntimeVersion = '')
     $pool = Get-Content -LiteralPath (Join-Path $Root 'pool.json') -Raw | ConvertFrom-Json
     Assert-ExactProperties $pool @('schema_version', 'office_count', 'offices', 'runtime_version') 'pool'
-    if ($pool.schema_version -ne 1 -or $pool.office_count -ne 5 -or (@($pool.offices) -join ',') -cne ($ExpectedOffices -join ',')) {
-        throw 'pool must contain exactly O1 through O5'
+    if ($pool.schema_version -ne 1 -or $pool.office_count -ne 5 -or (@($pool.offices) -join ',') -cne ($ExpectedOffices -join ',') -or (-not [string]::IsNullOrEmpty($ExpectedRuntimeVersion) -and [string]$pool.runtime_version -cne $ExpectedRuntimeVersion)) {
+        throw 'pool must contain exactly O1 through O5 and runtime version differs'
     }
     if (Test-Path -LiteralPath (Join-Path $Root 'updates\runtime-transaction.json')) {
         throw 'runtime recovery is pending'
@@ -252,9 +252,15 @@ function Assert-InstalledTree {
 }
 
 function Restore-PreviousInstall {
-    param([string]$Root, [string]$Backup, [string]$Failed)
+    param([string]$Root, [string]$Backup, [string]$Failed, [string]$Staging)
     if ((Test-Path -LiteralPath $Backup) -and (Test-Path -LiteralPath $Root)) {
+        $rootLock = Join-Path $Root '.pool.lock'
+        if (Test-Path -LiteralPath $rootLock) { Move-Item -LiteralPath $rootLock -Destination (Join-Path $Backup '.pool.lock') }
         Move-Item -LiteralPath $Root -Destination $Failed
+    }
+    $stagedLock = Join-Path $Staging '.pool.lock'
+    if ((Test-Path -LiteralPath $Backup) -and -not (Test-Path -LiteralPath (Join-Path $Backup '.pool.lock')) -and (Test-Path -LiteralPath $stagedLock)) {
+        Move-Item -LiteralPath $stagedLock -Destination (Join-Path $Backup '.pool.lock')
     }
     if (Test-Path -LiteralPath $Backup) {
         Move-Item -LiteralPath $Backup -Destination $Root
@@ -269,8 +275,8 @@ function Enter-PoolLock {
 }
 
 function Write-ActivationTransaction {
-    param([string]$Root, [string]$Backup, [string]$Staging)
-    [System.IO.File]::WriteAllText("$Root$ActivationName", (@{ schema_version = 1; backup = $Backup; staging = $Staging } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8)
+    param([string]$Root, [string]$Backup, [string]$Staging, [ValidateSet('prepared', 'backup', 'staging-locked', 'active')][string]$Phase)
+    [System.IO.File]::WriteAllText("$Root$ActivationName", (@{ schema_version = 1; backup = $Backup; staging = $Staging; phase = $Phase } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8)
 }
 
 function Recover-PendingActivation {
@@ -278,10 +284,31 @@ function Recover-PendingActivation {
     $path = "$Root$ActivationName"
     if (-not (Test-Path -LiteralPath $path)) { return }
     $transaction = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-    Assert-ExactProperties $transaction @('schema_version', 'backup', 'staging') 'activation transaction'
-    if ($transaction.schema_version -ne 1 -or -not (Test-Path -LiteralPath $transaction.backup)) { throw 'activation recovery has no prior tree' }
-    if (Test-Path -LiteralPath $Root) { Move-Item -LiteralPath $Root -Destination "$Root.failed.recovery.$([guid]::NewGuid().ToString('N'))" }
-    Move-Item -LiteralPath $transaction.backup -Destination $Root
+    Assert-ExactProperties $transaction @('schema_version', 'backup', 'staging', 'phase') 'activation transaction'
+    if ($transaction.schema_version -ne 1) { throw 'invalid activation transaction' }
+    switch ([string]$transaction.phase) {
+        'prepared' {
+            if (-not (Test-Path -LiteralPath $Root) -or (Test-Path -LiteralPath $transaction.backup)) { throw 'invalid prepared activation state' }
+        }
+        'backup' {
+            if ((Test-Path -LiteralPath $Root) -or -not (Test-Path -LiteralPath $transaction.backup)) { throw 'invalid backup activation state' }
+            Move-Item -LiteralPath $transaction.backup -Destination $Root
+        }
+        'staging-locked' {
+            $stagedLock = Join-Path $transaction.staging '.pool.lock'
+            if ((Test-Path -LiteralPath $Root) -or -not (Test-Path -LiteralPath $transaction.backup) -or -not (Test-Path -LiteralPath $stagedLock)) { throw 'invalid staged-lock activation state' }
+            Move-Item -LiteralPath $stagedLock -Destination (Join-Path $transaction.backup '.pool.lock')
+            Move-Item -LiteralPath $transaction.backup -Destination $Root
+        }
+        'active' {
+            $failed = "$Root.failed.recovery.$([guid]::NewGuid().ToString('N'))"
+            if (-not (Test-Path -LiteralPath $Root) -or -not (Test-Path -LiteralPath $transaction.backup)) { throw 'invalid active activation state' }
+            Move-Item -LiteralPath $Root -Destination $failed
+            Move-Item -LiteralPath (Join-Path $failed '.pool.lock') -Destination (Join-Path $transaction.backup '.pool.lock')
+            Move-Item -LiteralPath $transaction.backup -Destination $Root
+        }
+        default { throw 'invalid activation phase' }
+    }
     [System.IO.File]::Delete($path)
 }
 
@@ -289,50 +316,59 @@ function Invoke-AtomicInstall {
     param([string]$Operation, [string]$ArchivePath, [string]$SidecarPath, [string]$Root)
     $safeRoot = Assert-SafeRoot $Root
     Assert-NtfsPath $safeRoot
-    Recover-PendingActivation $safeRoot
     $archiveStream = Assert-ArchiveChecksum $ArchivePath $SidecarPath
     try {
         $archiveManifest = Assert-ArchiveManifest $archiveStream
-    $exists = Test-Path -LiteralPath $safeRoot
-    if ($Operation -ceq 'Install' -and $exists) { throw 'install root already exists' }
-    if ($Operation -cne 'Install' -and -not $exists) { throw 'update or rollback requires an existing install' }
-    $suffix = [guid]::NewGuid().ToString('N')
-    $staging = "$safeRoot.staging.$suffix"
-    $backup = "$safeRoot.previous.$suffix"
-    $failed = "$safeRoot.failed.$suffix"
-    Expand-VerifiedArchive $archiveStream $staging
-    Assert-NtfsPath $staging
-    Assert-InstalledTree $staging $archiveManifest.manifest $archiveManifest.manifest_sha256
-    Assert-AllFree $staging
-    try {
-        $lock = $null
+        $exists = Test-Path -LiteralPath $safeRoot
+        if ($exists) {
+            $recoveryLock = Enter-PoolLock $safeRoot
+            try { Recover-PendingActivation $safeRoot } finally { $recoveryLock.Dispose() }
+        }
+        else { Recover-PendingActivation $safeRoot }
+        $exists = Test-Path -LiteralPath $safeRoot
+        if ($Operation -ceq 'Install' -and $exists) { throw 'install root already exists' }
+        if ($Operation -cne 'Install' -and -not $exists) { throw 'update or rollback requires an existing install' }
+        $suffix = [guid]::NewGuid().ToString('N')
+        $staging = "$safeRoot.staging.$suffix"
+        $backup = "$safeRoot.previous.$suffix"
+        $failed = "$safeRoot.failed.$suffix"
+        Expand-VerifiedArchive $archiveStream $staging
+        Assert-NtfsPath $staging
+        Assert-InstalledTree $staging $archiveManifest.manifest $archiveManifest.manifest_sha256
+        Assert-AllFree $staging $archiveManifest.manifest.runtime_version
         if ($exists) {
             $lock = Enter-PoolLock $safeRoot
-            Assert-InstalledTree $safeRoot
-            Assert-AllFree $safeRoot
-            Write-ActivationTransaction $safeRoot $backup $staging
-            Move-Item -LiteralPath $safeRoot -Destination $backup
+            try {
+                Assert-InstalledTree $safeRoot
+                Assert-AllFree $safeRoot
+                Write-ActivationTransaction $safeRoot $backup $staging 'prepared'
+                Move-Item -LiteralPath $safeRoot -Destination $backup
+                Write-ActivationTransaction $safeRoot $backup $staging 'backup'
+                Move-Item -LiteralPath (Join-Path $backup '.pool.lock') -Destination (Join-Path $staging '.pool.lock')
+                Write-ActivationTransaction $safeRoot $backup $staging 'staging-locked'
+                Move-Item -LiteralPath $staging -Destination $safeRoot
+                Write-ActivationTransaction $safeRoot $backup $staging 'active'
+                Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
+                Assert-AllFree $safeRoot $archiveManifest.manifest.runtime_version
+                [System.IO.File]::Delete("$safeRoot$ActivationName")
+            }
+            catch { Restore-PreviousInstall $safeRoot $backup $failed $staging; throw }
+            finally { $lock.Dispose() }
         }
-        Move-Item -LiteralPath $staging -Destination $safeRoot
-        if ($exists -and (Test-Path -LiteralPath (Join-Path $backup '.pool.lock'))) { Move-Item -LiteralPath (Join-Path $backup '.pool.lock') -Destination (Join-Path $safeRoot '.pool.lock') }
-        Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
-        Assert-AllFree $safeRoot
-        if ($exists) { [System.IO.File]::Delete("$safeRoot$ActivationName") }
-    }
-    catch {
-        Restore-PreviousInstall $safeRoot $backup $failed
-        throw
+        else {
+            Move-Item -LiteralPath $staging -Destination $safeRoot
+            Assert-InstalledTree $safeRoot $archiveManifest.manifest $archiveManifest.manifest_sha256
+            Assert-AllFree $safeRoot $archiveManifest.manifest.runtime_version
+        }
+        [pscustomobject]@{
+            action = $Operation
+            label = 'developer-preview'
+            install_root = $safeRoot
+            previous_install = $(if ($exists) { $backup } else { $null })
+        }
     }
     finally {
-        if ($null -ne $lock) { $lock.Dispose() }
         $archiveStream.Dispose()
-    }
-    [pscustomobject]@{
-        action = $Operation
-        label = 'developer-preview'
-        install_root = $safeRoot
-        previous_install = $(if ($exists) { $backup } else { $null })
-    }
     }
 }
 
