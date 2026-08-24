@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ast, fnmatch, hashlib, os, re, sys
+import ast, fnmatch, hashlib, json, os, re, sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +38,15 @@ def scan_tree(root:Path)->list[Finding]:
      texts += [x+"=" for x in labels if any(y.fullmatch(x+"=") for y in RULES)]
     except SyntaxError: pass
    if any(x.search(t) for t in texts for x in RULES): out.append(Finding(r,"content","private"))
- return out
-def main(): return int(bool(scan_tree(Path(sys.argv[1]) if len(sys.argv)>1 else Path("."))))
+ return sorted(out, key=lambda finding: (finding.path, finding.rule, finding.detail))
+def main():
+ try: findings=scan_tree(Path(sys.argv[1]) if len(sys.argv)>1 else Path("."))
+ except (OSError,ValueError) as error:
+  print(json.dumps({"error":"scan-failed","kind":type(error).__name__},sort_keys=True,separators=(",",":")))
+  print("public-tree scan-error=1",file=sys.stderr)
+  return 2
+ for finding in findings:
+  print(json.dumps({"detail":finding.detail,"path":finding.path,"rule":finding.rule},sort_keys=True,separators=(",",":")))
+ print(f"public-tree findings={len(findings)}",file=sys.stderr)
+ return int(bool(findings))
 if __name__=="__main__": raise SystemExit(main())

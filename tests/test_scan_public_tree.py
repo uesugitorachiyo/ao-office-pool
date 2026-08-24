@@ -1,8 +1,12 @@
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.scan_public_tree import scan_tree
+from scripts.scan_public_tree import main, scan_tree
 
 
 def text(*parts): return "".join(parts)
@@ -169,6 +173,33 @@ class ScanPublicTreeTests(unittest.TestCase):
         target.write_bytes(b"public replacement\n")
         findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
         self.assertEqual(findings[relative], "identity")
+
+    def test_main_reports_sorted_json_findings_and_summary(self):
+        self.write("z/__pycache__/later.pyc")
+        self.write("a/__pycache__/first.pyc")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["scan_public_tree.py", str(self.root)]), redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main(), 1)
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual([row["path"] for row in rows], ["a/__pycache__/first.pyc", "z/__pycache__/later.pyc"])
+        self.assertEqual(rows[0], {"detail": "private", "path": "a/__pycache__/first.pyc", "rule": "artifact"})
+        self.assertEqual(stderr.getvalue(), "public-tree findings=2\n")
+
+    def test_main_reports_a_clean_summary(self):
+        self.write("README.md")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["scan_public_tree.py", str(self.root)]), redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main(), 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "public-tree findings=0\n")
+
+    def test_main_bounds_scan_errors_without_disclosing_absolute_paths(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["scan_public_tree.py", str(self.root)]), patch("scripts.scan_public_tree.scan_tree", side_effect=OSError(str(self.root / "private.txt"))), redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(main(), 2)
+        self.assertEqual(json.loads(stdout.getvalue()), {"error": "scan-failed", "kind": "OSError"})
+        self.assertNotIn(str(self.root), stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(stderr.getvalue(), "public-tree scan-error=1\n")
 
 
 if __name__ == "__main__": unittest.main()
