@@ -84,9 +84,11 @@ the eight-component stack, privacy constraints, and the supported bootstrap
 and verification outcomes. It links only with repository-relative Markdown
 paths.
 
-`README-FIRST.md` is included at the archive root. It contains the minimum
-clean-directory sequence and links to `docs/QUICKSTART.md` and
-`docs/AI_OPERATOR_RUNBOOK.md`.
+`README-FIRST.md` is included at the archive root. It begins after authenticated
+acquisition and archive-hash verification, contains the minimum relative
+install/verify sequence, and links to `docs/QUICKSTART.md` and
+`docs/AI_OPERATOR_RUNBOOK.md`. It never implies that an archive can authenticate
+itself.
 
 `docs/QUICKSTART.md` provides the shortest human path. It covers prerequisites,
 private GitHub authentication, release selection, download, checksum and asset
@@ -102,18 +104,35 @@ qualified.
 ### 2. Authenticated private-release acquisition
 
 `packaging/Get-AOOfficePoolRelease.ps1` downloads the exact assets described by
-`manifests/developer-preview-release.json` into a caller-selected destination
-whose default is `./downloads` relative to the invocation directory.
+the two-level release authority into a caller-selected destination whose
+default is `./downloads` relative to the invocation directory.
+
+The tracked control-plane file `manifests/developer-preview-release.json` pins
+the repository, private visibility, release tag, product-source commit,
+architecture, exact closed release-asset names, and the external
+`candidate-manifest.json` name, size, and SHA-256. The candidate manifest then
+binds the archive, checksum sidecar, inventories, provenance, release notes,
+SBOM, and checksum list. It does not list or hash itself. This existing
+two-level pattern prevents an impossible self-referential archive or manifest
+hash.
+
+The exact control-plane release contract is excluded from the preview archive.
+It is created only after deterministic candidate construction and belongs to a
+later control commit. The archive records its product-source commit; the
+control contract records both that source identity and the external candidate
+manifest identity.
 
 The script:
 
 - accepts the GitHub repository and release tag only when they equal the
-  manifest contract;
+  control-plane contract;
 - reads authentication from `GITHUB_TOKEN` without echoing or serializing it;
 - requests repository and release metadata through the authenticated GitHub
   API;
-- requires private visibility, the exact tag target, and the exact closed asset
-  name set;
+- requires private visibility, the exact product-source target, and the exact
+  closed asset name set;
+- downloads and verifies the pinned candidate manifest before trusting its
+  metadata rows for any other asset;
 - streams each asset to a create-only temporary file;
 - verifies exact size and SHA-256 before atomic rename;
 - refuses links, reparse ancestors, pre-existing unexpected files, partial
@@ -122,10 +141,9 @@ The script:
   path, asset, size, and digest facts;
 - removes only task-created partial files after a failed download.
 
-The manifest is schema-validated and contains the repository, tag, target
-commit, architecture, archive identity, and exact asset rows. Updating a future
-release requires a reviewed manifest change; the downloader never trusts live
-metadata to redefine the accepted set.
+Both authority files are schema-validated. Updating a future release requires
+a reviewed control-contract change after candidate construction; the
+downloader never trusts live metadata to redefine the accepted set.
 
 For operators who cannot provide `GITHUB_TOKEN`, the quickstart documents a
 manual private-GitHub download path followed by the same local verification
@@ -198,15 +216,16 @@ invalidate that record.
 
 ## Data and control flow
 
-1. The operator reads `README.md` in the private repository or
-   `README-FIRST.md` in an approved bootstrap copy.
+1. The operator reads `README.md` in the private control repository.
 2. The operator establishes `GITHUB_TOKEN` privately or selects the documented
    manual authenticated download path.
-3. The acquisition script reads the tracked release contract, authenticates,
-   verifies remote metadata, downloads the closed asset set, and verifies every
-   byte before publication into `./downloads`.
-4. The quickstart resolves an NTFS install root at runtime and invokes the
-   existing installer by a path relative to the checkout or bootstrap root.
+3. The acquisition script reads the tracked control contract, authenticates,
+   verifies remote metadata, verifies the pinned candidate manifest, downloads
+   its closed asset set, and verifies every byte before publication into
+   `./downloads`.
+4. After archive verification, the operator extracts a bootstrap copy, reads
+   its `README-FIRST.md`, resolves an NTFS install root at runtime, and invokes
+   the installer by a path relative to that verified extraction.
 5. The verifier binds the installed tree back to the accepted archive and
    checksum sidecar.
 6. The operator records the machine-readable acquisition and verification
@@ -256,8 +275,11 @@ unchanged generated candidate bytes.
 
 This work produces a new private candidate rather than mutating
 `developer-preview-v02`. The existing v02 archive and its qualification remain
-immutable evidence. The new release contract, documentation, scripts, skills,
-and candidate hashes are qualified together.
+immutable evidence. Candidate construction uses a product-source commit. After
+the archive and external candidate manifest exist, a later control commit adds
+their exact acquisition contract. The new documentation, scripts, skills,
+candidate bytes, candidate manifest, and control contract are qualified as one
+release chain without embedding a self-referential hash.
 
 The first slice may be called bootstrap-ready only after clean-directory native
 acceptance passes. It must not be called operationally ready. Operational
