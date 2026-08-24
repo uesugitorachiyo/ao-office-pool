@@ -43,10 +43,19 @@ FAKE_PRODUCER = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #ifdef _WIN32
+#include <windows.h>
+#include <process.h>
 #include <fcntl.h>
 #include <io.h>
+#define access _access
+#define F_OK 0
+#define usleep(x) Sleep((DWORD)((x) / 1000))
+#define sleep(x) Sleep((DWORD)((x) * 1000))
+#define getpid _getpid
+#define close _close
+#else
+#include <unistd.h>
 #endif
 
 static const char *base(const char *path) {
@@ -134,6 +143,9 @@ int main(int argc, char **argv) {
   }
   if (mode && strcmp(mode, "failure") == 0) return 9;
   if (mode && strcmp(mode, "error-descendant") == 0) {
+#ifdef _WIN32
+    return 71;
+#else
     pid_t child = fork();
     if (child < 0) return 71;
     if (child == 0) {
@@ -143,8 +155,12 @@ int main(int argc, char **argv) {
     }
     usleep(50000);
     return 9;
+#endif
   }
   if (mode && (strcmp(mode, "descendant") == 0 || strcmp(mode, "success-descendant") == 0)) {
+#ifdef _WIN32
+    return 71;
+#else
     pid_t child = fork();
     if (child < 0) return 71;
     if (child == 0) {
@@ -159,6 +175,7 @@ int main(int argc, char **argv) {
     fwrite(output, 1, sizeof(output), stdout); fflush(stdout); sleep(30);
     return 0;
     }
+#endif
   }
   if (argc > 2 && strcmp(argv[1], "authorize") == 0) {
     const char *out = NULL;
@@ -230,26 +247,17 @@ int main(int argc, char **argv) {
 '''
 
 
-COMMITS = {
-    "ao-blueprint": "a581a22af7d06483287a1b7590709e4c4d3739b8",
-    "ao-atlas": "2bf243ce8d8c71d845754398238b14d1ab77d0e6",
-    "ao-forge": "e104b47c2e14b6c0927b885e137907ad227aeb5c",
-    "ao-covenant": "2fd72a0426a747868826581612fa1dc9727b53b9",
-    "ao2": "8307795b3434af920f6cef088e56ca8fcc76775b",
+_REPOSITORY_COMPONENTS = {
+    component["name"]: component
+    for component in json.loads(
+        Path(__file__).resolve().parents[1]
+        .joinpath("manifests", "components.lock.json")
+        .read_text(encoding="utf-8")
+    )["components"]
 }
-VERSIONS = {
-    "ao-blueprint": "git-a581a22af7d0",
-    "ao-atlas": "v0.2.0",
-    "ao-forge": "v0.1.4",
-    "ao-covenant": "v0.1.1",
-    "ao2": "v0.5.11",
-}
-ASSETS = {
-    "ao-blueprint": "ao-blueprint",
-    "ao-atlas": "ao-atlas",
-    "ao-forge": "forge",
-    "ao-covenant": "covenant",
-    "ao2": "ao2",
+_PRODUCER_COMPONENTS = {
+    name: _REPOSITORY_COMPONENTS[name]
+    for name in ("ao-blueprint", "ao-atlas", "ao-forge", "ao-covenant", "ao2")
 }
 OBJECTIVE_FIELD = "obj" + "ective"
 
@@ -259,17 +267,17 @@ class ForgeRuntimePackageTests(unittest.TestCase):
         schema = governance.FORGE_RUNTIME_ROOT.joinpath(
             *governance._FORGE_SCHEMA_PARTS
         )
-        expected = "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
+        expected = "1a1c48a29c6b35713b08d733191e88887795fb8482054801900ae4b37e5bda3c"
         self.assertEqual(governance.FORGE_SCHEMA_SHA256, expected)
         self.assertEqual(hashlib.sha256(schema.read_bytes()).hexdigest(), expected)
 
     def test_witness_uses_the_released_component_lock_identities(self):
         expected = {
-            "ao-blueprint": ("git-a581a22af7d0", "a581a22af7d06483287a1b7590709e4c4d3739b8"),
-            "ao-atlas": ("v0.2.0", "2bf243ce8d8c71d845754398238b14d1ab77d0e6"),
-            "ao-forge": ("v0.1.4", "e104b47c2e14b6c0927b885e137907ad227aeb5c"),
+            "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5"),
+            "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18"),
+            "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98"),
             "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9"),
-            "ao2": ("v0.5.11", "8307795b3434af920f6cef088e56ca8fcc76775b"),
+            "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6"),
         }
         components = governance._locked_components()
         self.assertEqual(
@@ -320,12 +328,21 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.bin_dir.mkdir()
         source = self.base / "fake-producer.c"
         source.write_text(FAKE_PRODUCER, encoding="utf-8")
-        built = self.base / "fake-producer"
-        subprocess.run(["cc", str(source), "-o", str(built)], check=True)
+        built = self.base / ("fake-producer.exe" if os.name == "nt" else "fake-producer")
+        if os.name == "nt":
+            vcvars = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+            compile_cmd = self.base / "compile.cmd"
+            compile_cmd.write_text(
+                f'@call "{vcvars}" >nul\n@cl /nologo /Fo:"{self.base / "fake-producer.obj"}" "{source}" /Fe:"{built}"\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["cmd.exe", "/d", "/c", str(compile_cmd)], check=True)
+        else:
+            subprocess.run(["cc", str(source), "-o", str(built)], check=True)
         self.components = []
         binary_digest = hashlib.sha256(built.read_bytes()).hexdigest()
         for name in ("ao-blueprint", "ao-atlas", "ao-forge", "ao-covenant"):
-            path = self.bin_dir / ASSETS[name]
+            path = self.bin_dir / _PRODUCER_COMPONENTS[name]["asset"]
             shutil.copy2(built, path)
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
             self.components.append(self._component(name, binary_digest))
@@ -353,14 +370,14 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.configuration.stop()
         self.temporary_directory.cleanup()
 
-    def _component(self, name, digest):
-        commit = COMMITS[name]
+    def _component(self, name, digest, *, commit=None, version=None, asset=None):
+        pinned = _PRODUCER_COMPONENTS[name]
         return {
             "name": name,
-            "version": VERSIONS[name],
+            "version": pinned["version"] if version is None else version,
             "repository": "https://example.invalid/" + name,
-            "commit": commit,
-            "asset": ASSETS[name],
+            "commit": pinned["commit"] if commit is None else commit,
+            "asset": pinned["asset"] if asset is None else asset,
             "license": "Apache-2.0",
             "sha256": digest,
         }

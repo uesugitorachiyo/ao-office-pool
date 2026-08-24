@@ -14,18 +14,18 @@ COMPONENT_NAMES = (
 )
 
 RELEASED_LOCK_VALUES = {
-    "ao2": ("v0.5.11", "8307795b3434af920f6cef088e56ca8fcc76775b", "ao2", "6cba9a1ded758506bb0a4b6d6377687e29b9d35950c799c2a0b4efb51c6f1bd7"),
-    "ao2-control-plane": ("v0.1.19", "5de3541e9007e12d95b125e7f911c02932e21479", "ao2-cp-server", "91e04f5ffa2517908d0961eb42513c2cb1629b76f8433207e5c65afa346689aa"),
-    "ao-mission": ("v0.1.4", "cee287597024b5a1e990c6e272518236bc9e32fa", "ao-mission", "dec18e71b4a98ec72e4713fe5e3a11d3c1d11cd1051f629f84ab09fa7b1aa6b4"),
-    "ao-atlas": ("v0.2.0", "2bf243ce8d8c71d845754398238b14d1ab77d0e6", "ao-atlas", "e6968aeeb11bc19eb77fe3f87ca71414697dc92736556e726abe89c74f874bea"),
-    "ao-command": ("v0.1.2", "a728d90077c1340e295468e5017b5e166bc5bc7a", "ao-command", "3b90ddfe5cd3f43c4e9ad301aaf235f8732d6c33069acb2d327b469b5b53681b"),
-    "ao-forge": ("v0.1.4", "e104b47c2e14b6c0927b885e137907ad227aeb5c", "forge", "823ee61771608c7893287532c00929710ee1ff1149e06c13d40ff7296e937ba1"),
-    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "covenant", "9a5ca7c6920c44b6e120d6c5bd8baf190b66e188d43485639c6fc5355190868e"),
+    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint", "8f4dd9766e77948e7688b0c80dc8e49ea1cd5fe7ab57be900c651ea2a2f4b4be"),
+    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2", "f2fb203040c0f67fe159e3f84cf84e5e8dcd3e882ff79f6abaa306e909d29dd1"),
+    "ao2-control-plane": ("v0.1.19", "5de3541e9007e12d95b125e7f911c02932e21479", "ao2-cp-server", "75c74af686ae6fb28d0566b66b908090567f848ecff1b6c1da4940691d416135"),
+    "ao-mission": ("v0.1.6", "f631893906e3bed6f257ac30bc3d0ad2739fe9df", "ao-mission", "46639c6389721dbc691d5e20f3d7478451bd160a7618352bff87917d2307d87b"),
+    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas", "d6d0bf089c8b04359fdd84bc9b825752eb2e4f5655ee6005c8f77a976295e521"),
+    "ao-command": ("v0.1.3", "ffef6d76306e892c3e7a7f39734433d5a832006a", "ao-command", "3023530b6035e86e4167069840da4dcd61f2eeba261fca75a670415a12d71d55"),
+    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge", "17545288d7c3ad62e0d091e282b363cd5e9c61af533cd3bb6dbaeb90f97aaed7"),
+    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "covenant", "fd6e3a0033608d3f47dccb60f48191e4c4b2dc4fdce893c87d8ea96199610c5d"),
 }
 
 UNRELEASED_LOCK_OBJECTS = {
     "ao-architecture": b'    {"name":"ao-architecture","version":"git-60313323e56b","repository":"https://github.com/uesugitorachiyo/ao-architecture.git","commit":"60313323e56b52095a39445c93367c29787131a9","asset":"ao","license":"Apache-2.0","sha256":"89eca8a6309b1314d2d500e8a0599690019ae2ba3098a412c605794b6ade63d8"},\n',
-    "ao-blueprint": b'    {"name":"ao-blueprint","version":"git-a581a22af7d0","repository":"https://github.com/uesugitorachiyo/ao-blueprint.git","commit":"a581a22af7d06483287a1b7590709e4c4d3739b8","asset":"ao-blueprint","license":"Apache-2.0","sha256":"f86f221351069bbece0bd2afacdf964c812081018d71a94286bb0103927cafec"},\n',
     "ao-foundry": b'    {"name":"ao-foundry","version":"git-028ec4d50847","repository":"https://github.com/uesugitorachiyo/ao-foundry.git","commit":"028ec4d50847247ee48c1d8d4560a4eda3422550","asset":"foundry","license":"Apache-2.0","sha256":"42fd3ec7a471ef508e81768b772cf812d420db540fea9c086456c4ccc55d6ddb"},\n',
     "ao-arena": b'    {"name":"ao-arena","version":"git-e5d600108582","repository":"https://github.com/uesugitorachiyo/ao-arena.git","commit":"e5d60010858242b1dc5bdee9fbf1bcf1975e4ec9","asset":"ao-arena","license":"Apache-2.0","sha256":"e1d1e7bbd44856076f02fbac3e26ce67e88906caadc1680321676c4d266af724"},\n',
     "ao-crucible": b'    {"name":"ao-crucible","version":"git-64227e3ee305","repository":"https://github.com/uesugitorachiyo/ao-crucible.git","commit":"64227e3ee305cc3399063b567e02a548b5bc1855","asset":"ao-crucible","license":"Apache-2.0","sha256":"a4804dd244121d20b4516d0f44cde1b4fb59cae97df8ac2bffb5aedcdfdbb600"},\n',
@@ -84,7 +84,7 @@ class VerifyLockTests(unittest.TestCase):
             for name in RELEASED_LOCK_VALUES
         }
         raw_objects = {
-            json.loads(line.rstrip(b"\r\n").removesuffix(b","))["name"]: line
+            json.loads(line.rstrip(b"\r\n").removesuffix(b","))["name"]: line.replace(b"\r\n", b"\n")
             for line in lock_bytes.splitlines(keepends=True)
             if line.lstrip().startswith(b'{"name":')
         }

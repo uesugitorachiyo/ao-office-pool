@@ -370,7 +370,9 @@ class ActiveReadbackTests(unittest.TestCase):
                     + "\n"
                 ).encode()
             )
-        candidate = self.fixture.base / ("readback-" + version)
+        candidate = self.fixture.base / (
+            "readback-" + version + "-" + hashlib.sha256(asset).hexdigest()[:12]
+        )
         candidate.mkdir()
         manifest = {
             "schema_version": 1,
@@ -491,7 +493,13 @@ class ActiveReadbackTests(unittest.TestCase):
         staged = self.root / "components" / "ao2" / component["version"]
         shutil.rmtree(staged)
         shutil.rmtree(
-            self.fixture.base / ("readback-" + component["version"])
+            self.fixture.base
+            / (
+                "readback-"
+                + component["version"]
+                + "-"
+                + hashlib.sha256(self.fixture.runtime_bytes).hexdigest()[:12]
+            )
         )
         component_lock = json.loads(
             (self.root / "manifests/components.lock.json").read_bytes()
@@ -521,7 +529,7 @@ class ActiveReadbackTests(unittest.TestCase):
         self._assert_stale_exports_fail()
 
     def test_activation_invalidates_detached_qualification_exports(self):
-        self._change_runtime("v0.5.12", RuntimeUpdate(self.root).activate)
+        self._change_runtime("v0.5.13", RuntimeUpdate(self.root).activate)
         self._assert_stale_exports_fail()
 
     def test_rollback_invalidates_detached_qualification_exports(self):

@@ -568,7 +568,10 @@ class PilotMatrixTests(unittest.TestCase):
 
             unsafe = base / "unsafe"
             shutil.copytree(root, unsafe)
-            (unsafe / "offices" / "O1" / "history" / "link").symlink_to(unsafe / "pool.json")
+            try:
+                (unsafe / "offices" / "O1" / "history" / "link").symlink_to(unsafe / "pool.json")
+            except OSError as error:
+                self.skipTest(str(error))
             with self.assertRaisesRegex(ValueError, "unsafe"):
                 validate(unsafe)
 

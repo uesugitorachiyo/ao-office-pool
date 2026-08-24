@@ -38,7 +38,7 @@ from internal.pool import AuthorityLease, Pool, PoolError
 COMPONENT_LOCK = Path(__file__).parents[1] / "manifests/components.lock.json"
 BIN_DIR = Path(__file__).parents[1] / ".local/bin"
 FORGE_RUNTIME_ROOT = Path(__file__).parents[1] / "packaging/runtime/ao-forge"
-FORGE_SCHEMA_SHA256 = "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
+FORGE_SCHEMA_SHA256 = "1a1c48a29c6b35713b08d733191e88887795fb8482054801900ae4b37e5bda3c"
 ENVELOPE_SCHEMA = Path(__file__).parents[1] / "schemas/governance-envelope.schema.json"
 REQUIREMENTS_MANIFEST = Path(__file__).parents[1] / "manifests/requirements.json"
 _PRIVATE_PARTS = (".ao", "governance", "office-pool")
@@ -49,11 +49,11 @@ _PRODUCERS = {
     "ao-covenant": ("verify", "--ledger", "{ledger}", "--evidence", "{artifact}", "--json"),
 }
 _PINNED = {
-    "ao-blueprint": ("git-a581a22af7d0", "a581a22af7d06483287a1b7590709e4c4d3739b8", "ao-blueprint"),
-    "ao-atlas": ("v0.2.0", "2bf243ce8d8c71d845754398238b14d1ab77d0e6", "ao-atlas"),
-    "ao-forge": ("v0.1.4", "e104b47c2e14b6c0927b885e137907ad227aeb5c", "forge"),
+    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint"),
+    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas"),
+    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge"),
     "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "covenant"),
-    "ao2": ("v0.5.11", "8307795b3434af920f6cef088e56ca8fcc76775b", "ao2"),
+    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2"),
 }
 _ROOTS = {
     "ao-blueprint": (".ao", "evidence", "ao-blueprint"),

@@ -35,12 +35,14 @@ FAKE_AO2 = r'''
 #define task_sleep(seconds) Sleep((seconds) * 1000)
 #define task_getcwd _getcwd
 #define task_mkdir(path) _mkdir(path)
+#define slow_large_seconds 30
 #else
 #include <sys/stat.h>
 #include <unistd.h>
 #define task_sleep(seconds) sleep(seconds)
 #define task_getcwd getcwd
 #define task_mkdir(path) mkdir(path, 0700)
+#define slow_large_seconds 10
 #endif
 
 #ifndef _WIN32
@@ -252,13 +254,7 @@ static int fake_mission(int argc, char **argv) {
     char block[1000]; memset(block, 'x', sizeof(block));
     for (int i = 0; i < 70; i++) fwrite(block, 1, sizeof(block), stdout);
     fflush(stdout);
-    if (strcmp(mode, "slow-large") == 0) task_sleep(
-#ifdef _WIN32
-      30
-#else
-      10
-#endif
-    );
+    if (strcmp(mode, "slow-large") == 0) task_sleep(slow_large_seconds);
     return 0;
   }
   const char *home = argument_value(argc, argv, "--home");
@@ -449,7 +445,16 @@ class ExecutionTests(unittest.TestCase):
     def _compile(self, source: str, output: Path) -> None:
         source_path = self.base / (output.stem + "-source.c")
         source_path.write_text(source, encoding="utf-8")
-        subprocess.run(["cc", str(source_path), "-o", str(output)], check=True)
+        if os.name == "nt":
+            vcvars = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+            compile_cmd = self.base / (output.stem + "-compile.cmd")
+            compile_cmd.write_text(
+                f'@call "{vcvars}" >nul\n@cl /nologo /Fo:"{self.base / (output.stem + ".obj")}" "{source_path}" /Fe:"{output}"\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["cmd.exe", "/d", "/c", str(compile_cmd)], check=True)
+        else:
+            subprocess.run(["cc", str(source_path), "-o", str(output)], check=True)
 
     def _witness(self) -> Path:
         return issue_witness(

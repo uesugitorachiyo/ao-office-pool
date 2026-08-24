@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOTS={".ao",".ao-mission",".local",".worktrees","build","dist","offices","operator-secrets","runtime","support-bundles","updates"}; PATS=("*.receipt.json","recovery-key*","*.pem","*.key","*.p12")
-HASH_BOUND_PUBLIC_FILES={"packaging/runtime/ao-forge/docs/contracts/goal-run-v0.1.schema.json":"68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"}
+HASH_BOUND_PUBLIC_FILES={"packaging/runtime/ao-forge/docs/contracts/goal-run-v0.1.schema.json":"1a1c48a29c6b35713b08d733191e88887795fb8482054801900ae4b37e5bda3c"}
 FIELD=r"(?im)(?:^[ \t]*(?:[-*+][ \t]+)?|[{\[(,][ \t]*)[\"']?"
 RULES=(re.compile(FIELD+r"owner(?:_id|id)?[\"']?\s*[:=]"),re.compile(FIELD+r"(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|recovery[_-]?key|(?:receipt|secret|token|password))[\w-]*[\"']?\s*[:=](?!\s*(?:Path|str)\b)"),re.compile(FIELD+r"(?:objective|transcript|model|resume|private[_-]?state)[\"']?\s*[:=](?!\s*str\b)"),re.compile(FIELD+r"(?:system\s+)?prompt[\"']?\s*[:=]"),re.compile(r"(?i)/(?:users|home|volumes)/[^/\s]+"),re.compile(r"(?i)\b[a-z]:[\\/]+users[\\/][^\\/\s]+"))
 @dataclass(frozen=True)
