@@ -1,12 +1,13 @@
-# AO Office Pool Roadmap: Months 1–6
+# AO Office Pool Roadmap: Months 1–6 Completed Preview Phase
 
-Months 1–6 produce a private Windows developer preview. They do not produce a
-public v1.2.0 release. Each month ends with a usable checkpoint and a blocking
-exit gate.
+Months 1–6 produced the qualified private Windows developer preview. This file
+records that completed phase and its blocking gates; current execution is
+Windows-only and advances toward a private stable release.
 
 ## Program rules
 
-- Build in the public repository on macOS; qualify Windows behavior on NTFS.
+- Build and qualify on Windows, with native behavior exercised on fixed local
+  NTFS. macOS and Linux are outside the current product scope.
 - Reimplement V1.1 invariants through contracts and tests. Do not copy its
   implementation, private state, absolute paths, or contaminated skill text.
 - Treat all nineteen transferred V1.2 blockers as open until a failing test,
@@ -30,7 +31,7 @@ Deliverables:
 - Windows lexical path validator plus a Windows-only physical-identity adapter
   contract;
 - requirement rows for every validated V1.1 invariant and B01–B19;
-- CI on macOS and Windows with no Production claims.
+- focused Windows test automation with no Production claims.
 
 Exit gate:
 
@@ -163,8 +164,9 @@ Exit gate:
 - all offices finish free with zero task-output residue;
 - update interruption and emergency recovery preserve accepted bytes;
 - an independent reviewer reproduces the pilot result;
-- artifacts are labeled `developer-preview`, never Production or public v1.2.0.
+- artifacts are labeled `developer-preview`, never Production or stable.
 
-Months 7–12 complete the skill redesign, advanced component activation,
-endurance testing, independent release qualification, and public v1.2.0. See
+Months 7–12 advance the qualified private Windows developer preview through
+soak, lifecycle hardening, security, endurance, independent stable-candidate
+qualification, and an exact-byte private stable release. See
 [ROADMAP_MONTHS_7_12.md](ROADMAP_MONTHS_7_12.md).
