@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/uesugitorachiyo/ao-office-pool/schemas/developer-preview-release.schema.json",
+  "title": "AO Office Pool private developer preview release contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository",
+    "visibility",
+    "tag",
+    "product_source_commit",
+    "architecture",
+    "asset_names",
+    "candidate_manifest"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository": {"const": "uesugitorachiyo/ao-office-pool"},
+    "visibility": {"const": "private"},
+    "tag": {"type": "string", "pattern": "^developer-preview-v[0-9]{2}$"},
+    "product_source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "architecture": {"const": "windows-x86_64"},
+    "asset_names": {
+      "const": [
+        "candidate-manifest.json",
+        "ao-office-pool-developer-preview.zip",
+        "ao-office-pool-developer-preview.zip.sha256",
+        "member-inventory.json",
+        "provenance.json",
+        "RELEASE-NOTES.md",
+        "SBOM.json",
+        "SHA256SUMS"
+      ]
+    },
+    "candidate_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size", "sha256"],
+      "properties": {
+        "name": {"const": "candidate-manifest.json"},
+        "size": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

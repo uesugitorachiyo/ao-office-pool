@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "repository": "uesugitorachiyo/ao-office-pool",
+  "visibility": "private",
+  "tag": "developer-preview-v02",
+  "product_source_commit": "4bf8db6469a00dac69d2ddd7d103b501f797d7f6",
+  "architecture": "windows-x86_64",
+  "asset_names": [
+    "candidate-manifest.json",
+    "ao-office-pool-developer-preview.zip",
+    "ao-office-pool-developer-preview.zip.sha256",
+    "member-inventory.json",
+    "provenance.json",
+    "RELEASE-NOTES.md",
+    "SBOM.json",
+    "SHA256SUMS"
+  ],
+  "candidate_manifest": {
+    "name": "candidate-manifest.json",
+    "size": 4131,
+    "sha256": "e291850f960ac66391163fd79dc30118bc65e666aef5a5def655521d7c37342f"
+  }
+}
