@@ -12,17 +12,6 @@ from internal.pool import Pool
 
 _MUTABLE_FILES = {"pool.json", ".pool.lock", *(f"offices/O{n}/office-state.json" for n in range(1, 6))}
 _MUTABLE_PREFIXES = ("runtime/", "operator-secrets/", "updates/", *(f"offices/O{n}/{part}/" for n in range(1, 6) for part in ("history", "work")))
-_S01_ROOT = Path(r"D:\ao-office-pool\.local\missions\windows-latest-stack-private-release-v01\extracted-v2")
-_S01_COMPONENTS = {
-    "ao2": ("v0.5.12", "ao2.exe", "f2fb203040c0f67fe159e3f84cf84e5e8dcd3e882ff79f6abaa306e909d29dd1", "ao2-0.5.12-windows-x86_64.tar/bin/ao2.exe"),
-    "ao-mission": ("v0.1.6", "ao-mission.exe", "46639c6389721dbc691d5e20f3d7478451bd160a7618352bff87917d2307d87b", "ao-mission-0.1.6-windows-x86_64/ao-mission.exe"),
-    "ao-command": ("v0.1.3", "ao-command.exe", "3023530b6035e86e4167069840da4dcd61f2eeba261fca75a670415a12d71d55", "ao-command-0.1.3-windows-x86_64/ao-command.exe"),
-    "ao-atlas": ("v0.2.1", "ao-atlas.exe", "d6d0bf089c8b04359fdd84bc9b825752eb2e4f5655ee6005c8f77a976295e521", "ao-atlas-v0.2.1-windows-x86_64.tar/ao-atlas.exe"),
-    "ao-forge": ("v0.1.5", "forge.exe", "17545288d7c3ad62e0d091e282b363cd5e9c61af533cd3bb6dbaeb90f97aaed7", "ao-forge_Windows_x86_64/forge.exe"),
-    "ao-covenant": ("v0.1.1", "ao-covenant_v0.1.1_windows_amd64.exe", "fd6e3a0033608d3f47dccb60f48191e4c4b2dc4fdce893c87d8ea96199610c5d", "ao-covenant_v0.1.1_windows_amd64/ao-covenant_v0.1.1_windows_amd64.exe"),
-    "ao2-control-plane": ("v0.1.19", "ao2-cp-server.exe", "75c74af686ae6fb28d0566b66b908090567f848ecff1b6c1da4940691d416135", "ao2-control-plane-0.1.19-windows-x86_64.tar/bin/ao2-cp-server.exe"),
-    "ao-blueprint": ("git-ec6a80b60b54", "ao-blueprint.exe", "8f4dd9766e77948e7688b0c80dc8e49ea1cd5fe7ab57be900c651ea2a2f4b4be", "ao-blueprint-source-exception/ao-blueprint.exe"),
-}
 _S01_LOCKS = {
     "ao2": {"name": "ao2", "version": "v0.5.12", "repository": "https://github.com/uesugitorachiyo/ao2.git", "commit": "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "asset": "ao2.exe", "license": "Apache-2.0", "sha256": "f2fb203040c0f67fe159e3f84cf84e5e8dcd3e882ff79f6abaa306e909d29dd1"},
     "ao-mission": {"name": "ao-mission", "version": "v0.1.6", "repository": "https://github.com/uesugitorachiyo/ao-mission.git", "commit": "f631893906e3bed6f257ac30bc3d0ad2739fe9df", "asset": "ao-mission.exe", "license": "Apache-2.0", "sha256": "46639c6389721dbc691d5e20f3d7478451bd160a7618352bff87917d2307d87b"},
@@ -68,8 +57,11 @@ def _reparse_or_link(path: Path) -> bool:
         return True
 
 
-def _validate_s01_components(ao2: Path, runtime_version: str, components: dict[str, tuple[str, Path]]) -> dict[str, bytes]:
-    if runtime_version != "v0.5.12" or set(components) != set(_S01_COMPONENTS):
+def _validate_s01_components(ao2: Path, runtime_version: str, components: dict[str, tuple[str, Path]], component_root: Path) -> dict[str, bytes]:
+    component_root = Path(component_root)
+    if not component_root.is_absolute() or _reparse_or_link(component_root) or not component_root.is_dir():
+        raise ValueError("component root must be a regular absolute directory")
+    if runtime_version != "v0.5.12" or set(components) != set(_S01_LOCKS):
         raise ValueError("component map must contain exactly the S01 components")
     if len({name.casefold() for name in components}) != len(components):
         raise ValueError("component map has case-insensitive duplicate names")
@@ -80,34 +72,42 @@ def _validate_s01_components(ao2: Path, runtime_version: str, components: dict[s
     if not isinstance(entries, list):
         raise ValueError("components lock is malformed")
     locked = {entry.get("name"): entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get("name"), str)}
-    if len(locked) != len(entries) or set(locked) != set(_S01_COMPONENTS):
+    if len(locked) != len(entries) or set(locked) != set(_S01_LOCKS):
         raise ValueError("components lock must contain exactly the S01 components")
     paths = []
     for name, (version, binary) in components.items():
-        expected_version, expected_name, expected_hash, relative = _S01_COMPONENTS[name]
+        expected = _S01_LOCKS[name]
+        expected_version = expected["version"]
+        expected_name = expected["asset"]
+        expected_hash = expected["sha256"]
         if version != expected_version or Path(binary).name != expected_name:
             raise ValueError("component identity is not bound in S01")
         entry = locked[name]
         if entry != _S01_LOCKS[name]:
             raise ValueError("components lock identity does not match S01")
         binary = Path(binary)
-        expected = _S01_ROOT / relative
-        if binary != expected or _reparse_or_link(binary) or not binary.is_file():
+        try:
+            binary.relative_to(component_root)
+        except ValueError as error:
+            raise ValueError("component input must be within component root") from error
+        if _reparse_or_link(binary) or not binary.is_file():
             raise ValueError("component input must be a verified S01 file")
         data = binary.read_bytes()
         if _reparse_or_link(binary) or hashlib.sha256(data).hexdigest() != expected_hash:
             raise ValueError("component input hash does not match S01")
         paths.append((str(binary).casefold(), data))
-    if len({path for path, _ in paths}) != len(paths) or Path(ao2) != _S01_ROOT / _S01_COMPONENTS["ao2"][3]:
+    if len({path for path, _ in paths}) != len(paths) or Path(ao2) != Path(components["ao2"][1]):
         raise ValueError("component inputs have duplicate or unbound paths")
     return dict(zip(components, (data for _, data in paths)))
 
 
-def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, components: dict[str, tuple[str, Path]] | None = None) -> Path:
+def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, components: dict[str, tuple[str, Path]] | None = None, component_root: Path | None = None) -> Path:
     source, ao2, output = Path(source), Path(ao2), Path(output)
     if components is None:
         raise ValueError("component map is required")
-    verified = _validate_s01_components(ao2, runtime_version, components)
+    if component_root is None:
+        raise ValueError("component root is required")
+    verified = _validate_s01_components(ao2, runtime_version, components, component_root)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "preview"
         shutil.copytree(source, root)
