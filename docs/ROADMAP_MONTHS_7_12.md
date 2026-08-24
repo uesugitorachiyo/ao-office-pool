@@ -1,158 +1,168 @@
-# AO Office Pool Roadmap: Months 7–12
+# AO Office Pool Roadmap: Windows-Private Months 7–12
 
-Months 7–12 start only after the private Windows developer preview passes its
-Month 6 gate. The phase ends with a public v1.2.0 release if every release gate
-passes.
+Months 7–12 advance the qualified Windows developer preview to a private stable
+AO Office Pool release. Windows x86-64 is the only supported platform. The
+repository and every release remain private. Delivery is manual and
+evidence-gated; this program does not require complex CI/CD.
 
-## Month 7: Lean skill package and context economy
+The months are gates, not mandatory calendar durations. Each gate consumes one
+exact accepted candidate and returns `PASS`, `REPAIR`, or `HOLD`. Month 8 uses
+`ADVANCE` for its terminal pass. `REPAIR` permits only changes tied to a
+demonstrated failure and invalidates every affected result. `HOLD` is reserved
+for a genuine external blocker with an exact next action.
 
-Redesign the seven canonical product skills around current AO authority
-boundaries. Preserve useful V1.1 behavior, remove project contamination, and
-add deterministic skill validation. Inventory first and update an existing
-skill before creating another.
+The accepted starting point is `developer-preview-v02`, source commit
+`4bf8db6469a00dac69d2ddd7d103b501f797d7f6`, archive SHA-256
+`ebc61a5ae235815456831934e4e4a31352591c2dc71044de1b5a64b3186b4282`.
 
-Deliverables:
+## Program rules
 
-- seven portable product skills with only `name` and `description` in YAML
-  frontmatter;
-- hard maximum of 200 physical lines per `SKILL.md`, with a target near 120;
-- one-level `references/` for detailed rubrics, examples, and mode-specific
-  guidance;
-- tested `scripts/` only for deterministic repeated operations;
-- trigger-positive, trigger-negative, overlap, and forward-behavior tests;
-- root agent instructions under about 200 lines and 2,000 tokens.
+- Run native qualification on Windows and a fixed local NTFS volume.
+- Keep source, candidates, logs, AO Mission state, and raw qualification
+  evidence private and ignored where appropriate.
+- Keep each candidate immutable and bind source, component lock, archive,
+  manifest, provenance, SBOM, checksums, and evidence by exact digest.
+- Preserve five isolated AO2 office runtimes and all AO authority boundaries.
+- Use AO Mission for objectives, checkpoints, evidence, and reconciliation
+  only. AO Mission does not execute work or grant publication authority.
+- Create a new candidate only for a demonstrated correction. Never rebuild
+  merely to refresh timestamps, exercise an upgrade, or change labels.
+- Preserve unknown residue and report it. Remove only paths proven to belong to
+  the active task after resolving their exact absolute identities.
+- Month 7 `PASS` starts Month 8 automatically. Months 9–12 remain inactive
+  until Month 8 returns `ADVANCE`.
 
-Exit gate:
+## Month 7: Private preview soak
 
-- no skill contains absolute paths, user identity, stale version counts,
-  unrelated projects, copied evidence, or duplicate instructions;
-- ordinary tasks stay compact while reusable, ambiguous, high-risk, critical,
-  or explicit work receives proportional gates;
-- descriptions route correctly under a measured discovery-token budget;
-- missing or unreadable references fail validation;
-- skill mirrors, if the chosen clients require them, match byte-for-byte.
+### Inputs and workload
 
-## Month 8: Complete AO component activation
+Authenticate to the private repository, redownload all eight uploaded
+`developer-preview-v02` assets, and match exact names, sizes, and SHA-256 values
+before installation. A mismatch is `HOLD`; do not substitute or rebuild bytes.
 
-Promote advanced AO components from recorded source or asset states to verified
-Windows executable, accepted, activated, and routed states. Pin each transition
-to exact source, asset, patch, license, digest, and native smoke evidence.
+Run all five offices on fixed local NTFS. The gate requires:
 
-Deliverables:
+- at least 100 successful claim, resume, and release lifecycles distributed
+  across O1–O5;
+- at least eight hours of elapsed mixed workload;
+- fresh-process restart and exact resume coverage;
+- concurrent claim, same-task continuation, clean release, failure recovery,
+  repeated verification, and bounded support readback;
+- per-office operation counts, failure counts, process exits, resource trends,
+  state digests, and residue results.
 
-- activated contracts for Mission, Blueprint, Atlas, Foundry, Forge, Covenant,
-  Command, Arena, Crucible, Sentinel, Promoter, and the Control Plane where each
-  component has a real executable role;
-- explicit guidance-only state for architecture or source-only packages;
-- compatibility adapters that do not widen authority;
-- capability readback that reports the exact readiness level per component.
+Use disposable test projects. Do not persist receipts, prompts, credentials,
+private task content, or raw support data in tracked files.
 
-Exit gate:
+### Exit gate
 
-- every routed executable runs a repeatable native Windows identity test;
-- source presence cannot satisfy executable readiness;
-- unavailable toolchains produce honest blocked status without installation;
-- component failure cannot bypass Covenant or AO2 boundaries;
-- shared packages remain immutable and office runtimes remain independent.
+Month 7 returns `PASS` only when:
 
-## Month 9: Pulse, RSI, evaluation, and readback boundaries
+- every required lifecycle completes without duplicate ownership or
+  cross-office access;
+- restart and resume preserve exact office, project, generation, and receipt
+  authority;
+- no unexplained monotonic handle, process, or storage growth remains;
+- post-soak verification passes against unchanged installed bytes;
+- uninstall leaves zero candidate-owned residue;
+- the complete Windows suite passes against the exact candidate source; and
+- AO Mission imports the evidence and reconciles without a blocker.
 
-Integrate Pulse and RSI operator workflows with evidence-bound Arena, Crucible,
-Sentinel, Promoter, Command, and Mission readback. Keep observation, evaluation,
-promotion recommendation, policy, and execution as separate authorities.
+`PASS` starts Month 8 automatically. `REPAIR` requires one focused failing
+test, the smallest correction, a new immutable candidate, the full Windows
+suite, and a complete Month 7 rerun from authenticated redownload. `HOLD`
+requires an external blocker and exact next action.
 
-Deliverables:
+## Month 8: Installer and lifecycle hardening
 
-- bounded Pulse lifecycle and resume evidence;
-- RSI claim-to-evidence map with explicit hold and rollback conditions;
-- benchmark, hardening, regression, and promotion records bound to exact input
-  and output digests;
-- read-only public Command surface and protected receipt-bound diagnostics;
-- provider-free deterministic fixtures for every authority transition.
+Month 8 consumes the exact Month 7 `PASS` candidate. If Month 7 required no
+repair, the input remains `developer-preview-v02`.
 
-Exit gate:
+### Lifecycle matrix
 
-- no evaluator can execute, approve policy, publish, or mutate accepted state;
-- Promoter cannot promote without required Sentinel and Covenant evidence;
-- stale or mismatched evidence becomes an exact blocker;
-- public readback uses an exact allowlist and remains nonmutating;
-- Pulse and RSI retries preserve history without duplicate side effects.
+Exercise on fixed local NTFS:
 
-## Month 10: Windows endurance, recovery, and security
+- clean install, verification, uninstall, and reinstall;
+- repeated nonmutating verification;
+- rejection of corrupt, missing, substituted, or mismatched files;
+- interruption and recovery at installer-controlled transaction boundaries;
+- safe repair or reinstall from the exact accepted archive;
+- identity and help routes for all eight installed AO components;
+- support-bundle and operator-diagnostic allowlists; and
+- final cleanup with zero candidate-owned residue.
 
-Run long-duration concurrency, power-loss, process-kill, update, rollback,
-reparse-point, antivirus, and storage-pressure tests on supported Windows hosts.
-Complete the release threat model and security policy before public review.
+Native version-to-version update and rollback require two independently
+qualified candidates. Do not fabricate a second release or weaken version
+checks to satisfy the test. When only one qualified candidate exists,
+deterministic update and rollback tests remain required and the native
+two-version exercise moves to Month 11.
 
-Deliverables:
+### Exit gate
 
-- 72-hour five-office mixed-workload endurance run;
-- crash matrix for claim, checkpoint, release, recovery, stage, activate, and
-  rollback transitions;
-- ACL, handle identity, junction, hard-link, symlink, 8.3, UNC, extended-path,
-  and delete/recreate adversarial suite;
-- security policy, threat model, support-bundle review, and dependency/SBOM
-  audit;
-- recovery drills from every durable state.
+Month 8 returns `ADVANCE` only when:
 
-Exit gate:
-
-- no duplicate ownership, cross-project access, secret disclosure, or accepted
-  state corruption occurs under fault injection;
-- unknown residue remains byte-preserved and blocks reuse;
-- all interrupted transitions converge to an accepted prior state or explicit
+- every lifecycle operation reaches its exact expected state;
+- corruption and identity drift fail closed with bounded diagnostics;
+- interrupted transitions converge to an accepted prior state or an explicit
   recovery-required state;
-- security review has no unresolved release blocker;
-- the owner approves the public security-reporting route.
+- support output contains no secrets, receipts, identities, local paths,
+  private history, or raw support content;
+- operator documentation matches the exercised commands and outcomes;
+- focused regressions and the complete Windows suite pass;
+- uninstall leaves zero candidate-owned residue; and
+- AO Mission reconciles with no ready node or unresolved blocker.
 
-## Month 11: Release candidate and independent qualification
+`REPAIR` follows the Month 7 correction and invalidated-gate rerun rule.
+`HOLD` requires a genuine external blocker and exact next action.
 
-Freeze the release-candidate inputs and run qualification on clean Windows
-hosts operated by someone other than the primary implementer. Permit only
-versioned corrections followed by a complete rerun.
+## Month 9: Windows security and boundary audit
 
-Deliverables:
+Complete the release threat model and security policy. Exercise ACL, handle
+identity, junction, hard-link, symlink, 8.3, UNC, extended-path, and
+delete/recreate boundaries. Audit dependencies, SBOM, support outputs, secrets,
+receipts, and the private vulnerability-reporting procedure.
 
-- deterministic v1.2.0 release-candidate archive;
-- final component lock, checksums, SBOM, provenance, licenses, and notices;
-- clean-room install, update, rollback, recovery, support, and uninstall report;
-- independent V1.1-inheritance, B01–B19, P01–P76, and advanced-stack results;
-- public documentation and migration guide.
+The gate has no unresolved release blocker and no evaluator, diagnostic, or
+readback surface can execute, publish, approve policy, or mutate accepted
+state.
 
-Exit gate:
+## Month 10: Endurance and fault injection
 
-- two complete runs against identical bytes produce identical accepted results;
-- the evaluator reproduces every critical claim without private test data;
-- the release archive contains only allowlisted files and passes leak scanning;
-- O1–O5 finish free, clean, independent, and byte-equal where required;
-- any correction invalidates prior qualification and starts a full rerun.
+Run five-office concurrency plus process-kill, storage-pressure,
+transaction-interruption, recovery, reparse-point, and antivirus scenarios.
+Start with a 24-hour endurance run. Extend it to 72 hours only when the 24-hour
+evidence or an explicit release requirement justifies the added elapsed time.
 
-## Month 12: Public v1.2.0 release and stabilization
+Every interruption must converge to accepted prior state or explicit
+recovery-required state without duplicate ownership, cross-project access,
+secret disclosure, or accepted-state corruption.
 
-Publish only the exact independently qualified bytes after owner approval. Tag
-the source, publish checksums and provenance, then hold a bounded stabilization
-window without adding new architecture.
+## Month 11: Stable-candidate qualification
 
-Deliverables:
+Freeze one immutable stable candidate and qualify it on clean Windows hosts.
+Require two clean-host, complete runs against identical bytes, with at least
+one run independent of the primary implementation session. Exercise native
+version-to-version update and rollback when a prior independently qualified
+candidate exists.
 
-- public `v1.2.0` source tag and Windows x86-64 release archive;
-- signed or otherwise authenticated checksum set, SBOM, provenance, and notices;
-- operator, security, recovery, update, and migration documentation;
-- public issue and private vulnerability-reporting routes;
-- post-release verification and rollback decision record.
+Any source, component, archive, manifest, installer, or bound-evidence change
+invalidates the affected qualification and requires a new candidate.
 
-Exit gate:
+## Month 12: Private stable release and stabilization
 
-- published bytes match the qualified archive exactly;
-- installation verification rejects any digest or manifest mismatch;
-- public files contain no prompts, receipts, identities, recovery material,
-  local paths, private history, or raw support data;
-- the owner records release approval and the independent qualification digest;
-- stabilization finds no issue requiring withdrawal or rollback.
+After explicit operator authorization, publish only the exact independently
+qualified bytes to the private GitHub repository. Authenticated-redownload
+every uploaded asset and compare exact names, sizes, and hashes. Record the tag
+target, release identity, qualification digests, and rollback decision.
 
-## Deferred beyond v1.2.0
+Hold a bounded stabilization window for defect corrections only. Do not add
+new architecture during stabilization.
 
-The release does not add a scheduler, automatic queue, automatic stale release,
-hardware controller, unsolicited network updater, permanent background service,
-cloud tenancy, or public network API. A later requirement and threat model must
-justify any of those surfaces.
+## Outside the program
+
+macOS and Linux support, public distribution, Pulse or RSI expansion,
+unrelated skill-package redesign, activation of unused AO components,
+schedulers, automatic queues, permanent background services, cloud tenancy,
+public network APIs, unsolicited automatic updates, and complex CI/CD are
+outside scope. A later requirement and threat model must justify any such
+surface.
