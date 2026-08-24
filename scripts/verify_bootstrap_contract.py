@@ -138,6 +138,35 @@ def verify_candidate_manifest(path: Path, release: dict) -> dict:
     return value
 
 
+def verify_asset_directory(root: Path, contract: Path) -> list[dict]:
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("asset directory must be a regular directory")
+    entries = list(root.iterdir())
+    if (
+        len(entries) != len(ASSET_NAMES)
+        or {entry.name for entry in entries} != set(ASSET_NAMES)
+        or any(entry.is_symlink() or not entry.is_file() for entry in entries)
+    ):
+        raise ValueError("asset directory does not contain the closed set")
+    release = verify_release_manifest(contract)
+    candidate = verify_candidate_manifest(root / ASSET_NAMES[0], release)
+    identities = [release["candidate_manifest"], *candidate["metadata"]]
+    verified = []
+    for identity in identities:
+        path = root / identity["name"]
+        raw = path.read_bytes()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or len(raw) != identity["size"]
+            or hashlib.sha256(raw).hexdigest() != identity["sha256"]
+        ):
+            raise ValueError(f"asset identity mismatch: {identity['name']}")
+        verified.append(dict(identity))
+    return verified
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     path = Path(arguments[0]) if arguments else Path(__file__).parents[1] / "manifests" / "developer-preview-release.json"
