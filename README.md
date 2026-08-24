@@ -1,53 +1,76 @@
-# AO Office Pool
+# AO Office Pool private Windows preview
 
-AO Office Pool is a planned Windows-native coordination layer for five isolated
-AO execution offices over one version-pinned AO stack. AO Mission accepts and
-routes objectives. AO2 performs receipt-bound execution. Each active project
-conversation uses one office, one connected project, and one private receipt.
+AO Office Pool is a Windows x86-64 coordination package for five isolated AO
+offices over one pinned AO stack. This repository is private. The current
+developer preview is built for a fixed directory on a local NTFS volume; macOS
+and Linux are outside the supported product boundary.
 
-## Current status
+The closed stack contains exactly these eight components:
 
-This repository contains the approved architecture and a twelve-month
-development path. It does not contain a Production pool or a qualified Windows
-release.
+| Component | Pinned identity |
+| --- | --- |
+| AO2 | `v0.5.12` |
+| AO Mission | `v0.1.6` |
+| AO Command | `v0.1.3` |
+| AO Atlas | `v0.2.1` |
+| AO Forge | `v0.1.5` |
+| AO Covenant | `v0.1.1` |
+| AO2 Control Plane | `v0.1.19` |
+| AO Blueprint | `git-ec6a80b60b54` |
 
-Development staging occurs on macOS. Windows qualification and Production use
-a fixed directory on a local NTFS volume. macOS evidence cannot establish
-Windows readiness.
+## Acquire the private release
 
-## Read first
+Start in a clean clone of this repository. Use PowerShell 7 on Windows, provide
+a GitHub credential with read access to the private repository through
+`GITHUB_TOKEN`, and do not print or save its value in evidence.
 
-1. [Architecture design](docs/superpowers/specs/2026-08-10-ao-office-pool-design.md)
-2. [Folder and AO stack layout](docs/STACK_LAYOUT.md)
-3. [Months 1–6 roadmap](docs/ROADMAP.md)
-4. [Months 7–12 roadmap](docs/ROADMAP_MONTHS_7_12.md)
-5. [Implementation plan](docs/superpowers/plans/2026-08-10-ao-office-pool-initial-development.md)
+```powershell
+$env:GITHUB_TOKEN = Read-Host 'GitHub read credential' -MaskInput
+./packaging/Get-AOOfficePoolRelease.ps1 -Destination (Join-Path (Get-Location) 'downloads')
+Remove-Item Env:GITHUB_TOKEN
+```
 
-## Public repository boundary
+The acquisition script pins the private repository, release tag, source commit,
+Windows architecture, candidate-manifest identity, and exact eight release
+asset names. It validates GitHub metadata before downloading, verifies the
+external candidate manifest before trusting its seven metadata rows, and
+copies only hash-matching assets with create-only writes.
 
-Git may contain source, schemas, tests, sanitized fixtures, documentation,
-release manifests, checksums, SBOMs, and provenance. Git and release archives
-must exclude prompts, transcripts, receipts, owner identities, recovery
-material, absolute local paths, office state, private execution history, and
-raw support data.
+On success, extract the already authenticated archive into a new sibling
+directory and switch to its archive-first instructions:
 
-The ignored `.local/` directory holds machine-local handoffs, security drafts,
-and mission state. AO Mission handoffs are stored at:
+```powershell
+Expand-Archive -LiteralPath ./downloads/ao-office-pool-developer-preview.zip `
+  -DestinationPath ./verified-preview
+Set-Location ./verified-preview
+Get-Content ./README-FIRST.md
+```
 
-- `.local/handoffs/AO_MISSION_HANDOFF.md`
-- `.local/handoffs/AO_MISSION_HANDOFF_MONTHS_7_12.md`
+Continue with [README-FIRST](README-FIRST.md). For a short path use the
+[quickstart](docs/QUICKSTART.md); an AI operator must follow the normative
+[AI operator runbook](docs/AI_OPERATOR_RUNBOOK.md). Installer internals and
+recovery behavior are in the [operator guide](docs/OPERATOR_GUIDE.md).
 
-`manifests/public-tree.json` lists the roots allowed in the public GitHub
-repository. `.gitignore` excludes local mission state, component checkouts,
-generated runtimes, credentials, receipts, caches, and support data.
+## Supported boundary
 
-## Component sources
+- Private GitHub release; no public release or public repository workflow.
+- Windows x86-64 and PowerShell 7.
+- Fixed local NTFS installation directory, never a share, link, junction,
+  reparse point, volume root, or ambiguous alias.
+- Five offices named O1 through O5.
+- Manual, authenticated acquisition and explicit install/verify/uninstall.
 
-[AO Architecture](https://github.com/uesugitorachiyo/ao-architecture)
-defines stack contracts and compatibility. Implementations come from the linked
-component repositories. AO Office Pool will pin exact source, release, asset,
-digest, license, and readiness identities before packaging or activation.
+This preview does not provide a user-facing office lifecycle command or a
+standardized endurance runner. Installation verifies package integrity; it
+does not grant operational office authority, start work, or publish anything.
 
-V1.1 and the transferred V1.2 candidate are requirement and regression sources.
-They are not code-import authorities. V1.2 implementation must carry forward
-validated behavior through new contracts and tests.
+## Release assets
+
+The private release is a closed set: `candidate-manifest.json`, the preview ZIP,
+its checksum sidecar, member inventory, provenance, release notes, SBOM, and
+`SHA256SUMS`. Unexpected, missing, linked, renamed, or changed assets stop the
+bootstrap.
+
+Git tracks source, schemas, tests, sanitized fixtures, documentation, and
+release contracts. It excludes credentials, private work state, raw API
+responses, operator history, recovery material, and generated evidence.

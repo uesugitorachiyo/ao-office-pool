@@ -1,134 +1,115 @@
 # AO Office Pool developer-preview operator guide
 
-This guide covers the private Windows x86-64 `developer-preview` checkpoint for
-Months 1–6. It is not GA and does not authorize publication, deployment,
-provider calls, or upstream changes.
+This guide describes installer mechanics for the private Windows x86-64
+developer preview. Begin with repository-root [authenticated
+acquisition](../README.md#acquire-the-private-release), or use the closed gates
+in the [AI operator runbook](AI_OPERATOR_RUNBOOK.md). The guide grants no
+authority to publish, call unrelated providers, or start office work.
 
-## Before each operation
+## Prerequisites and paths
 
-Use a local, drive-absolute path on an NTFS volume. Do not use a volume root,
-UNC path, link, junction, reparse point, or 8.3 alias. Keep the archive and its
-checksum sidecar in private operator storage.
+Use PowerShell 7 and a fixed local NTFS drive. Do not use a volume root, UNC
+path, link, junction, reparse point, or short-name alias. Keep the verified
+archive and checksum outside both the extraction and installation.
 
-The archive checksum sidecar contains one line:
+From the verified extraction establish portable variables:
 
-```text
-<64 lowercase or uppercase SHA-256 hex> *<archive filename>
+```powershell
+$BootstrapRoot = (Get-Location).Path
+$DownloadRoot = (Resolve-Path (Join-Path $BootstrapRoot '..\verified-assets')).Path
+$InstallRoot = Join-Path $env:LOCALAPPDATA 'AOOfficePool'
+$Archive = Join-Path $DownloadRoot 'ao-office-pool-developer-preview.zip'
+$Sidecar = Join-Path $DownloadRoot 'ao-office-pool-developer-preview.zip.sha256'
 ```
 
-The archive root contains `developer-preview-manifest.json` with fields exactly
-`schema_version`, `label`, `architecture`, `runtime_version`, and `files`.
-`label` is `developer-preview`; `architecture` is `windows-x86_64`; each file
-row contains exactly `path`, `sha256`, and `size`. Paths use forward slashes.
-The manifest lists immutable package files except itself. It must not list the
-governed mutable pool state (`pool.json`, `.pool.lock`, root runtime state,
-operator secrets, optional updates, or each office's state, history, and work
-tree); that state is separately checked for the exact O1--O5 all-free shape.
-The scripts reject missing immutable
-files, extra immutable files, digest or size drift, traversal, duplicate names,
-and reparse points.
+Acquisition emits one compressed JSON object with schema version, mode,
+repository, tag, product source commit, architecture, portable destination,
+and exact name/size/hash rows. Installer and verifier commands exit nonzero on
+failure; their successful structured results may be retained after removing
+private paths and live state.
 
-Install, verify, update, rollback, and uninstall stop unless the pool contains
-exactly O1, O2, O3, O4, and O5 and all five offices are free. A pending runtime
-transaction also stops the operation. Finish or recover active work first.
+## Integrity model
+
+The sidecar contains one SHA-256 digest and archive filename. The archive root
+contains `developer-preview-manifest.json`, which binds every immutable member
+except itself by relative path, size, and digest. Governed mutable state is
+checked separately for the exact O1 through O5 all-free shape.
+
+The scripts reject missing or extra immutable files, changed size or digest,
+traversal, duplicate names, reparse points, path ambiguity, a pending runtime
+transaction, or an occupied office. Source presence alone never establishes an
+executable, accepted, activated, routed, or authorized capability.
 
 ## Install and verify
 
-Run PowerShell from the directory containing the scripts:
-
 ```powershell
-.\Install-AOOfficePool.ps1 -Action Install `
-  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
-  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256 `
-  -InstallRoot C:\AOOfficePool
-
-.\Verify-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool `
-  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
-  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256
+./packaging/Install-AOOfficePool.ps1 -Action Install -Archive $Archive `
+  -ChecksumFile $Sidecar -InstallRoot $InstallRoot
+./packaging/Verify-AOOfficePool.ps1 -InstallRoot $InstallRoot `
+  -Archive $Archive -ChecksumFile $Sidecar
 ```
 
-The installer retains one checked archive handle through member validation and
-extraction, verifies the staged manifest and immutable file hashes, then takes
-the pool byte-range lock, checks all five offices free again, and records a
-private sibling recovery transaction before replacement. A later invocation
-restores the accepted prior tree if an interrupted replacement is found.
-It does not start a service, create a queue, or schedule work.
+The installer keeps one checked archive handle through member validation and
+extraction, verifies staged immutable bytes, takes the pool byte-range lock,
+checks all offices free again, and records a private sibling recovery
+transaction before replacement. A later invocation restores the accepted
+prior tree when it finds an interrupted replacement.
+
+Installation does not start a service, create a queue, schedule work, or grant
+operational office authority. This preview has no user-facing office lifecycle
+command and no standardized endurance runner.
 
 ## Update and rollback
 
-An update uses a new private archive. A rollback uses the previously accepted
-archive and checksum. Both follow the same checksum, manifest, NTFS, path,
-exact-tree, and all-free checks:
+An update uses a newly acquired and verified private archive. Rollback uses a
+previously accepted archive and sidecar:
 
 ```powershell
-.\Install-AOOfficePool.ps1 -Action Update `
-  -Archive D:\PrivatePreview\next.zip `
-  -ChecksumFile D:\PrivatePreview\next.zip.sha256 `
-  -InstallRoot C:\AOOfficePool
-
-.\Install-AOOfficePool.ps1 -Action Rollback `
-  -Archive D:\PrivatePreview\previous.zip `
-  -ChecksumFile D:\PrivatePreview\previous.zip.sha256 `
-  -InstallRoot C:\AOOfficePool
+./packaging/Install-AOOfficePool.ps1 -Action Update -Archive $Archive `
+  -ChecksumFile $Sidecar -InstallRoot $InstallRoot
+./packaging/Install-AOOfficePool.ps1 -Action Rollback -Archive $Archive `
+  -ChecksumFile $Sidecar -InstallRoot $InstallRoot
 ```
 
-The archive manifest's `runtime_version` must already equal the active
-`pool.json.runtime_version`. Package activation does not change the governed
-runtime version. Complete the governed `internal.runtime_update.RuntimeUpdate`
-transition first, then use an archive built for that active version. A mismatch
-stops before the activation journal or any tree replacement.
+The archive runtime version must equal the active governed runtime version.
+Package activation does not change that version. Update and rollback replace
+immutable members only, preserving accepted mutable bytes and the physical pool
+lock identity.
 
-Update and rollback replace immutable package members only. They preserve the
-exact accepted mutable bytes listed above and the physical `.pool.lock`
-identity in the new active root.
-
-After a successful replacement, the command reports the preserved prior tree
-as `previous_install`. Keep it until verification and the required pilot smoke
-run finish. If replacement fails after the first rename, the installer restores
-the prior tree and preserves the rejected tree under its `.staging.<id>` sibling.
+After replacement, retain the reported prior tree until verification and the
+authorized pilot finish. If replacement fails after the first rename, the
+installer restores the prior tree and preserves the rejected staging sibling.
 Do not merge or delete either tree before recording the private incident.
 
-There is no network updater or background updater. The operator supplies and
-verifies every archive.
+## Recovery stops
 
-## Recovery
+Stop for an occupied office, `recovery-required`, a pending runtime transition,
+unknown bytes, checksum mismatch, or path ambiguity. Do not edit trusted
+metadata to make a changed tree pass. Keep unknown bytes in place, use the
+accepted prior archive for rollback, and record only sanitized evidence.
 
-Stop when a script reports an occupied office, `recovery-required`, a pending
-runtime transaction, an unknown file, a checksum mismatch, or path ambiguity.
-Do not edit the manifest to make a changed tree pass. Use the receipt-bound
-recovery flow for pool state and the accepted prior archive for runtime
-rollback. Unknown bytes stay in place for investigation.
-
-The scripts never turn `source-present` into a runtime claim. Source presence
-does not establish executable, accepted, activated, or routed capability.
-Those states require their own existing qualification records.
+There is no network or background updater. Every archive is supplied and
+verified explicitly.
 
 ## Uninstall
 
-Verify first, then remove the active path:
+Verify first, then uninstall only while all offices are free:
 
 ```powershell
-.\Verify-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool `
-  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
-  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256
-.\Uninstall-AOOfficePool.ps1 -InstallRoot C:\AOOfficePool `
-  -Archive D:\PrivatePreview\ao-office-pool-developer-preview.zip `
-  -ChecksumFile D:\PrivatePreview\ao-office-pool-developer-preview.zip.sha256
+./packaging/Verify-AOOfficePool.ps1 -InstallRoot $InstallRoot `
+  -Archive $Archive -ChecksumFile $Sidecar
+./packaging/Uninstall-AOOfficePool.ps1 -InstallRoot $InstallRoot `
+  -Archive $Archive -ChecksumFile $Sidecar
 ```
 
-Uninstall verifies unchanged manifest-bound bytes and the all-free state, then
-atomically renames the installation to a private `.uninstalled.<id>` sibling.
-This removes the active installation while preserving every byte for recovery
-or independent reproduction. Delete that preserved tree only under a separate
-operator retention decision after the pilot record is complete.
+Uninstall verifies manifest-bound bytes and all-free state, then atomically
+renames the installation to a private recovery sibling. Deleting that preserved
+tree requires a separate retention decision.
 
-## Claims and limits
+## Qualification limit
 
-Verification requires the accepted archive and checksum sidecar as an
-independent immutable anchor; a self-consistent replacement manifest inside
-the installation is not sufficient. Portable tests can validate script structure and fail-closed ordering. They do
-not prove NTFS identity behavior or native Windows execution. Only a pilot run
-against unchanged archive bytes on the required Windows hosts can record those
-results. The preview has no scheduler, hardware controller, automatic queue,
-stale auto-release, permanent background service, or unsolicited network
-updater.
+Portable tests establish structure and fail-closed ordering. Only native
+Windows execution on the required local NTFS boundary establishes filesystem
+identity behavior. A successful bootstrap proves package acquisition,
+integrity, installation, and verification only; it does not prove or authorize
+end-to-end office work.
