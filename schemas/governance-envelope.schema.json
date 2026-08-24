@@ -133,7 +133,7 @@
       "properties": {
         "name": {"const": "ao2"},
         "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-        "asset": {"const": "ao2"},
+        "asset": {"const": "ao2.exe"},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },

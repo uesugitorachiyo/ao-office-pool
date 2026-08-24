@@ -49,11 +49,11 @@ _PRODUCERS = {
     "ao-covenant": ("verify", "--ledger", "{ledger}", "--evidence", "{artifact}", "--json"),
 }
 _PINNED = {
-    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint"),
-    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas"),
-    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge"),
-    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "covenant"),
-    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2"),
+    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint.exe"),
+    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas.exe"),
+    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge.exe"),
+    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "ao-covenant_v0.1.1_windows_amd64.exe"),
+    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2.exe"),
 }
 _ROOTS = {
     "ao-blueprint": (".ao", "evidence", "ao-blueprint"),

@@ -335,7 +335,7 @@ def _ao2_path(receipt: Path, authority: dict, governed: GovernedExecution) -> Pa
         if governed.ao2 != {
             "name": "ao2",
             "commit": governed.ao2["commit"],
-            "asset": "ao2",
+            "asset": "ao2.exe",
             "sha256": governed.ao2["sha256"],
         }:
             raise ValueError("invalid AO2 identity")

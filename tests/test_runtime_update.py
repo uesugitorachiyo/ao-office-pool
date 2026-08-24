@@ -72,7 +72,7 @@ class RuntimeUpdateTests(unittest.TestCase):
             "version": version,
             "repository": "https://example.invalid/ao2",
             "commit": "a" * 40,
-            "asset": "ao2",
+            "asset": "ao2.exe",
             "license": "Apache-2.0",
             "sha256": hashlib.sha256(data).hexdigest(),
         }
@@ -96,7 +96,7 @@ class RuntimeUpdateTests(unittest.TestCase):
                 "sha256": component["sha256"],
             },
         )
-        (candidate / "ao2").write_bytes(data)
+        (candidate / "ao2.exe").write_bytes(data)
         return candidate
 
     def _runtime_bytes(self, version: str) -> list[bytes]:
@@ -159,7 +159,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         self.assertEqual(self._runtime_bytes("v2"), [self.new_bytes] * 5)
         if os.name != "nt":
             inodes = [
-                (self.root / "offices" / office / "runtime" / "versions" / "v2" / "ao2").stat().st_ino
+                (self.root / "offices" / office / "runtime" / "versions" / "v2" / "ao2.exe").stat().st_ino
                 for office in OFFICE_IDS
             ]
             self.assertEqual(len(set(inodes)), 5)
@@ -187,7 +187,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         tampered = b"attacker runtime\n"
         value["sha256"] = hashlib.sha256(tampered).hexdigest()
         _write_json(self.candidate / "runtime-package.json", value)
-        (self.candidate / "ao2").write_bytes(tampered)
+        (self.candidate / "ao2.exe").write_bytes(tampered)
 
         with self.assertRaises(RuntimeUpdateError) as raised:
             RuntimeUpdate(self.root).stage(self.candidate)
@@ -213,7 +213,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         paths = (
             self.candidate,
             self.candidate / "runtime-package.json",
-            self.candidate / "ao2",
+            self.candidate / "ao2.exe",
         )
 
         @contextmanager
@@ -262,7 +262,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         original = alias / self.candidate.name
         expected = (
             original,
-            (original / "runtime-package.json", original / "ao2"),
+            (original / "runtime-package.json", original / "ao2.exe"),
         )
         seen = []
 
@@ -336,7 +336,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         def replacement_read(path, limit):
             if Path(path).name == "runtime-package.json":
                 return replacement_manifest
-            if Path(path).name == "ao2":
+            if Path(path).name == "ao2.exe":
                 return replacement_asset
             return real_read(path, limit)
 
@@ -370,7 +370,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         paths = (
             staged,
             staged / "runtime-package.json",
-            staged / "ao2",
+            staged / "ao2.exe",
             staged / "runtime-anchor.json",
         )
 
@@ -407,7 +407,7 @@ class RuntimeUpdateTests(unittest.TestCase):
             original,
             (
                 original / "runtime-package.json",
-                original / "ao2",
+                original / "ao2.exe",
                 original / "runtime-anchor.json",
             ),
         )
@@ -486,7 +486,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         manifest = json.loads((staged / "runtime-package.json").read_text())
         manifest["sha256"] = hashlib.sha256(replacement).hexdigest()
         _write_json(staged / "runtime-package.json", manifest)
-        (staged / "ao2").write_bytes(replacement)
+        (staged / "ao2.exe").write_bytes(replacement)
 
         with self.assertRaises(RuntimeUpdateError) as raised:
             updater.activate("v2")
@@ -510,7 +510,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         staged = RuntimeUpdate(self.root).stage(self.candidate)
         self.assertEqual(
             {path.name for path in staged.iterdir()},
-            {"runtime-package.json", "ao2", "runtime-anchor.json"},
+            {"runtime-package.json", "ao2.exe", "runtime-anchor.json"},
         )
 
     def test_stage_captures_package_and_component_authority_inside_pool_lock(self):
@@ -583,7 +583,7 @@ class RuntimeUpdateTests(unittest.TestCase):
         manifest = json.loads((staged / "runtime-package.json").read_bytes())
         manifest["sha256"] = hashlib.sha256(replacement).hexdigest()
         _write_json(staged / "runtime-package.json", manifest)
-        (staged / "ao2").write_bytes(replacement)
+        (staged / "ao2.exe").write_bytes(replacement)
         anchor = {
             "schema_version": 1,
             "version": "v2",

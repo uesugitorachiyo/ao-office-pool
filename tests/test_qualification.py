@@ -187,12 +187,12 @@ class QualificationTests(unittest.TestCase):
                         "name": "ao2",
                         "version": candidate_version,
                         "commit": candidate_commit,
-                        "asset": "ao2",
+                        "asset": "ao2.exe",
                         "sha256": runtime_sha256,
                     }
                 )
             )
-            (candidate / "ao2").write_bytes(asset)
+            (candidate / "ao2.exe").write_bytes(asset)
             finalizer.stage(candidate)
             if ordinal == 1:
                 self.pool.release(self.claim_path)

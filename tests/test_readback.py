@@ -379,13 +379,13 @@ class ActiveReadbackTests(unittest.TestCase):
             "name": "ao2",
             "version": version,
             "commit": commit,
-            "asset": "ao2",
+            "asset": "ao2.exe",
             "sha256": hashlib.sha256(asset).hexdigest(),
         }
         (candidate / "runtime-package.json").write_bytes(
             (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         )
-        (candidate / "ao2").write_bytes(asset)
+        (candidate / "ao2.exe").write_bytes(asset)
         RuntimeUpdate(self.root).stage(candidate)
 
     def _change_runtime(self, version: str, operation) -> None:

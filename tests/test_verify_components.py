@@ -3,25 +3,25 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.verify_components import verify_lock
 
 
 COMPONENT_NAMES = (
-    "ao-architecture", "ao-mission", "ao2", "ao2-control-plane", "ao-blueprint",
-    "ao-atlas", "ao-foundry", "ao-forge", "ao-covenant", "ao-command", "ao-arena",
-    "ao-crucible", "ao-sentinel", "ao-promoter",
+    "ao2", "ao-mission", "ao-command", "ao-atlas", "ao-forge", "ao-covenant",
+    "ao2-control-plane", "ao-blueprint",
 )
 
 RELEASED_LOCK_VALUES = {
-    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint", "8f4dd9766e77948e7688b0c80dc8e49ea1cd5fe7ab57be900c651ea2a2f4b4be"),
-    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2", "f2fb203040c0f67fe159e3f84cf84e5e8dcd3e882ff79f6abaa306e909d29dd1"),
-    "ao2-control-plane": ("v0.1.19", "5de3541e9007e12d95b125e7f911c02932e21479", "ao2-cp-server", "75c74af686ae6fb28d0566b66b908090567f848ecff1b6c1da4940691d416135"),
-    "ao-mission": ("v0.1.6", "f631893906e3bed6f257ac30bc3d0ad2739fe9df", "ao-mission", "46639c6389721dbc691d5e20f3d7478451bd160a7618352bff87917d2307d87b"),
-    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas", "d6d0bf089c8b04359fdd84bc9b825752eb2e4f5655ee6005c8f77a976295e521"),
-    "ao-command": ("v0.1.3", "ffef6d76306e892c3e7a7f39734433d5a832006a", "ao-command", "3023530b6035e86e4167069840da4dcd61f2eeba261fca75a670415a12d71d55"),
-    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge", "17545288d7c3ad62e0d091e282b363cd5e9c61af533cd3bb6dbaeb90f97aaed7"),
-    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "covenant", "fd6e3a0033608d3f47dccb60f48191e4c4b2dc4fdce893c87d8ea96199610c5d"),
+    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint.exe", "8f4dd9766e77948e7688b0c80dc8e49ea1cd5fe7ab57be900c651ea2a2f4b4be"),
+    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2.exe", "f2fb203040c0f67fe159e3f84cf84e5e8dcd3e882ff79f6abaa306e909d29dd1"),
+    "ao2-control-plane": ("v0.1.19", "5de3541e9007e12d95b125e7f911c02932e21479", "ao2-cp-server.exe", "75c74af686ae6fb28d0566b66b908090567f848ecff1b6c1da4940691d416135"),
+    "ao-mission": ("v0.1.6", "f631893906e3bed6f257ac30bc3d0ad2739fe9df", "ao-mission.exe", "46639c6389721dbc691d5e20f3d7478451bd160a7618352bff87917d2307d87b"),
+    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas.exe", "d6d0bf089c8b04359fdd84bc9b825752eb2e4f5655ee6005c8f77a976295e521"),
+    "ao-command": ("v0.1.3", "ffef6d76306e892c3e7a7f39734433d5a832006a", "ao-command.exe", "3023530b6035e86e4167069840da4dcd61f2eeba261fca75a670415a12d71d55"),
+    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge.exe", "17545288d7c3ad62e0d091e282b363cd5e9c61af533cd3bb6dbaeb90f97aaed7"),
+    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "ao-covenant_v0.1.1_windows_amd64.exe", "fd6e3a0033608d3f47dccb60f48191e4c4b2dc4fdce893c87d8ea96199610c5d"),
 }
 
 UNRELEASED_LOCK_OBJECTS = {
@@ -75,7 +75,7 @@ class VerifyLockTests(unittest.TestCase):
         digest = hashlib.sha256(self.asset_bytes).hexdigest()
         self.assertEqual(verify_lock(self.lock(), self.component_root), dict.fromkeys(COMPONENT_NAMES, digest))
 
-    def test_tracked_lock_repins_coherent_release_without_changing_unreleased_objects(self):
+    def test_tracked_lock_is_the_closed_s01_qualified_set(self):
         lock_path = Path(__file__).parents[1] / "manifests/components.lock.json"
         lock_bytes = lock_path.read_bytes()
         components = {component["name"]: component for component in json.loads(lock_bytes)["components"]}
@@ -83,14 +83,8 @@ class VerifyLockTests(unittest.TestCase):
             name: tuple(components[name][field] for field in ("version", "commit", "asset", "sha256"))
             for name in RELEASED_LOCK_VALUES
         }
-        raw_objects = {
-            json.loads(line.rstrip(b"\r\n").removesuffix(b","))["name"]: line.replace(b"\r\n", b"\n")
-            for line in lock_bytes.splitlines(keepends=True)
-            if line.lstrip().startswith(b'{"name":')
-        }
-
         self.assertEqual(actual_released, RELEASED_LOCK_VALUES)
-        self.assertEqual({name: raw_objects[name] for name in UNRELEASED_LOCK_OBJECTS}, UNRELEASED_LOCK_OBJECTS)
+        self.assertEqual(set(components), set(COMPONENT_NAMES))
 
     def test_rejects_a_missing_expected_component(self):
         components = self.components()
@@ -159,6 +153,14 @@ class VerifyLockTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             verify_lock(self.lock(components), self.component_root)
+
+    def test_rejects_a_symlinked_component_root_ancestor_before_digesting(self):
+        root = self.component_root
+        original = Path.is_symlink
+
+        with mock.patch.object(Path, "is_symlink", autospec=True, side_effect=lambda path: path == root or original(path)):
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                verify_lock(self.lock(), root)
 
     def test_rejects_backslash_asset_names_on_every_platform(self):
         asset = r"nested\component.zip"

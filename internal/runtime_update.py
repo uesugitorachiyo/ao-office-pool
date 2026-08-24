@@ -17,7 +17,7 @@ from internal.windows_paths import validate_segment
 
 RUNTIME_SCHEMA = Path(__file__).parents[1] / "schemas/runtime-package.schema.json"
 _MANIFEST = "runtime-package.json"
-_ASSET = "ao2"
+_ASSET = "ao2.exe"
 _ANCHOR = "runtime-anchor.json"
 _MAX_ASSET = 64 * 1024 * 1024
 _COMPONENT_FIELDS = {

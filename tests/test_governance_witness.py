@@ -273,15 +273,15 @@ class ForgeRuntimePackageTests(unittest.TestCase):
 
     def test_witness_uses_the_released_component_lock_identities(self):
         expected = {
-            "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5"),
-            "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18"),
-            "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98"),
-            "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9"),
-            "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6"),
+            "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint.exe"),
+            "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas.exe"),
+            "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge.exe"),
+            "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "ao-covenant_v0.1.1_windows_amd64.exe"),
+            "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2.exe"),
         }
         components = governance._locked_components()
         self.assertEqual(
-            {name: (value["version"], value["commit"]) for name, value in components.items()},
+            {name: (value["version"], value["commit"], value["asset"]) for name, value in components.items()},
             expected,
         )
 
@@ -762,7 +762,7 @@ class GovernanceWitnessTests(unittest.TestCase):
         ).read_text(encoding="utf-8").splitlines()
         self.assertEqual(
             {line.split("|", 1)[0] for line in project_commands},
-            {"ao-blueprint", "covenant"},
+            {"ao-blueprint.exe", "ao-covenant_v0.1.1_windows_amd64.exe"},
         )
         self.assertEqual(len(runtime_commands), 1)
         self.assertIn("|goal|validate|--goal-run|", runtime_commands[0])
@@ -963,12 +963,20 @@ class GovernanceWitnessTests(unittest.TestCase):
         )
         commands = self._producer_commands()
         self.assertEqual(len(commands), 3)
-        self.assertIn("|authorize|--pack|", commands["ao-blueprint"])
-        self.assertIn("|--out|", commands["ao-blueprint"])
-        self.assertIn("|goal|validate|--goal-run|", commands["forge"])
-        self.assertIn("|verify|--ledger|", commands["covenant"])
-        self.assertIn("|--evidence|", commands["covenant"])
-        self.assertTrue(commands["covenant"].endswith("|--json"))
+        self.assertIn("|authorize|--pack|", commands["ao-blueprint.exe"])
+        self.assertIn("|--out|", commands["ao-blueprint.exe"])
+        self.assertIn("|goal|validate|--goal-run|", commands["forge.exe"])
+        self.assertIn(
+            "|verify|--ledger|",
+            commands["ao-covenant_v0.1.1_windows_amd64.exe"],
+        )
+        self.assertIn(
+            "|--evidence|",
+            commands["ao-covenant_v0.1.1_windows_amd64.exe"],
+        )
+        self.assertTrue(
+            commands["ao-covenant_v0.1.1_windows_amd64.exe"].endswith("|--json")
+        )
 
     def test_native_covenant_pack_and_ledger_are_bound_after_locked_verification(self):
         start = datetime(2026, 8, 13, tzinfo=timezone.utc)

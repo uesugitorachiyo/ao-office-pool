@@ -8,12 +8,25 @@ from urllib.parse import urlsplit
 _LOCK_FIELDS = {"schema_version", "components"}
 _COMPONENT_FIELDS = {"name", "version", "repository", "commit", "asset", "license", "sha256"}
 _EXPECTED_COMPONENTS = {
-    "ao-architecture", "ao-mission", "ao2", "ao2-control-plane", "ao-blueprint",
-    "ao-atlas", "ao-foundry", "ao-forge", "ao-covenant", "ao-command", "ao-arena",
-    "ao-crucible", "ao-sentinel", "ao-promoter",
+    "ao2", "ao-mission", "ao-command", "ao-atlas", "ao-forge", "ao-covenant",
+    "ao2-control-plane", "ao-blueprint",
 }
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _reparse_or_link(path: Path) -> bool:
+    try:
+        current = path
+        while True:
+            information = current.stat(follow_symlinks=False)
+            if current.is_symlink() or getattr(information, "st_file_attributes", 0) & 0x400:
+                return True
+            if current == current.parent:
+                return False
+            current = current.parent
+    except OSError:
+        return True
 
 
 def _load(path: Path) -> dict:
@@ -37,8 +50,13 @@ def _asset_path(component: dict[str, str], component_root: Path) -> Path:
         raise ValueError("component name and version must be path segments")
     if "/" in asset or "\\" in asset or Path(asset).name != asset or asset in {".", ".."}:
         raise ValueError("asset must be a file name")
+    if _reparse_or_link(component_root) or not component_root.is_dir():
+        raise ValueError("component root contains a reparse point or link")
     root = component_root.resolve()
-    path = (root / name / version / asset).resolve()
+    candidate = root / name / version / asset
+    if _reparse_or_link(candidate):
+        raise ValueError("component input contains a reparse point or link")
+    path = candidate.resolve()
     try:
         path.relative_to(root)
     except ValueError as error:
@@ -47,10 +65,14 @@ def _asset_path(component: dict[str, str], component_root: Path) -> Path:
 
 
 def _digest(path: Path) -> str:
+    if _reparse_or_link(path):
+        raise ValueError("component input contains a reparse point or link")
     digest = hashlib.sha256()
     with path.open("rb") as asset:
         for chunk in iter(lambda: asset.read(1024 * 1024), b""):
             digest.update(chunk)
+    if _reparse_or_link(path):
+        raise ValueError("component input contains a reparse point or link")
     return digest.hexdigest()
 
 
