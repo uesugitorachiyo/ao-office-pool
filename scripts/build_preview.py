@@ -32,7 +32,7 @@ def _directory(z: zipfile.ZipFile, path: str) -> None:
     z.writestr(info, b"")
 
 
-def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path) -> Path:
+def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, components: dict[str, tuple[str, Path]] | None = None) -> Path:
     source, ao2, output = Path(source), Path(ao2), Path(output)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "preview"
@@ -42,6 +42,11 @@ def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path) -
             destination = root / f"offices/O{office}/runtime/versions/{runtime_version}/ao2.exe"
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ao2, destination)
+        for name, (version, binary) in sorted((components or {}).items()):
+            binary = Path(binary)
+            destination = root / "components" / name / version / binary.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(binary, destination)
         files = []
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
             relative = path.relative_to(root).as_posix()
