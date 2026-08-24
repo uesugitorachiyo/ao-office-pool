@@ -23,3 +23,4 @@ class PackageBuilderTests(unittest.TestCase):
                 paths = {row["path"] for row in manifest["files"]}
                 self.assertEqual(manifest["runtime_version"], "v0.5.12")
                 self.assertTrue(all(f"offices/O{number}/runtime/versions/v0.5.12/ao2.exe" in paths for number in range(1, 6)))
+                self.assertTrue(all(f"offices/O{number}/history/" in package.namelist() for number in range(1, 6)))

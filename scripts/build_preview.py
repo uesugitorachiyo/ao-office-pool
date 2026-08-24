@@ -26,6 +26,12 @@ def _write(z: zipfile.ZipFile, path: str, data: bytes) -> None:
     z.writestr(info, data)
 
 
+def _directory(z: zipfile.ZipFile, path: str) -> None:
+    info = zipfile.ZipInfo(path + "/", (1980, 1, 1, 0, 0, 0))
+    info.external_attr = 0o40755 << 16
+    z.writestr(info, b"")
+
+
 def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path) -> Path:
     source, ao2, output = Path(source), Path(ao2), Path(output)
     with tempfile.TemporaryDirectory() as temporary:
@@ -44,6 +50,8 @@ def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path) -
                 files.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)})
         manifest = {"schema_version": 1, "label": "developer-preview", "architecture": "windows-x86_64", "runtime_version": runtime_version, "files": files}
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as package:
+            for path in sorted(p for p in root.rglob("*") if p.is_dir()):
+                _directory(package, path.relative_to(root).as_posix())
             for path in sorted(p for p in root.rglob("*") if p.is_file()):
                 _write(package, path.relative_to(root).as_posix(), path.read_bytes())
             _write(package, "developer-preview-manifest.json", (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode())
