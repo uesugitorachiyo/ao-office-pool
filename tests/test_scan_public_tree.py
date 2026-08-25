@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import tempfile
 import unittest
@@ -173,6 +174,40 @@ class ScanPublicTreeTests(unittest.TestCase):
         target.write_bytes(b"public replacement\n")
         findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
         self.assertEqual(findings[relative], "identity")
+
+    def test_accepts_only_manifest_bound_preview_binaries(self):
+        binaries = {
+            "components/ao2/v1/ao2.exe": b"binary owner: private\x00",
+            "offices/O1/runtime/versions/v1/ao2.exe": b"runtime token=x\x00",
+        }
+        rows = []
+        for relative, data in binaries.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            rows.append(
+                {
+                    "path": relative,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size": len(data),
+                }
+            )
+        self.write(
+            "developer-preview-manifest.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "label": "developer-preview",
+                    "architecture": "windows-x86_64",
+                    "runtime_version": "v1",
+                    "files": rows,
+                }
+            ),
+        )
+        self.assertEqual(scan_tree(self.root), [])
+        (self.root / next(iter(binaries))).write_bytes(b"changed\n")
+        findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
+        self.assertEqual(findings[next(iter(binaries))], "identity")
 
     def test_main_reports_sorted_json_findings_and_summary(self):
         self.write("z/__pycache__/later.pyc")
