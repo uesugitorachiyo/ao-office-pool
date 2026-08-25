@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import unquote
 
-from scripts.verify_bootstrap_contract import verify_release_manifest
+from scripts.verify_bootstrap_contract import verify_bootstrap_tree, verify_release_manifest
 
 
 ROOT = Path(__file__).parents[1]
@@ -19,6 +19,11 @@ DOCUMENTS = (
 
 
 class BootstrapContractTests(unittest.TestCase):
+    def test_build_time_verifier_accepts_the_portable_bootstrap_tree(self):
+        result = verify_bootstrap_tree(ROOT)
+        self.assertEqual(result["documents"], len(DOCUMENTS))
+        self.assertEqual(result["bootstrap_members"], 12)
+
     def test_bootstrap_documents_are_relative_complete_and_truthful(self):
         texts = {
             name: (ROOT / name).read_text(encoding="utf-8") for name in DOCUMENTS
