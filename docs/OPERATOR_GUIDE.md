@@ -34,6 +34,10 @@ The sidecar contains one SHA-256 digest and archive filename. The archive root
 contains `developer-preview-manifest.json`, which binds every immutable member
 except itself by relative path, size, and digest. Governed mutable state is
 checked separately for exactly O1, O2, O3, O4, and O5 in the all-free shape.
+The archive contains only the empty mutable directory template. During staging,
+the installer creates fresh governance and recovery keys, authenticated runtime
+state, generations, office states, pool metadata, and the pool lock. No
+install-local authority material is shared between builds or installations.
 
 The scripts reject missing or extra immutable files, changed size or digest,
 traversal, duplicate names, reparse points, path ambiguity, a pending runtime

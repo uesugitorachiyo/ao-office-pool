@@ -63,6 +63,9 @@ recovery behavior are in the [operator guide](docs/OPERATOR_GUIDE.md).
 This preview does not provide a user-facing office lifecycle command or a
 standardized endurance runner. Installation verifies package integrity; it
 does not grant operational office authority, start work, or publish anything.
+The archive contains no initialized mutable office state or reusable secrets;
+the installer creates fresh per-install governance and recovery material on the
+target machine.
 
 ## Release assets
 

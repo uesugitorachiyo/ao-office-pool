@@ -7,9 +7,6 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from internal.pool import Pool
-
-
 _MUTABLE_FILES = {"pool.json", ".pool.lock", *(f"offices/O{n}/office-state.json" for n in range(1, 6))}
 _MUTABLE_PREFIXES = ("runtime/", "operator-secrets/", "updates/", *(f"offices/O{n}/{part}/" for n in range(1, 6) for part in ("history", "work")))
 _REQUIRED_BOOTSTRAP_MEMBERS = {
@@ -125,6 +122,26 @@ def _validate_bootstrap_source(source: Path) -> None:
             raise ValueError("source is missing bootstrap contract")
 
 
+def _initialize_preview_directories(root: Path) -> None:
+    directories = {
+        "operator-secrets",
+        "runtime/governance/consumed",
+        "runtime/governance/issued",
+        "runtime/governance/revoked",
+        "runtime/pointers",
+        "runtime/receipts",
+        "runtime/recovery",
+        "runtime/transactions",
+    }
+    directories.update(
+        f"offices/O{office}/{part}"
+        for office in range(1, 6)
+        for part in ("history", "runtime/versions", "work")
+    )
+    for relative in sorted(directories):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+
+
 def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, components: dict[str, tuple[str, Path]] | None = None, component_root: Path | None = None) -> Path:
     source, ao2, output = Path(source), Path(ao2), Path(output)
     if components is None:
@@ -146,7 +163,7 @@ def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, c
                 else []
             ),
         )
-        Pool(root, runtime_version=runtime_version).initialize()
+        _initialize_preview_directories(root)
         for office in range(1, 6):
             destination = root / f"offices/O{office}/runtime/versions/{runtime_version}/ao2.exe"
             destination.parent.mkdir(parents=True, exist_ok=True)

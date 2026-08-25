@@ -29,7 +29,9 @@ $InstallRoot = Join-Path $env:LOCALAPPDATA 'AOOfficePool'
 Both commands must finish successfully. Verification binds installed immutable
 bytes to the independently retained archive and checksum. Installation does
 not authorize operational office work, create a queue, start a service, or
-publish a release.
+publish a release. The archive carries no initialized mutable state or reusable
+keys; installation creates fresh local authority and recovery material before
+the new tree becomes active.
 
 For an AI-driven setup, follow every gate in the [AI operator
 runbook](docs/AI_OPERATOR_RUNBOOK.md). Humans may use the

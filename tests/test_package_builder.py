@@ -247,6 +247,39 @@ class PackageBuilderTests(unittest.TestCase):
                     self.assertEqual(rows[relative]["size"], len(data))
                     self.assertEqual(rows[relative]["sha256"], hashlib.sha256(data).hexdigest())
 
+    def test_preview_is_deterministic_and_contains_no_mutable_files(self):
+        import scripts.build_preview as builder
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.bootstrap_source(root)
+            component_root, components, lock_path, identities = self.portable_components(root)
+            first = root / "first.zip"
+            second = root / "second.zip"
+            with (
+                mock.patch.object(builder, "_LOCK_PATH", lock_path),
+                mock.patch.object(builder, "_S01_LOCKS", identities),
+            ):
+                for archive in (first, second):
+                    builder.build_preview(
+                        source,
+                        components["ao2"][1],
+                        "v0.5.12",
+                        archive,
+                        components=components,
+                        component_root=component_root,
+                    )
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as package:
+                mutable_files = [
+                    path
+                    for path in package.namelist()
+                    if not path.endswith("/")
+                    and path != "developer-preview-manifest.json"
+                    and builder._mutable(path)
+                ]
+            self.assertEqual(mutable_files, [])
+
     def test_build_preview_rejects_a_component_outside_the_caller_root(self):
         import scripts.build_preview as builder
 

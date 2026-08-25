@@ -267,6 +267,102 @@ function Assert-GovernanceMarkerDirectory {
     }
 }
 
+function Write-NewBytes {
+    param([string]$Path, [byte[]]$Bytes)
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+}
+
+function Write-NewUtf8 {
+    param([string]$Path, [string]$Text)
+    Write-NewBytes $Path ([System.Text.UTF8Encoding]::new($false).GetBytes($Text))
+}
+
+function Get-RandomBytes {
+    param([int]$Count)
+    $bytes = [byte[]]::new($Count)
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) }
+    finally { $generator.Dispose() }
+    return $bytes
+}
+
+function Get-Sha256Hex {
+    param([byte[]]$Bytes)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([System.Convert]::ToHexString($algorithm.ComputeHash($Bytes))).ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+}
+
+function Initialize-FreshMutableState {
+    param([string]$Root, [string]$RuntimeVersion)
+    foreach ($relative in @(
+        $MutableStateFiles + @(
+            'runtime/generations.json',
+            'runtime/recovery-authority.json',
+            'runtime/runtime-update-state.json',
+            'operator-secrets/governance-witness.key',
+            'operator-secrets/recovery-key-O1',
+            'operator-secrets/recovery-key-O2',
+            'operator-secrets/recovery-key-O3',
+            'operator-secrets/recovery-key-O4',
+            'operator-secrets/recovery-key-O5'
+        )
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $Root $relative)) {
+            throw 'archive must not contain initialized mutable state'
+        }
+    }
+    Assert-ExactChildNames (Join-Path $Root 'runtime') @(
+        'governance', 'pointers', 'receipts', 'recovery', 'transactions'
+    ) 'archive runtime template'
+    Assert-ExactChildNames (Join-Path $Root 'operator-secrets') @() 'archive operator template'
+    Assert-ExactChildNames (Join-Path $Root 'runtime\governance') @('consumed', 'issued', 'revoked') 'archive governance template'
+    foreach ($relative in @(
+        'runtime\pointers', 'runtime\receipts', 'runtime\recovery',
+        'runtime\transactions', 'runtime\governance\consumed',
+        'runtime\governance\issued', 'runtime\governance\revoked'
+    )) {
+        Assert-ExactChildNames (Join-Path $Root $relative) @() "archive template: $relative"
+    }
+
+    Write-NewBytes (Join-Path $Root '.pool.lock') ([byte[]]::new(0))
+    $witnessBytes = Get-RandomBytes 32
+    Write-NewBytes (Join-Path $Root 'operator-secrets\governance-witness.key') $witnessBytes
+    $digests = @{}
+    foreach ($office in $ExpectedOffices) {
+        $keyBytes = Get-RandomBytes 32
+        $keyText = [System.Convert]::ToBase64String($keyBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_') + "`n"
+        $keyFileBytes = [System.Text.Encoding]::UTF8.GetBytes($keyText)
+        Write-NewBytes (Join-Path $Root "operator-secrets\recovery-key-$office") $keyFileBytes
+        $digests[$office] = Get-Sha256Hex $keyFileBytes
+        Write-NewUtf8 (Join-Path $Root "offices\$office\office-state.json") ("{`"generation`":0,`"office_id`":`"$office`",`"schema_version`":1,`"status`":`"free`"}`n")
+    }
+
+    Write-NewUtf8 (Join-Path $Root 'pool.json') ("{`"office_count`":5,`"offices`":[`"O1`",`"O2`",`"O3`",`"O4`",`"O5`"],`"runtime_version`":`"$RuntimeVersion`",`"schema_version`":1}`n")
+    Write-NewUtf8 (Join-Path $Root 'runtime\generations.json') "{`"generations`":{`"O1`":0,`"O2`":0,`"O3`":0,`"O4`":0,`"O5`":0},`"schema_version`":1}`n"
+    $recoveryText = "{`"digests`":{`"O1`":`"$($digests.O1)`",`"O2`":`"$($digests.O2)`",`"O3`":`"$($digests.O3)`",`"O4`":`"$($digests.O4)`",`"O5`":`"$($digests.O5)`"},`"schema_version`":1}`n"
+    Write-NewUtf8 (Join-Path $Root 'runtime\recovery-authority.json') $recoveryText
+
+    $payload = "{`"completed`":{},`"schema_version`":1}`n"
+    $authenticated = [System.Text.Encoding]::UTF8.GetBytes("runtime-update-state`0$payload")
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($witnessBytes)
+    try { $stateTag = ([System.Convert]::ToHexString($hmac.ComputeHash($authenticated))).ToLowerInvariant() }
+    finally { $hmac.Dispose() }
+    Write-NewUtf8 (Join-Path $Root 'runtime\runtime-update-state.json') ("{`"completed`":{},`"schema_version`":1,`"state_tag`":`"$stateTag`"}`n")
+}
+
 function Assert-MutableStateShape {
     param([string]$Root, [switch]$AllowMissingLock)
     foreach ($relative in $MutableStateFiles) {
@@ -697,6 +793,7 @@ function Invoke-AtomicInstall {
         $candidateState = "$staging.mutable"
         Expand-VerifiedArchive $archiveStream $staging
         Assert-NtfsPath $staging
+        Initialize-FreshMutableState $staging $archiveManifest.manifest.runtime_version
         Assert-InstalledTree $staging $archiveManifest.manifest $archiveManifest.manifest_sha256
         Assert-AllFree $staging $archiveManifest.manifest.runtime_version
         Assert-MutableStateShape $staging
