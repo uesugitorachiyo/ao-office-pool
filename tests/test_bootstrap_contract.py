@@ -95,7 +95,7 @@ class BootstrapContractTests(unittest.TestCase):
         )
         self.assertEqual(
             result["product_source_commit"],
-            "7e6a640f6f764555ae64e4ee4921e1835ab8eb2a",
+            "dbcd03226143e3338c7b2211e15cf537d5c03950",
         )
 
     def test_release_manifest_rejects_unknown_fields_and_duplicate_asset_names(self):
