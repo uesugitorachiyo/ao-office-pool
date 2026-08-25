@@ -33,9 +33,12 @@ publish a release. The archive carries no initialized mutable state or reusable
 keys; installation creates fresh local authority and recovery material before
 the new tree becomes active.
 
-For an AI-driven setup, follow every gate in the [AI operator
-runbook](docs/AI_OPERATOR_RUNBOOK.md). Humans may use the
-[quickstart](docs/QUICKSTART.md) and consult the detailed
+For an AI-driven setup that entered through this file after the external
+candidate was verified, [start at G06 in the AI operator
+runbook](docs/AI_OPERATOR_RUNBOOK.md#g06-ntfs-install-root-selection). Do not
+rerun G00 through G05 from this extracted archive: those gates require the
+later release-control checkout and its external non-self-referential contract.
+Humans may use the [quickstart](docs/QUICKSTART.md) and consult the detailed
 [operator guide](docs/OPERATOR_GUIDE.md).
 
 ## Remove the preview

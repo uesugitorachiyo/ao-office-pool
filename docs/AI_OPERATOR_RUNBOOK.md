@@ -5,6 +5,14 @@ through G09 in order. At every gate choose exactly one result: `CONTINUE`,
 `REPAIR`, or `HOLD`. Never treat a later success as evidence that a skipped
 gate passed.
 
+The gates cross one explicit trust boundary. G00 through G05 require the
+release-control checkout, because its external contract authenticates the
+candidate without creating a self-reference inside the ZIP. G06 through G09
+run from the verified extraction while retaining the independently verified
+asset directory. An AI entering through `README-FIRST.md` after documented
+external verification starts at G06; it does not repeat G00 through G05 from
+inside the extracted archive.
+
 ## G00 Authority
 
 **Authority:** Read local files and perform the explicitly requested private
@@ -243,10 +251,11 @@ office authorization remain separate actions.
 ## Offline or manually authenticated acquisition
 
 When another authorized mechanism has downloaded the eight private release
-assets, place only those files in a new directory and run the G05 offline
-command with that directory as `-OfflineAssetRoot`. Test mode is not used. The
-same package-owned contract, candidate-manifest identity, closed asset set,
-sizes, and hashes are mandatory. Manual acquisition does not weaken any gate.
+assets, place only those files in a new directory. From the release-control
+checkout—not from the extracted ZIP—run the G05 offline command with that
+directory as `-OfflineAssetRoot`. Test mode is not used. The same
+package-owned contract, candidate-manifest identity, closed asset set, sizes,
+and hashes are mandatory. Manual acquisition does not weaken any gate.
 
 ## Bounded recovery
 

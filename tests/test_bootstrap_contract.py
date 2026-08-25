@@ -71,6 +71,16 @@ class BootstrapContractTests(unittest.TestCase):
             for label in ("Authority", "Command", "Expected", "Stop", "Evidence", "Next"):
                 self.assertIn(f"**{label}:**", block, f"{match.group(1)} lacks {label}")
 
+    def test_extracted_entry_point_does_not_repeat_control_checkout_acquisition(self):
+        read_first = (ROOT / "README-FIRST.md").read_text(encoding="utf-8")
+        runbook = (ROOT / "docs/AI_OPERATOR_RUNBOOK.md").read_text(encoding="utf-8")
+        read_first_words = " ".join(read_first.split())
+        runbook_words = " ".join(runbook.split())
+        self.assertIn("start at G06", read_first_words)
+        self.assertIn("Do not rerun G00 through G05", read_first_words)
+        self.assertIn("G00 through G05 require the release-control checkout", runbook_words)
+        self.assertIn("G06 through G09 run from the verified extraction", runbook_words)
+
     def test_tracked_release_manifest_is_the_closed_private_v03_contract(self):
         result = verify_release_manifest(
             ROOT / "manifests/developer-preview-release.json"
