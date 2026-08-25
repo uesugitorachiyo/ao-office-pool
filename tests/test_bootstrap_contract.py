@@ -71,20 +71,21 @@ class BootstrapContractTests(unittest.TestCase):
             for label in ("Authority", "Command", "Expected", "Stop", "Evidence", "Next"):
                 self.assertIn(f"**{label}:**", block, f"{match.group(1)} lacks {label}")
 
-    def test_tracked_release_manifest_is_the_closed_private_v02_contract(self):
+    def test_tracked_release_manifest_is_the_closed_private_v03_contract(self):
         result = verify_release_manifest(
             ROOT / "manifests/developer-preview-release.json"
         )
         self.assertEqual(result["repository"], "uesugitorachiyo/ao-office-pool")
         self.assertEqual(result["visibility"], "private")
         self.assertEqual(result["architecture"], "windows-x86_64")
+        self.assertEqual(result["tag"], "developer-preview-v03")
         self.assertEqual(len(result["asset_names"]), 8)
         self.assertEqual(
             result["candidate_manifest"]["name"], "candidate-manifest.json"
         )
         self.assertEqual(
             result["product_source_commit"],
-            "4bf8db6469a00dac69d2ddd7d103b501f797d7f6",
+            "e2a3c9eac00caa42cec15bdbee669f2f1638bcb5",
         )
 
     def test_release_manifest_rejects_unknown_fields_and_duplicate_asset_names(self):
