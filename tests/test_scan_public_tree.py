@@ -164,6 +164,29 @@ class ScanPublicTreeTests(unittest.TestCase):
         self.write("README.md")
         self.assertEqual(scan_tree(self.root), [])
 
+    def test_ignores_a_regular_root_git_worktree_pointer(self):
+        self.write(
+            ".git",
+            "gitdir: C:" + "\\Users\\private\\repository\\.git\\worktrees\\checkout\n",
+        )
+        self.write("README.md")
+        self.assertEqual(scan_tree(self.root), [])
+
+    def test_scans_a_non_pointer_root_git_file(self):
+        self.write(".git", text("owner", "Id: private"))
+        findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
+        self.assertEqual(findings, {".git": "content"})
+
+    def test_reports_a_linked_root_git_entry(self):
+        target = Path(self.temporary_directory.name) / "private-git"
+        target.mkdir()
+        try:
+            (self.root / ".git").symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(str(error))
+        findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
+        self.assertEqual(findings[".git"], "symlink")
+
     def test_accepts_only_hash_bound_pinned_forge_runtime_schema(self):
         relative = "packaging/runtime/ao-forge/docs/contracts/goal-run-v0.1.schema.json"
         packaged = Path(__file__).parents[1] / relative

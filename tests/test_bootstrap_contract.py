@@ -55,7 +55,9 @@ class BootstrapContractTests(unittest.TestCase):
         for phrase in (
             "## Fresh clone: validate the source checkout",
             "git clone https://github.com/uesugitorachiyo/ao-office-pool.git",
+            "python -m tests.windows_compiler",
             "python -m unittest discover -s tests -v",
+            "compiler-dependent skips do not qualify",
             "## Copy-paste prompt for Windows Codex",
             "If the private release is unavailable",
             "Do not substitute locally built or unverified assets",

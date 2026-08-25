@@ -45,10 +45,20 @@ def scan_tree(root:Path)->list[Finding]:
  bindings,out=_preview_bindings(root); seen=set()
  def fail(e): raise e
  for d,ds,fs in os.walk(root,followlinks=False,onerror=fail):
-  ds[:]=[x for x in ds if x!=".git"]
+  kept=[]
+  for n in ds:
+   p=Path(d)/n
+   if n==".git":
+    if p.is_symlink(): out.append(Finding(p.relative_to(root).as_posix(),"symlink","private"))
+    continue
+   kept.append(n)
+  ds[:]=kept
   for n in fs:
    p=Path(d)/n; r=p.relative_to(root).as_posix(); low=n.casefold()
    if p.is_symlink(): out.append(Finding(r,"symlink","private")); continue
+   if Path(d)==root and n==".git" and p.is_file():
+    pointer=p.read_text(errors="ignore")
+    if re.fullmatch(r"gitdir: [^\r\n]+\r?\n?",pointer): continue
    if r in bindings and r in TRUSTED_PREVIEW_BINARIES and p.suffix.casefold() in {".exe",".dll"}:
     data=p.read_bytes(); seen.add(r); size,digest=bindings[r]
     if len(data)!=size or hashlib.sha256(data).hexdigest()!=digest: out.append(Finding(r,"identity","private"))

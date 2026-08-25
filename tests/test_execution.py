@@ -19,6 +19,7 @@ import internal.mission_bridge as mission_bridge
 from internal.execution import ExecutionError, execute
 from internal.governance_witness import issue_witness
 from tests import test_governance_witness as witness_tests
+from tests.windows_compiler import compile_c
 
 
 FAKE_AO2 = r'''
@@ -446,13 +447,7 @@ class ExecutionTests(unittest.TestCase):
         source_path = self.base / (output.stem + "-source.c")
         source_path.write_text(source, encoding="utf-8")
         if os.name == "nt":
-            vcvars = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-            compile_cmd = self.base / (output.stem + "-compile.cmd")
-            compile_cmd.write_text(
-                f'@call "{vcvars}" >nul\n@cl /nologo /Fo:"{self.base / (output.stem + ".obj")}" "{source_path}" /Fe:"{output}"\n',
-                encoding="utf-8",
-            )
-            subprocess.run(["cmd.exe", "/d", "/c", str(compile_cmd)], check=True)
+            compile_c(source_path, output)
         else:
             subprocess.run(["cc", str(source_path), "-o", str(output)], check=True)
 

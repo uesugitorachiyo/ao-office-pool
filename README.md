@@ -20,10 +20,13 @@ The closed stack contains exactly these eight components:
 
 ## Fresh clone: validate the source checkout
 
-Run this copy-paste block in PowerShell 7 on Windows x86-64. It needs Git and
-Python 3, but no third-party Python package. Source validation can run before a
-private release is published; installing the packaged preview additionally
-requires a new directory on a fixed local NTFS volume.
+Run this copy-paste block in PowerShell 7 on Windows x86-64. It needs Git,
+Python 3, and Visual Studio Build Tools with the Desktop development with C++
+workload, but no third-party Python package. Set `AO_TEST_VCVARS64` to a valid
+`vcvars64.bat` only when automatic Visual Studio discovery is unavailable.
+Source validation can run before a private release is published; installing
+the packaged preview additionally requires a new directory on a fixed local
+NTFS volume.
 
 ```powershell
 git clone https://github.com/uesugitorachiyo/ao-office-pool.git
@@ -38,16 +41,19 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 
 python --version
 $env:PYTHONDONTWRITEBYTECODE = '1'
+python -m tests.windows_compiler
 python scripts/scan_public_tree.py .
 python scripts/verify_bootstrap_contract.py .
 python -m unittest discover -s tests -v
 Remove-Item Env:PYTHONDONTWRITEBYTECODE
 ```
 
-Expected results are `public-tree findings=0`, a bootstrap summary with 13
-members and 5 documents, and a final `OK` test result. Privilege-dependent
-symlink tests may be reported as skips on Windows. A failure is a stop signal;
-do not continue to release installation by bypassing it.
+Expected results are `windows-c-compiler=ready`, `public-tree findings=0`, a
+bootstrap summary with 13 members and 5 documents, and a final `OK` test result.
+Privilege-dependent symlink tests may be reported as skips on Windows. Other
+compiler-dependent skips do not qualify the checkout. A missing compiler or
+any other failure is a stop signal; do not continue to release installation by
+bypassing it.
 
 ## Copy-paste prompt for Windows Codex
 
@@ -63,11 +69,13 @@ docs/AI_OPERATOR_RUNBOOK.md, docs/OPERATOR_GUIDE.md, and
 manifests/developer-preview-release.json completely. Treat those tracked files
 as authority. Use only relative repository paths in commands and evidence.
 
-Confirm Git, Python 3, PowerShell 7, and Windows x86-64. Set
-PYTHONDONTWRITEBYTECODE=1, then run the public-tree scanner, bootstrap-contract
-verifier, and complete unittest suite exactly as README.md specifies. Report
-commands, exit codes, test totals, and named skips. Stop on any unexpected
-failure; do not weaken a gate.
+Confirm Git, Python 3, PowerShell 7, Windows x86-64, and the documented Windows
+C compiler preflight. Set PYTHONDONTWRITEBYTECODE=1, then run the compiler
+preflight, public-tree scanner, bootstrap-contract verifier, and complete
+unittest suite exactly as README.md specifies. Report commands, exit codes,
+test totals, and named skips. Treat a missing compiler or compiler-dependent
+skip as HOLD rather than native qualification. Stop on any unexpected failure;
+do not weaken a gate.
 
 After source validation, determine whether the pinned private release is
 available. Use GITHUB_TOKEN only if it already exists in the process

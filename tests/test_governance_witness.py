@@ -24,6 +24,7 @@ from internal.governance_witness import (
 )
 from internal.pool import AuthorityLease, Pool, PoolError
 from tests.windows_crt import windows_text_mode
+from tests.windows_compiler import compile_c
 
 
 TEST_FORGE_SCHEMA = b"test-forge-goal-run-schema\n"
@@ -330,13 +331,7 @@ class GovernanceWitnessTests(unittest.TestCase):
         source.write_text(FAKE_PRODUCER, encoding="utf-8")
         built = self.base / ("fake-producer.exe" if os.name == "nt" else "fake-producer")
         if os.name == "nt":
-            vcvars = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-            compile_cmd = self.base / "compile.cmd"
-            compile_cmd.write_text(
-                f'@call "{vcvars}" >nul\n@cl /nologo /Fo:"{self.base / "fake-producer.obj"}" "{source}" /Fe:"{built}"\n',
-                encoding="utf-8",
-            )
-            subprocess.run(["cmd.exe", "/d", "/c", str(compile_cmd)], check=True)
+            compile_c(source, built)
         else:
             subprocess.run(["cc", str(source), "-o", str(built)], check=True)
         self.components = []
