@@ -33,12 +33,12 @@ private paths and live state.
 The sidecar contains one SHA-256 digest and archive filename. The archive root
 contains `developer-preview-manifest.json`, which binds every immutable member
 except itself by relative path, size, and digest. Governed mutable state is
-checked separately for the exact O1 through O5 all-free shape.
+checked separately for exactly O1, O2, O3, O4, and O5 in the all-free shape.
 
 The scripts reject missing or extra immutable files, changed size or digest,
 traversal, duplicate names, reparse points, path ambiguity, a pending runtime
-transaction, or an occupied office. Source presence alone never establishes an
-executable, accepted, activated, routed, or authorized capability.
+transaction, or an occupied office. The `source-present` state does not establish executable,
+accepted, activated, routed, or authorized capability.
 
 ## Install and verify
 
@@ -93,7 +93,7 @@ verified explicitly.
 
 ## Uninstall
 
-Verify first, then uninstall only while all offices are free:
+Verify first, then uninstall only while all five offices are free:
 
 ```powershell
 ./packaging/Verify-AOOfficePool.ps1 -InstallRoot $InstallRoot `

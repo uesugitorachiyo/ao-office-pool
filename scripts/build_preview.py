@@ -12,6 +12,21 @@ from internal.pool import Pool
 
 _MUTABLE_FILES = {"pool.json", ".pool.lock", *(f"offices/O{n}/office-state.json" for n in range(1, 6))}
 _MUTABLE_PREFIXES = ("runtime/", "operator-secrets/", "updates/", *(f"offices/O{n}/{part}/" for n in range(1, 6) for part in ("history", "work")))
+_REQUIRED_BOOTSTRAP_MEMBERS = {
+    "README.md",
+    "README-FIRST.md",
+    "docs/QUICKSTART.md",
+    "docs/AI_OPERATOR_RUNBOOK.md",
+    "docs/OPERATOR_GUIDE.md",
+    "packaging/Install-AOOfficePool.ps1",
+    "packaging/Verify-AOOfficePool.ps1",
+    "packaging/Uninstall-AOOfficePool.ps1",
+    "schemas/developer-preview-release.schema.json",
+    "skills/thought-experiment/SKILL.md",
+    "skills/engineering-research/SKILL.md",
+    "skills/scope-to-deliverable-workflow/SKILL.md",
+}
+_CONTROL_CONTRACT = "manifests/developer-preview-release.json"
 _S01_LOCKS = {
     "ao2": {"name": "ao2", "version": "v0.5.12", "repository": "https://github.com/uesugitorachiyo/ao2.git", "commit": "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "asset": "ao2.exe", "license": "Apache-2.0", "sha256": "f2fb203040c0f67fe159e3f84cf84e5e8dcd3e882ff79f6abaa306e909d29dd1"},
     "ao-mission": {"name": "ao-mission", "version": "v0.1.6", "repository": "https://github.com/uesugitorachiyo/ao-mission.git", "commit": "f631893906e3bed6f257ac30bc3d0ad2739fe9df", "asset": "ao-mission.exe", "license": "Apache-2.0", "sha256": "46639c6389721dbc691d5e20f3d7478451bd160a7618352bff87917d2307d87b"},
@@ -101,6 +116,15 @@ def _validate_s01_components(ao2: Path, runtime_version: str, components: dict[s
     return dict(zip(components, (data for _, data in paths)))
 
 
+def _validate_bootstrap_source(source: Path) -> None:
+    if _reparse_or_link(source) or not source.is_dir():
+        raise ValueError("source is missing bootstrap contract")
+    for relative in _REQUIRED_BOOTSTRAP_MEMBERS:
+        path = source / relative
+        if _reparse_or_link(path) or not path.is_file():
+            raise ValueError("source is missing bootstrap contract")
+
+
 def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, components: dict[str, tuple[str, Path]] | None = None, component_root: Path | None = None) -> Path:
     source, ao2, output = Path(source), Path(ao2), Path(output)
     if components is None:
@@ -108,9 +132,20 @@ def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, c
     if component_root is None:
         raise ValueError("component root is required")
     verified = _validate_s01_components(ao2, runtime_version, components, component_root)
+    _validate_bootstrap_source(source)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "preview"
-        shutil.copytree(source, root)
+        control_parent = source / Path(_CONTROL_CONTRACT).parent
+        shutil.copytree(
+            source,
+            root,
+            ignore=lambda directory, names: (
+                [Path(_CONTROL_CONTRACT).name]
+                if Path(directory) == control_parent
+                and Path(_CONTROL_CONTRACT).name in names
+                else []
+            ),
+        )
         Pool(root, runtime_version=runtime_version).initialize()
         for office in range(1, 6):
             destination = root / f"offices/O{office}/runtime/versions/{runtime_version}/ao2.exe"
@@ -127,6 +162,9 @@ def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, c
             if not _mutable(relative):
                 data = path.read_bytes()
                 files.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)})
+        immutable_paths = {row["path"] for row in files}
+        if not _REQUIRED_BOOTSTRAP_MEMBERS <= immutable_paths or _CONTROL_CONTRACT in immutable_paths:
+            raise ValueError("source is missing bootstrap contract")
         manifest = {"schema_version": 1, "label": "developer-preview", "architecture": "windows-x86_64", "runtime_version": runtime_version, "files": files}
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as package:
             for path in sorted(p for p in root.rglob("*") if p.is_dir()):

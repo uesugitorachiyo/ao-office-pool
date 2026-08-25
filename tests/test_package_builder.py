@@ -7,7 +7,34 @@ from pathlib import Path
 from unittest import mock
 
 
+ROOT = Path(__file__).parents[1]
+REQUIRED_BOOTSTRAP_MEMBERS = {
+    "README.md",
+    "README-FIRST.md",
+    "docs/QUICKSTART.md",
+    "docs/AI_OPERATOR_RUNBOOK.md",
+    "docs/OPERATOR_GUIDE.md",
+    "packaging/Install-AOOfficePool.ps1",
+    "packaging/Verify-AOOfficePool.ps1",
+    "packaging/Uninstall-AOOfficePool.ps1",
+    "schemas/developer-preview-release.schema.json",
+    "skills/thought-experiment/SKILL.md",
+    "skills/engineering-research/SKILL.md",
+    "skills/scope-to-deliverable-workflow/SKILL.md",
+}
+
+
 class PackageBuilderTests(unittest.TestCase):
+    def bootstrap_source(self, root):
+        source = root / "source"
+        for relative in REQUIRED_BOOTSTRAP_MEMBERS | {
+            "manifests/developer-preview-release.json"
+        }:
+            destination = source / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((ROOT / relative).read_bytes())
+        return source
+
     def portable_components(self, root):
         import scripts.build_preview as builder
 
@@ -152,8 +179,7 @@ class PackageBuilderTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
+            source = self.bootstrap_source(root)
             (source / "app.txt").write_text("application\n", encoding="utf-8")
             component_root, components, lock_path, identities = self.portable_components(root)
             ao2 = components["ao2"][1]
@@ -173,8 +199,7 @@ class PackageBuilderTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
+            source = self.bootstrap_source(root)
             component_root, components, lock_path, identities = self.portable_components(root)
             archive = root / "preview.zip"
             with (
@@ -190,6 +215,37 @@ class PackageBuilderTests(unittest.TestCase):
                     component_root=component_root,
                 )
             self.assertTrue(archive.is_file())
+
+    def test_preview_contains_the_complete_bootstrap_contract(self):
+        import scripts.build_preview as builder
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.bootstrap_source(root)
+            component_root, components, lock_path, identities = self.portable_components(root)
+            archive = root / "preview.zip"
+            with (
+                mock.patch.object(builder, "_LOCK_PATH", lock_path),
+                mock.patch.object(builder, "_S01_LOCKS", identities),
+            ):
+                builder.build_preview(
+                    source,
+                    components["ao2"][1],
+                    "v0.5.12",
+                    archive,
+                    components=components,
+                    component_root=component_root,
+                )
+            with zipfile.ZipFile(archive) as package:
+                names = set(package.namelist())
+                self.assertTrue(REQUIRED_BOOTSTRAP_MEMBERS <= names)
+                self.assertNotIn("manifests/developer-preview-release.json", names)
+                manifest = json.loads(package.read("developer-preview-manifest.json"))
+                rows = {row["path"]: row for row in manifest["files"]}
+                for relative in REQUIRED_BOOTSTRAP_MEMBERS:
+                    data = package.read(relative)
+                    self.assertEqual(rows[relative]["size"], len(data))
+                    self.assertEqual(rows[relative]["sha256"], hashlib.sha256(data).hexdigest())
 
     def test_build_preview_rejects_a_component_outside_the_caller_root(self):
         import scripts.build_preview as builder
