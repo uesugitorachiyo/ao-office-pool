@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 import unittest
 import zipfile
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,7 @@ REQUIRED_BOOTSTRAP_MEMBERS = {
     "packaging/Verify-AOOfficePool.ps1",
     "packaging/Uninstall-AOOfficePool.ps1",
     "schemas/developer-preview-release.schema.json",
+    "schemas/developer-preview-candidate.schema.json",
     "skills/thought-experiment/SKILL.md",
     "skills/engineering-research/SKILL.md",
     "skills/scope-to-deliverable-workflow/SKILL.md",
@@ -279,6 +281,53 @@ class PackageBuilderTests(unittest.TestCase):
                     and builder._mutable(path)
                 ]
             self.assertEqual(mutable_files, [])
+
+    def test_build_preview_rejects_mutable_source_state(self):
+        import scripts.build_preview as builder
+
+        for relative in ("pool.json", "runtime/private.json", "offices/O1/work/private.txt"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = self.bootstrap_source(root)
+                private = source / relative
+                private.parent.mkdir(parents=True, exist_ok=True)
+                private.write_text("to" + "ken=private\n", encoding="utf-8")
+                component_root, components, lock_path, identities = self.portable_components(root)
+                with (
+                    mock.patch.object(builder, "_LOCK_PATH", lock_path),
+                    mock.patch.object(builder, "_S01_LOCKS", identities),
+                    self.assertRaisesRegex(ValueError, "mutable source state"),
+                ):
+                    builder.build_preview(source, components["ao2"][1], "v0.5.12", root / "preview.zip", components, component_root)
+
+    def test_build_preview_rejects_source_links_and_hardlinks(self):
+        import scripts.build_preview as builder
+
+        for kind in ("file-link", "directory-link", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = self.bootstrap_source(root)
+                outside = root / "outside.txt"
+                outside.write_text("to" + "ken=private\n", encoding="utf-8")
+                try:
+                    if kind == "file-link":
+                        (source / "linked.txt").symlink_to(outside)
+                    elif kind == "directory-link":
+                        target = root / "outside-dir"
+                        target.mkdir()
+                        (target / "private.txt").write_text("to" + "ken=private\n", encoding="utf-8")
+                        (source / "linked-dir").symlink_to(target, target_is_directory=True)
+                    else:
+                        os.link(outside, source / "hardlinked.txt")
+                except OSError as error:
+                    self.skipTest(str(error))
+                component_root, components, lock_path, identities = self.portable_components(root)
+                with (
+                    mock.patch.object(builder, "_LOCK_PATH", lock_path),
+                    mock.patch.object(builder, "_S01_LOCKS", identities),
+                    self.assertRaisesRegex(ValueError, "regular unlinked"),
+                ):
+                    builder.build_preview(source, components["ao2"][1], "v0.5.12", root / "preview.zip", components, component_root)
 
     def test_build_preview_rejects_a_component_outside_the_caller_root(self):
         import scripts.build_preview as builder

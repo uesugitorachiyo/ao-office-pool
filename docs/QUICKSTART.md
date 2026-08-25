@@ -18,6 +18,21 @@ The command succeeds only when repository visibility, tag, source commit,
 asset hosts, candidate identity, the exact eight-asset set, sizes, and hashes
 match the package-owned contract.
 
+If no `GITHUB_TOKEN` is available, use an already authenticated private GitHub
+browser or approved GitHub client to download all eight release assets into one
+new directory. Download no source snapshot and add no extra file. Then run the
+same verifier/acquirer without test mode:
+
+```powershell
+./packaging/Get-AOOfficePoolRelease.ps1 `
+  -OfflineAssetRoot ./manual-private-download `
+  -Destination (Join-Path (Get-Location) 'downloads')
+```
+
+This is only an alternate authenticated transport. The package-owned contract,
+tag/source binding, candidate manifest, exact asset set, sizes, and hashes are
+still mandatory.
+
 ## 2. Extract only the verified archive
 
 ```powershell

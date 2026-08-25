@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -19,6 +19,7 @@ _REQUIRED_BOOTSTRAP_MEMBERS = {
     "packaging/Verify-AOOfficePool.ps1",
     "packaging/Uninstall-AOOfficePool.ps1",
     "schemas/developer-preview-release.schema.json",
+    "schemas/developer-preview-candidate.schema.json",
     "skills/thought-experiment/SKILL.md",
     "skills/engineering-research/SKILL.md",
     "skills/scope-to-deliverable-workflow/SKILL.md",
@@ -122,6 +123,44 @@ def _validate_bootstrap_source(source: Path) -> None:
             raise ValueError("source is missing bootstrap contract")
 
 
+def _admit_source(source: Path) -> tuple[list[str], list[tuple[str, bytes]]]:
+    directories: list[str] = []
+    files: list[tuple[str, bytes]] = []
+    folded: set[str] = set()
+    for directory, names, filenames in os.walk(source, followlinks=False):
+        base = Path(directory)
+        for name in sorted(names):
+            path = base / name
+            relative = path.relative_to(source).as_posix()
+            if _reparse_or_link(path):
+                raise ValueError("source entries must be regular unlinked files and directories")
+            key = relative.casefold()
+            if key in folded:
+                raise ValueError("source entries must have unique case-insensitive paths")
+            folded.add(key)
+            directories.append(relative)
+        for name in sorted(filenames):
+            path = base / name
+            relative = path.relative_to(source).as_posix()
+            if relative == _CONTROL_CONTRACT:
+                continue
+            if _mutable(relative):
+                raise ValueError("mutable source state is not admitted")
+            information = path.stat(follow_symlinks=False)
+            if _reparse_or_link(path) or not path.is_file() or information.st_nlink != 1:
+                raise ValueError("source entries must be regular unlinked files and directories")
+            key = relative.casefold()
+            if key in folded:
+                raise ValueError("source entries must have unique case-insensitive paths")
+            folded.add(key)
+            data = path.read_bytes()
+            after = path.stat(follow_symlinks=False)
+            if after.st_nlink != 1 or (information.st_dev, information.st_ino, information.st_size) != (after.st_dev, after.st_ino, after.st_size):
+                raise ValueError("source entry changed during admission")
+            files.append((relative, data))
+    return directories, files
+
+
 def _initialize_preview_directories(root: Path) -> None:
     directories = {
         "operator-secrets",
@@ -150,19 +189,16 @@ def build_preview(source: Path, ao2: Path, runtime_version: str, output: Path, c
         raise ValueError("component root is required")
     verified = _validate_s01_components(ao2, runtime_version, components, component_root)
     _validate_bootstrap_source(source)
+    source_directories, source_files = _admit_source(source)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "preview"
-        control_parent = source / Path(_CONTROL_CONTRACT).parent
-        shutil.copytree(
-            source,
-            root,
-            ignore=lambda directory, names: (
-                [Path(_CONTROL_CONTRACT).name]
-                if Path(directory) == control_parent
-                and Path(_CONTROL_CONTRACT).name in names
-                else []
-            ),
-        )
+        root.mkdir()
+        for relative in source_directories:
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        for relative, data in source_files:
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
         _initialize_preview_directories(root)
         for office in range(1, 6):
             destination = root / f"offices/O{office}/runtime/versions/{runtime_version}/ao2.exe"

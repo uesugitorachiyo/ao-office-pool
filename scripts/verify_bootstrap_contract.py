@@ -66,15 +66,26 @@ BOOTSTRAP_MEMBERS = (
     "packaging/Verify-AOOfficePool.ps1",
     "packaging/Uninstall-AOOfficePool.ps1",
     "schemas/developer-preview-release.schema.json",
+    "schemas/developer-preview-candidate.schema.json",
     "skills/thought-experiment/SKILL.md",
     "skills/engineering-research/SKILL.md",
     "skills/scope-to-deliverable-workflow/SKILL.md",
 )
+COMPONENT_FIELDS = {"name", "version", "repository", "commit", "asset", "license", "sha256"}
+INSTALLER = {
+    "acquire": "packaging/Get-AOOfficePoolRelease.ps1",
+    "ai_runbook": "docs/AI_OPERATOR_RUNBOOK.md",
+    "install": "packaging/Install-AOOfficePool.ps1",
+    "read_first": "README-FIRST.md",
+    "uninstall": "packaging/Uninstall-AOOfficePool.ps1",
+    "verify": "packaging/Verify-AOOfficePool.ps1",
+}
+COMPONENT_LOCK = Path(__file__).parents[1] / "manifests" / "components.lock.json"
 
 
 def _regular_json(path: Path) -> tuple[dict, bytes]:
     path = Path(path)
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink() or not path.is_file() or path.stat(follow_symlinks=False).st_nlink != 1:
         raise ValueError("contract must be a regular file")
     try:
         raw = path.read_bytes()
@@ -107,6 +118,7 @@ def verify_release_manifest(path: Path) -> dict:
     names = value.get("asset_names")
     if (
         set(value) != ROOT_FIELDS
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != 1
         or value.get("repository") != REPOSITORY
         or value.get("visibility") != "private"
@@ -136,6 +148,7 @@ def verify_candidate_manifest(path: Path, release: dict) -> dict:
         len(raw) != identity["size"]
         or hashlib.sha256(raw).hexdigest() != identity["sha256"]
         or set(value) != MANIFEST_FIELDS
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != 1
         or value.get("architecture") != release["architecture"]
         or value.get("immutable") is not True
@@ -159,6 +172,38 @@ def verify_candidate_manifest(path: Path, release: dict) -> dict:
     names = [identity["name"], *(row["name"] for row in rows)]
     if tuple(names) != tuple(release["asset_names"]):
         raise ValueError("candidate asset set is invalid")
+    archive = _identity(value.get("archive"), ASSET_NAMES[1])
+    if archive != rows[0]:
+        raise ValueError("candidate archive identity is not metadata-bound")
+    try:
+        lock_raw = COMPONENT_LOCK.read_bytes()
+        lock = json.loads(lock_raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("component lock is unavailable") from error
+    locked_components = lock.get("components") if isinstance(lock, dict) else None
+    components = value.get("components")
+    if (
+        not isinstance(locked_components, list)
+        or len(locked_components) != 8
+        or any(not isinstance(row, dict) or set(row) != COMPONENT_FIELDS for row in locked_components)
+        or components != locked_components
+        or value.get("component_lock_sha256") != hashlib.sha256(lock_raw).hexdigest()
+    ):
+        raise ValueError("candidate components are not lock-bound")
+    expected_id = f"windows-ai-bootstrap-{release['tag'].removeprefix('developer-preview-')}-{release['product_source_commit'][:7]}"
+    if value.get("candidate_id") != expected_id or value.get("label") != "developer-preview":
+        raise ValueError("candidate identity is invalid")
+    if value.get("installer") != INSTALLER:
+        raise ValueError("candidate installer contract is invalid")
+    authority = value.get("authority")
+    if (
+        not isinstance(authority, dict)
+        or set(authority) != {"publication_authorized", "release_visibility", "tag_target"}
+        or authority.get("publication_authorized") is not False
+        or authority.get("release_visibility") != "private"
+        or authority.get("tag_target") != release["product_source_commit"]
+    ):
+        raise ValueError("candidate authority contract is invalid")
     return value
 
 
@@ -170,7 +215,7 @@ def verify_asset_directory(root: Path, contract: Path) -> list[dict]:
     if (
         len(entries) != len(ASSET_NAMES)
         or {entry.name for entry in entries} != set(ASSET_NAMES)
-        or any(entry.is_symlink() or not entry.is_file() for entry in entries)
+        or any(entry.is_symlink() or not entry.is_file() or entry.stat(follow_symlinks=False).st_nlink != 1 for entry in entries)
     ):
         raise ValueError("asset directory does not contain the closed set")
     release = verify_release_manifest(contract)
@@ -183,6 +228,7 @@ def verify_asset_directory(root: Path, contract: Path) -> list[dict]:
         if (
             path.is_symlink()
             or not path.is_file()
+            or path.stat(follow_symlinks=False).st_nlink != 1
             or len(raw) != identity["size"]
             or hashlib.sha256(raw).hexdigest() != identity["sha256"]
         ):

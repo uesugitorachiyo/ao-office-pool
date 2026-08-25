@@ -35,6 +35,15 @@ $script:CandidateFields = @(
     'installer', 'immutable', 'authority'
 )
 $script:IdentityFields = @('name', 'size', 'sha256')
+$script:ComponentFields = @('name', 'version', 'repository', 'commit', 'asset', 'license', 'sha256')
+$script:InstallerContract = [ordered]@{
+    acquire = 'packaging/Get-AOOfficePoolRelease.ps1'
+    ai_runbook = 'docs/AI_OPERATOR_RUNBOOK.md'
+    install = 'packaging/Install-AOOfficePool.ps1'
+    read_first = 'README-FIRST.md'
+    uninstall = 'packaging/Uninstall-AOOfficePool.ps1'
+    verify = 'packaging/Verify-AOOfficePool.ps1'
+}
 
 function Assert-ExactFields {
     param([object]$Value, [string[]]$Names, [string]$Kind)
@@ -104,13 +113,27 @@ function Assert-SafePath {
     return $full
 }
 
+function Assert-RegularUnlinkedFile {
+    param([string]$Path, [string]$Kind)
+    $item = Get-Item -LiteralPath $Path -Force
+    $linkType = $item.PSObject.Properties['LinkType']
+    if (
+        $item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($null -ne $linkType -and -not [string]::IsNullOrEmpty([string]$linkType.Value))
+    ) {
+        throw "$Kind must be a regular unlinked file"
+    }
+}
+
 function Assert-Identity {
     param([object]$Value, [string]$ExpectedName, [string]$Kind)
     Assert-ExactFields $Value $script:IdentityFields $Kind
     if (
+        $Value.name -isnot [string] -or
         $Value.name -cne $ExpectedName -or
         $Value.size -is [bool] -or
-        $Value.size -isnot [ValueType] -or
+        -not ($Value.size -is [int] -or $Value.size -is [long]) -or
         [long]$Value.size -lt 1 -or
         $Value.sha256 -isnot [string] -or
         $Value.sha256 -cnotmatch '^[0-9a-f]{64}$'
@@ -126,11 +149,13 @@ function Assert-Identity {
 
 function Read-ReleaseContract {
     param([string]$Path)
+    Assert-RegularUnlinkedFile $Path 'release contract'
     $bytes = [IO.File]::ReadAllBytes($Path)
     $value = Read-JsonBytes $bytes 'release contract'
     Assert-ExactFields $value $script:ReleaseFields 'release contract'
     if (
-        $value.schema_version -ne 1 -or
+        -not ($value.schema_version -is [int] -or $value.schema_version -is [long]) -or
+        [long]$value.schema_version -cne 1 -or
         $value.repository -cne $script:ExpectedRepository -or
         $value.visibility -cne 'private' -or
         $value.tag -isnot [string] -or
@@ -164,11 +189,16 @@ function Read-CandidateManifestBytes {
     Assert-ExactFields $value $script:CandidateFields 'candidate manifest'
     Assert-ExactFields $value.source @('commit', 'clean') 'candidate source'
     if (
-        $value.schema_version -ne 1 -or
+        -not ($value.schema_version -is [int] -or $value.schema_version -is [long]) -or
+        [long]$value.schema_version -cne 1 -or
+        $value.architecture -isnot [string] -or
         $value.architecture -cne $Release.Value.architecture -or
-        $value.immutable -ne $true -or
+        $value.immutable -isnot [bool] -or
+        $value.immutable -cne $true -or
+        $value.source.commit -isnot [string] -or
         $value.source.commit -cne $Release.Value.product_source_commit -or
-        $value.source.clean -ne $true
+        $value.source.clean -isnot [bool] -or
+        $value.source.clean -cne $true
     ) {
         throw 'candidate manifest contract mismatch'
     }
@@ -185,11 +215,66 @@ function Read-CandidateManifestBytes {
         $expectedName = $script:ExpectedAssets[$index + 1]
         $identities += Assert-Identity $rows[$index] $expectedName 'candidate metadata'
     }
+    $archive = Assert-Identity $value.archive $script:ExpectedAssets[1] 'candidate archive'
+    if (
+        $archive.name -cne $identities[1].name -or
+        $archive.size -ne $identities[1].size -or
+        $archive.sha256 -cne $identities[1].sha256
+    ) {
+        throw 'candidate archive identity is not metadata-bound'
+    }
+    $lockPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\manifests\components.lock.json'))
+    $lockBytes = [IO.File]::ReadAllBytes($lockPath)
+    $lock = Read-JsonBytes $lockBytes 'component lock'
+    $lockedComponents = @($lock.components)
+    $candidateComponents = @($value.components)
+    if ($lockedComponents.Count -ne 8 -or $candidateComponents.Count -ne 8) {
+        throw 'candidate components are not lock-bound'
+    }
+    for ($index = 0; $index -lt 8; $index++) {
+        Assert-ExactFields $lockedComponents[$index] $script:ComponentFields 'locked component'
+        Assert-ExactFields $candidateComponents[$index] $script:ComponentFields 'candidate component'
+        foreach ($name in $script:ComponentFields) {
+            if (
+                $candidateComponents[$index].$name -isnot [string] -or
+                $lockedComponents[$index].$name -isnot [string] -or
+                $candidateComponents[$index].$name -cne $lockedComponents[$index].$name
+            ) {
+                throw 'candidate components are not lock-bound'
+            }
+        }
+    }
+    if ($value.component_lock_sha256 -isnot [string] -or $value.component_lock_sha256 -cne (Get-Sha256Bytes $lockBytes)) {
+        throw 'candidate components are not lock-bound'
+    }
+    $version = $Release.Value.tag.Substring('developer-preview-'.Length)
+    $expectedCandidateId = "windows-ai-bootstrap-$version-$($Release.Value.product_source_commit.Substring(0, 7))"
+    if ($value.candidate_id -isnot [string] -or $value.candidate_id -cne $expectedCandidateId -or $value.label -isnot [string] -or $value.label -cne 'developer-preview') {
+        throw 'candidate identity is invalid'
+    }
+    Assert-ExactFields $value.installer @($script:InstallerContract.Keys) 'candidate installer'
+    foreach ($name in $script:InstallerContract.Keys) {
+        if ($value.installer.$name -isnot [string] -or $value.installer.$name -cne $script:InstallerContract[$name]) {
+            throw 'candidate installer contract is invalid'
+        }
+    }
+    Assert-ExactFields $value.authority @('publication_authorized', 'release_visibility', 'tag_target') 'candidate authority'
+    if (
+        $value.authority.publication_authorized -isnot [bool] -or
+        $value.authority.publication_authorized -cne $false -or
+        $value.authority.release_visibility -isnot [string] -or
+        $value.authority.release_visibility -cne 'private' -or
+        $value.authority.tag_target -isnot [string] -or
+        $value.authority.tag_target -cne $Release.Value.product_source_commit
+    ) {
+        throw 'candidate authority contract is invalid'
+    }
     return [pscustomobject]@{ Value = $value; Identities = $identities }
 }
 
 function Read-CandidateManifest {
     param([string]$Path, [object]$Release)
+    Assert-RegularUnlinkedFile $Path 'candidate manifest'
     return Read-CandidateManifestBytes ([IO.File]::ReadAllBytes($Path)) $Release
 }
 
@@ -237,7 +322,8 @@ function Assert-GitHubMetadata {
     if (
         $null -eq $ReleaseValue -or
         $ReleaseValue.tag_name -cne $ReleaseContract.Value.tag -or
-        $ReleaseValue.target_commitish -cne $ReleaseContract.Value.product_source_commit -or
+        $ReleaseValue.target_commitish -isnot [string] -or
+        [string]::IsNullOrWhiteSpace($ReleaseValue.target_commitish) -or
         $ReleaseValue.draft -ne $false -or
         $ReleaseValue.prerelease -ne $true
     ) {
@@ -290,67 +376,148 @@ function Assert-GitHubMetadata {
     return $assetMap
 }
 
-function Get-OfflineAssets {
-    param([string]$SourceRoot, [object]$Release)
+function Assert-GitHubTagObjects {
+    param([object[]]$Objects, [object]$ReleaseContract)
+    if ($Objects.Count -lt 1 -or $Objects.Count -gt 8) {
+        throw 'GitHub tag ref is missing or too deep'
+    }
+    $first = $Objects[0]
+    if ($null -eq $first -or $first.ref -cne ('refs/tags/' + $ReleaseContract.Value.tag) -or $null -eq $first.object) {
+        throw 'GitHub tag ref is invalid'
+    }
+    $current = $first.object
+    $seen = @{}
+    $used = 1
+    while ($true) {
+        if ($null -eq $current -or $current.sha -isnot [string] -or $current.sha -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'GitHub tag object is invalid'
+        }
+        if ($current.type -ceq 'commit') {
+            if ($current.sha -cne $ReleaseContract.Value.product_source_commit -or $used -ne $Objects.Count) {
+                throw 'GitHub tag does not resolve to the pinned commit'
+            }
+            return
+        }
+        if ($current.type -cne 'tag' -or $current.url -isnot [string]) {
+            throw 'GitHub tag object type is invalid'
+        }
+        $expectedPrefix = 'https://api.github.com/repos/' + $script:ExpectedRepository + '/git/tags/'
+        if (-not $current.url.StartsWith($expectedPrefix, [StringComparison]::Ordinal) -or $seen.ContainsKey($current.sha)) {
+            throw 'GitHub tag chain is invalid'
+        }
+        $seen[$current.sha] = $true
+        if ($used -ge $Objects.Count) {
+            throw 'GitHub annotated tag object is missing'
+        }
+        $tag = $Objects[$used]
+        $used++
+        if ($null -eq $tag -or $tag.sha -cne $current.sha -or $null -eq $tag.object) {
+            throw 'GitHub annotated tag object is invalid'
+        }
+        $current = $tag.object
+    }
+}
+
+function Get-GitHubTagObjects {
+    param([string]$ApiRoot, [object]$ReleaseContract, [string]$Credential)
+    $refUri = $ApiRoot + '/git/ref/tags/' + [Uri]::EscapeDataString($ReleaseContract.Value.tag)
+    $objects = @((Invoke-GitHubJson $refUri $Credential))
+    $current = $objects[0].object
+    $seen = @{}
+    while ($null -ne $current -and $current.type -ceq 'tag') {
+        if ($objects.Count -ge 8 -or $current.sha -isnot [string] -or $seen.ContainsKey($current.sha)) {
+            throw 'GitHub tag chain is invalid'
+        }
+        $seen[$current.sha] = $true
+        $expectedPrefix = 'https://api.github.com/repos/' + $script:ExpectedRepository + '/git/tags/'
+        if ($current.url -isnot [string] -or -not $current.url.StartsWith($expectedPrefix, [StringComparison]::Ordinal)) {
+            throw 'GitHub tag object URI is invalid'
+        }
+        $objects += Invoke-GitHubJson $current.url $Credential
+        $current = $objects[-1].object
+    }
+    Assert-GitHubTagObjects $objects $ReleaseContract
+    return $objects
+}
+
+function Write-VerifiedStream {
+    param([IO.Stream]$InputStream, [string]$Path, [object]$Identity)
+    $output = $null
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $output = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $buffer = [byte[]]::new(1048576)
+        [long]$count = 0
+        while (($read = $InputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $output.Write($buffer, 0, $read)
+            [void]$algorithm.TransformBlock($buffer, 0, $read, $buffer, 0)
+            $count += $read
+        }
+        [void]$algorithm.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        $digest = ([Convert]::ToHexString($algorithm.Hash)).ToLowerInvariant()
+        if ($count -ne $Identity.size -or $digest -cne $Identity.sha256) {
+            throw "asset identity mismatch: $($Identity.name)"
+        }
+    }
+    catch {
+        if ($null -ne $output) { $output.Dispose(); $output = $null }
+        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+        throw
+    }
+    finally {
+        if ($null -ne $output) { $output.Dispose() }
+        $algorithm.Dispose()
+    }
+}
+
+function Copy-VerifiedFile {
+    param([string]$Source, [string]$Destination, [object]$Identity)
+    $input = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try { Write-VerifiedStream $input $Destination $Identity }
+    finally { $input.Dispose() }
+}
+
+function Stage-OfflineAssets {
+    param([string]$SourceRoot, [object]$Release, [string]$StagingRoot)
     $entries = @(Get-ChildItem -LiteralPath $SourceRoot -Force)
     if ($entries.Count -ne $script:ExpectedAssets.Count) {
         throw 'offline source asset set is invalid'
     }
     foreach ($entry in $entries) {
-        if (-not $entry.PSIsContainer -and $script:ExpectedAssets -ccontains $entry.Name) { continue }
+        if (-not $entry.PSIsContainer -and $script:ExpectedAssets -ccontains $entry.Name) {
+            Assert-RegularUnlinkedFile $entry.FullName 'offline asset'
+            continue
+        }
         throw 'offline source asset set is invalid'
     }
-    $candidate = Read-CandidateManifest (Join-Path $SourceRoot 'candidate-manifest.json') $Release
-    $assets = @()
-    foreach ($identity in $candidate.Identities) {
-        $path = Join-Path $SourceRoot $identity.name
-        $bytes = [IO.File]::ReadAllBytes($path)
-        if ($bytes.Length -ne $identity.size -or (Get-Sha256Bytes $bytes) -cne $identity.sha256) {
-            throw "asset identity mismatch: $($identity.name)"
-        }
-        $assets += [pscustomobject]@{ Identity = $identity; Bytes = $bytes }
+    $candidateSource = Join-Path $SourceRoot 'candidate-manifest.json'
+    $candidateDestination = Join-Path $StagingRoot 'candidate-manifest.json'
+    Copy-VerifiedFile $candidateSource $candidateDestination $Release.CandidateIdentity
+    $candidate = Read-CandidateManifest $candidateDestination $Release
+    foreach ($identity in $candidate.Identities | Select-Object -Skip 1) {
+        Copy-VerifiedFile (Join-Path $SourceRoot $identity.name) (Join-Path $StagingRoot $identity.name) $identity
     }
-    return $assets
+    return $candidate.Identities
 }
 
-function Write-VerifiedAssets {
-    param([object[]]$Assets, [string]$DestinationPath)
+function New-AssetStaging {
+    param([string]$DestinationPath)
     if (Test-Path -LiteralPath $DestinationPath) {
-        $item = Get-Item -LiteralPath $DestinationPath -Force
-        if (-not $item.PSIsContainer -or @(Get-ChildItem -LiteralPath $DestinationPath -Force).Count -ne 0) {
-            throw 'destination must not contain files'
-        }
+        throw 'destination must not exist'
     }
-    else {
-        [void](New-Item -ItemType Directory -Path $DestinationPath)
+    $parent = Split-Path -Parent $DestinationPath
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        [void][IO.Directory]::CreateDirectory($parent)
     }
-    $temporaryFiles = [Collections.Generic.List[string]]::new()
-    try {
-        foreach ($asset in $Assets) {
-            $final = Join-Path $DestinationPath $asset.Identity.name
-            if (Test-Path -LiteralPath $final) {
-                throw 'destination asset already exists'
-            }
-            $temporary = Join-Path $DestinationPath ('.' + $asset.Identity.name + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
-            $temporaryFiles.Add($temporary)
-            $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-            try { $stream.Write($asset.Bytes, 0, $asset.Bytes.Length) }
-            finally { $stream.Dispose() }
-            $written = [IO.File]::ReadAllBytes($temporary)
-            if ($written.Length -ne $asset.Identity.size -or (Get-Sha256Bytes $written) -cne $asset.Identity.sha256) {
-                throw 'written asset identity mismatch'
-            }
-            [IO.File]::Move($temporary, $final)
-            [void]$temporaryFiles.Remove($temporary)
-        }
-    }
-    finally {
-        foreach ($temporary in $temporaryFiles) {
-            if (Test-Path -LiteralPath $temporary) {
-                Remove-Item -LiteralPath $temporary -Force
-            }
-        }
-    }
+    $staging = Join-Path $parent ('.ao-office-pool-staging-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($staging)
+    return $staging
+}
+
+function Publish-StagedAssets {
+    param([string]$StagingRoot, [string]$DestinationPath)
+    if (Test-Path -LiteralPath $DestinationPath) { throw 'destination already exists' }
+    [IO.Directory]::Move($StagingRoot, $DestinationPath)
 }
 
 function Get-PortableDestination {
@@ -393,7 +560,7 @@ function Invoke-GitHubJson {
 }
 
 function Invoke-GitHubAsset {
-    param([Uri]$ApiUri, [string]$Credential)
+    param([Uri]$ApiUri, [string]$Credential, [string]$DestinationPath, [object]$Identity)
     if ($ApiUri.Scheme -cne 'https' -or $ApiUri.Host -cne 'api.github.com') {
         throw 'GitHub asset API host is invalid'
     }
@@ -426,14 +593,20 @@ function Invoke-GitHubAsset {
     $downloadHandler.AllowAutoRedirect = $false
     $downloadClient = [Net.Http.HttpClient]::new($downloadHandler)
     try {
-        $response = $downloadClient.GetAsync($redirect).GetAwaiter().GetResult()
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, $redirect)
         try {
+            $response = $downloadClient.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            try {
             if (-not $response.IsSuccessStatusCode) {
                 throw 'GitHub asset download failed'
             }
-            return $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+                $input = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                try { Write-VerifiedStream $input $DestinationPath $Identity }
+                finally { $input.Dispose() }
+            }
+            finally { $response.Dispose() }
         }
-        finally { $response.Dispose() }
+        finally { $request.Dispose() }
     }
     finally {
         $downloadClient.Dispose()
@@ -447,11 +620,12 @@ function Invoke-MetadataFixture {
     }
     $fixturePath = Assert-SafePath $env:AO_OFFICE_POOL_METADATA_FIXTURE $true 'metadata fixture'
     $fixture = Read-JsonBytes ([IO.File]::ReadAllBytes($fixturePath)) 'metadata fixture'
-    Assert-ExactFields $fixture @('repository', 'release', 'redirects', 'candidate_manifest_path') 'metadata fixture'
+    Assert-ExactFields $fixture @('repository', 'release', 'tag_objects', 'redirects', 'candidate_manifest_path') 'metadata fixture'
     $contractPath = Assert-SafePath $Contract $true 'contract'
     $release = Read-ReleaseContract $contractPath
     $candidatePath = Assert-SafePath $fixture.candidate_manifest_path $true 'candidate fixture'
     $candidate = Read-CandidateManifest $candidatePath $release
+    Assert-GitHubTagObjects @($fixture.tag_objects) $release
     [void](Assert-GitHubMetadata $fixture.repository $fixture.release $release $candidate.Identities @($fixture.redirects))
     [ordered]@{ metadata = 'valid' } | ConvertTo-Json -Compress
 }
@@ -465,15 +639,17 @@ function Invoke-Acquisition {
     $destinationPath = Assert-SafePath $Destination $false 'destination'
     Assert-LocalDestination $destinationPath
     $release = Read-ReleaseContract $contractPath
-    if ($PSCmdlet.ParameterSetName -eq 'Offline') {
+    $stagingPath = New-AssetStaging $destinationPath
+    try {
+      if ($PSCmdlet.ParameterSetName -eq 'Offline') {
         $sourcePath = Assert-SafePath $OfflineAssetRoot $true 'offline source'
         if (-not (Get-Item -LiteralPath $sourcePath -Force).PSIsContainer) {
             throw 'offline source must be a directory'
         }
-        $assets = Get-OfflineAssets $sourcePath $release
+        $identities = Stage-OfflineAssets $sourcePath $release $stagingPath
         $mode = 'offline'
-    }
-    else {
+      }
+      else {
         if ((-not [string]::IsNullOrEmpty($Repository) -and $Repository -cne $release.Value.repository) -or
             (-not [string]::IsNullOrEmpty($Tag) -and $Tag -cne $release.Value.tag)) {
             throw 'requested release does not match the package contract'
@@ -487,36 +663,36 @@ function Invoke-Acquisition {
             $repositoryValue = Invoke-GitHubJson $apiRoot $githubCredential
             $releaseUri = $apiRoot + '/releases/tags/' + [Uri]::EscapeDataString($release.Value.tag)
             $releaseValue = Invoke-GitHubJson $releaseUri $githubCredential
+            [void](Get-GitHubTagObjects $apiRoot $release $githubCredential)
             $assetMap = Assert-GitHubMetadata $repositoryValue $releaseValue $release @($release.CandidateIdentity)
             $candidateAsset = $assetMap['candidate-manifest.json']
-            $candidateBytes = Invoke-GitHubAsset ([Uri]$candidateAsset.url) $githubCredential
-            $candidate = Read-CandidateManifestBytes $candidateBytes $release
+            $candidatePath = Join-Path $stagingPath 'candidate-manifest.json'
+            Invoke-GitHubAsset ([Uri]$candidateAsset.url) $githubCredential $candidatePath $release.CandidateIdentity
+            $candidate = Read-CandidateManifest $candidatePath $release
             $assetMap = Assert-GitHubMetadata $repositoryValue $releaseValue $release $candidate.Identities
-            $assets = @()
-            foreach ($identity in $candidate.Identities) {
-                if ($identity.name -ceq 'candidate-manifest.json') {
-                    $bytes = $candidateBytes
-                }
-                else {
-                    $asset = $assetMap[$identity.name.ToLowerInvariant()]
-                    $bytes = Invoke-GitHubAsset ([Uri]$asset.url) $githubCredential
-                }
-                if ($bytes.Length -ne $identity.size -or (Get-Sha256Bytes $bytes) -cne $identity.sha256) {
-                    throw "asset identity mismatch: $($identity.name)"
-                }
-                $assets += [pscustomobject]@{ Identity = $identity; Bytes = $bytes }
+            foreach ($identity in $candidate.Identities | Select-Object -Skip 1) {
+                $asset = $assetMap[$identity.name.ToLowerInvariant()]
+                Invoke-GitHubAsset ([Uri]$asset.url) $githubCredential (Join-Path $stagingPath $identity.name) $identity
             }
+            $identities = $candidate.Identities
             $mode = 'authenticated'
         }
         finally {
             $githubCredential = $null
         }
+      }
+      Publish-StagedAssets $stagingPath $destinationPath
+      $stagingPath = $null
     }
-    Write-VerifiedAssets $assets $destinationPath
-    $rows = @($assets | ForEach-Object { [ordered]@{
-        name = $_.Identity.name
-        size = $_.Identity.size
-        sha256 = $_.Identity.sha256
+    finally {
+      if ($null -ne $stagingPath -and (Test-Path -LiteralPath $stagingPath)) {
+        Remove-Item -LiteralPath $stagingPath -Recurse -Force
+      }
+    }
+    $rows = @($identities | ForEach-Object { [ordered]@{
+        name = $_.name
+        size = $_.size
+        sha256 = $_.sha256
     } })
     [ordered]@{
         schema_version = 1

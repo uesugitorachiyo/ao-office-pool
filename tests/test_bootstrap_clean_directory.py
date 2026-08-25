@@ -72,6 +72,8 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
     def make_release_assets(self, archive):
         source = self.root / "release-assets"
         source.mkdir()
+        lock_path = ROOT / "manifests" / "components.lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
         archive_target = source / ASSET_NAMES[1]
         shutil.copy2(archive, archive_target)
         archive_digest = hashlib.sha256(archive_target.read_bytes()).hexdigest()
@@ -93,17 +95,28 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
             )
         candidate = {
             "schema_version": 1,
-            "candidate_id": "clean-directory",
+            "candidate_id": "windows-ai-bootstrap-v98-3333333",
             "label": "developer-preview",
             "architecture": "windows-x86_64",
             "source": {"commit": "3" * 40, "clean": True},
-            "component_lock_sha256": "4" * 64,
+            "component_lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
             "archive": rows[0],
-            "components": [],
+            "components": lock["components"],
             "metadata": rows,
-            "installer": {},
+            "installer": {
+                "acquire": "packaging/Get-AOOfficePoolRelease.ps1",
+                "ai_runbook": "docs/AI_OPERATOR_RUNBOOK.md",
+                "install": "packaging/Install-AOOfficePool.ps1",
+                "read_first": "README-FIRST.md",
+                "uninstall": "packaging/Uninstall-AOOfficePool.ps1",
+                "verify": "packaging/Verify-AOOfficePool.ps1",
+            },
             "immutable": True,
-            "authority": {},
+            "authority": {
+                "publication_authorized": False,
+                "release_visibility": "private",
+                "tag_target": "3" * 40,
+            },
         }
         candidate_bytes = (
             json.dumps(candidate, indent=2, sort_keys=True) + "\n"
@@ -196,6 +209,19 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
             bootstrap,
         )
         self.assertEqual(install.returncode, 0, install.stderr)
+        recovery = json.loads((install_root / "runtime/recovery-authority.json").read_text(encoding="utf-8"))
+        office_material = {}
+        for number in range(1, 6):
+            office = f"O{number}"
+            state = json.loads((install_root / f"offices/{office}/office-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state, {"generation": 0, "office_id": office, "schema_version": 1, "status": "free"})
+            key = (install_root / f"operator-secrets/recovery-key-{office}").read_bytes()
+            office_material[office] = key
+            self.assertEqual(recovery["digests"][office], hashlib.sha256(key).hexdigest())
+        self.assertEqual(len(set(office_material.values())), 5)
+        witness_material = (install_root / "operator-secrets/governance-witness.key").read_bytes()
+        self.assertNotIn(witness_material, office_material.values())
+        self.assertEqual(list((install_root / "runtime/recovery").iterdir()), [])
         verify = self.run_powershell(
             [
                 bootstrap / scripts[2],
@@ -209,6 +235,37 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
             bootstrap,
         )
         self.assertEqual(verify.returncode, 0, verify.stderr)
+        second_root = operator / "installed" / "AOOfficePoolSecond"
+        second_install = self.run_powershell(
+            [
+                bootstrap / scripts[0],
+                "-Action",
+                "Install",
+                "-Archive",
+                archive_path,
+                "-ChecksumFile",
+                sidecar,
+                "-InstallRoot",
+                second_root,
+            ],
+            bootstrap,
+        )
+        self.assertEqual(second_install.returncode, 0, second_install.stderr)
+        for relative in ["operator-secrets/governance-witness.key", *(f"operator-secrets/recovery-key-O{number}" for number in range(1, 6))]:
+            self.assertNotEqual((install_root / relative).read_bytes(), (second_root / relative).read_bytes())
+        second_uninstall = self.run_powershell(
+            [
+                bootstrap / scripts[1],
+                "-InstallRoot",
+                second_root,
+                "-Archive",
+                archive_path,
+                "-ChecksumFile",
+                sidecar,
+            ],
+            bootstrap,
+        )
+        self.assertEqual(second_uninstall.returncode, 0, second_uninstall.stderr)
         uninstall = self.run_powershell(
             [
                 bootstrap / scripts[1],

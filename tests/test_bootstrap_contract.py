@@ -22,7 +22,7 @@ class BootstrapContractTests(unittest.TestCase):
     def test_build_time_verifier_accepts_the_portable_bootstrap_tree(self):
         result = verify_bootstrap_tree(ROOT)
         self.assertEqual(result["documents"], len(DOCUMENTS))
-        self.assertEqual(result["bootstrap_members"], 12)
+        self.assertEqual(result["bootstrap_members"], 13)
 
     def test_bootstrap_documents_are_relative_complete_and_truthful(self):
         texts = {

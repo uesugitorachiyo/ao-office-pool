@@ -177,8 +177,8 @@ class ScanPublicTreeTests(unittest.TestCase):
 
     def test_accepts_only_manifest_bound_preview_binaries(self):
         binaries = {
-            "components/ao2/v1/ao2.exe": b"binary owner: private\x00",
-            "offices/O1/runtime/versions/v1/ao2.exe": b"runtime token=x\x00",
+            "components/ao2/v0.5.12/ao2.exe": b"binary owner: private\x00",
+            "offices/O1/runtime/versions/v0.5.12/ao2.exe": b"runtime token=x\x00",
         }
         rows = []
         for relative, data in binaries.items():
@@ -199,15 +199,36 @@ class ScanPublicTreeTests(unittest.TestCase):
                     "schema_version": 1,
                     "label": "developer-preview",
                     "architecture": "windows-x86_64",
-                    "runtime_version": "v1",
+                    "runtime_version": "v0.5.12",
                     "files": rows,
                 }
             ),
         )
-        self.assertEqual(scan_tree(self.root), [])
+        trusted = {relative: hashlib.sha256(data).hexdigest() for relative, data in binaries.items()}
+        with patch("scripts.scan_public_tree.TRUSTED_PREVIEW_BINARIES", trusted):
+            self.assertEqual(scan_tree(self.root), [])
         (self.root / next(iter(binaries))).write_bytes(b"changed\n")
-        findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
+        with patch("scripts.scan_public_tree.TRUSTED_PREVIEW_BINARIES", trusted):
+            findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
         self.assertEqual(findings[next(iter(binaries))], "identity")
+
+    def test_forged_preview_manifest_cannot_authorize_an_arbitrary_binary(self):
+        data = b"token=super-private\n"
+        (self.root / "payload.exe").write_bytes(data)
+        self.write(
+            "developer-preview-manifest.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "label": "developer-preview",
+                    "architecture": "windows-x86_64",
+                    "runtime_version": "v0.5.12",
+                    "files": [{"path": "payload.exe", "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}],
+                }
+            ),
+        )
+        findings = {finding.path: finding.rule for finding in scan_tree(self.root)}
+        self.assertEqual(findings["payload.exe"], "content")
 
     def test_main_reports_sorted_json_findings_and_summary(self):
         self.write("z/__pycache__/later.pyc")
