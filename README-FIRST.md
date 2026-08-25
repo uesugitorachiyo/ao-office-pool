@@ -41,6 +41,21 @@ later release-control checkout and its external non-self-referential contract.
 Humans may use the [quickstart](docs/QUICKSTART.md) and consult the detailed
 [operator guide](docs/OPERATOR_GUIDE.md).
 
+## Packaged operator skills
+
+These three required skills are part of the verified immutable package. An AI
+must read the relevant `SKILL.md` completely before using that work mode:
+
+- [Thought experiment](skills/thought-experiment/SKILL.md) for bounded scenario
+  comparison without presenting assumptions as observed facts.
+- [Engineering research](skills/engineering-research/SKILL.md) for
+  evidence-backed technical research and authority/privacy boundaries.
+- [Scope-to-deliverable workflow](skills/scope-to-deliverable-workflow/SKILL.md)
+  for gated planning, implementation, verification, and handoff.
+
+Skill presence does not authorize office work, provider access, publication,
+or a skipped bootstrap gate.
+
 ## Remove the preview
 
 Uninstall only when all five offices are free and verification succeeds:

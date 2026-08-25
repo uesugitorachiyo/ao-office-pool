@@ -81,6 +81,15 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertIn("G00 through G05 require the release-control checkout", runbook_words)
         self.assertIn("G06 through G09 run from the verified extraction", runbook_words)
 
+    def test_required_operator_skills_are_discoverable_from_readme_first(self):
+        read_first = (ROOT / "README-FIRST.md").read_text(encoding="utf-8")
+        for relative in (
+            "skills/thought-experiment/SKILL.md",
+            "skills/engineering-research/SKILL.md",
+            "skills/scope-to-deliverable-workflow/SKILL.md",
+        ):
+            self.assertIn(f"]({relative})", read_first)
+
     def test_tracked_release_manifest_is_the_closed_private_v03_contract(self):
         result = verify_release_manifest(
             ROOT / "manifests/developer-preview-release.json"
