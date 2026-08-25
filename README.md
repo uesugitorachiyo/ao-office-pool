@@ -18,6 +18,79 @@ The closed stack contains exactly these eight components:
 | AO2 Control Plane | `v0.1.19` |
 | AO Blueprint | `git-ec6a80b60b54` |
 
+## Fresh clone: validate the source checkout
+
+Run this copy-paste block in PowerShell 7 on Windows x86-64. It needs Git and
+Python 3, but no third-party Python package. Source validation can run before a
+private release is published; installing the packaged preview additionally
+requires a new directory on a fixed local NTFS volume.
+
+```powershell
+git clone https://github.com/uesugitorachiyo/ao-office-pool.git
+Set-Location ./ao-office-pool
+
+if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+  throw 'Run this project with PowerShell 7 or newer.'
+}
+if (-not [Environment]::Is64BitOperatingSystem) {
+  throw 'AO Office Pool requires Windows x86-64.'
+}
+
+python --version
+$env:PYTHONDONTWRITEBYTECODE = '1'
+python scripts/scan_public_tree.py .
+python scripts/verify_bootstrap_contract.py .
+python -m unittest discover -s tests -v
+Remove-Item Env:PYTHONDONTWRITEBYTECODE
+```
+
+Expected results are `public-tree findings=0`, a bootstrap summary with 13
+members and 5 documents, and a final `OK` test result. Privilege-dependent
+symlink tests may be reported as skips on Windows. A failure is a stop signal;
+do not continue to release installation by bypassing it.
+
+## Copy-paste prompt for Windows Codex
+
+Open a new Windows Codex task in the freshly cloned repository and paste this
+entire prompt:
+
+```text
+Set up and validate this AO Office Pool checkout for me. Work only on Windows
+x86-64 and use PowerShell 7. Continue proactively through every safe documented step.
+
+First read README.md, README-FIRST.md, docs/QUICKSTART.md,
+docs/AI_OPERATOR_RUNBOOK.md, docs/OPERATOR_GUIDE.md, and
+manifests/developer-preview-release.json completely. Treat those tracked files
+as authority. Use only relative repository paths in commands and evidence.
+
+Confirm Git, Python 3, PowerShell 7, and Windows x86-64. Set
+PYTHONDONTWRITEBYTECODE=1, then run the public-tree scanner, bootstrap-contract
+verifier, and complete unittest suite exactly as README.md specifies. Report
+commands, exit codes, test totals, and named skips. Stop on any unexpected
+failure; do not weaken a gate.
+
+After source validation, determine whether the pinned private release is
+available. Use GITHUB_TOKEN only if it already exists in the process
+environment; never print, persist, or include it or private response bodies in
+evidence. If the private release is unavailable or the credential is missing,
+finish the source-validation report and state the exact release-acquisition
+blocker. Do not substitute locally built or unverified assets.
+
+If the release is available, run packaging/Get-AOOfficePoolRelease.ps1 into a
+new relative downloads directory. Require the exact closed eight-file set and
+all pinned hashes. Extract the authenticated archive into a new directory,
+switch authority to its README-FIRST.md, select a new fixed local NTFS install
+directory, install, and run Verify-AOOfficePool.ps1. Confirm all five offices
+are free and that fresh install-local governance and recovery state was
+created. Do not start office work, uninstall the verified installation,
+publish a release, push changes, or change repository visibility.
+
+Return the checkout commit, environment checks, source-test results, release
+availability, acquired identities when applicable, install path, verification
+state, limitations, and the exact next action. Do not claim publication,
+production readiness, or office-operation coverage.
+```
+
 ## Acquire the private release
 
 Start in a clean clone of this repository. Use PowerShell 7 on Windows, provide

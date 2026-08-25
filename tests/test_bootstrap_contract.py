@@ -50,6 +50,19 @@ class BootstrapContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, combined)
 
+    def test_readme_has_copy_paste_fresh_clone_and_ai_setup_paths(self):
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        for phrase in (
+            "## Fresh clone: validate the source checkout",
+            "git clone https://github.com/uesugitorachiyo/ao-office-pool.git",
+            "python -m unittest discover -s tests -v",
+            "## Copy-paste prompt for Windows Codex",
+            "If the private release is unavailable",
+            "Do not substitute locally built or unverified assets",
+            "Continue proactively through every safe documented step",
+        ):
+            self.assertIn(phrase, text)
+
     def test_every_relative_markdown_link_resolves(self):
         for name in DOCUMENTS:
             path = ROOT / name
