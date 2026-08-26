@@ -159,9 +159,19 @@ recovery behavior are in the [operator guide](docs/OPERATOR_GUIDE.md).
 - Five offices named O1 through O5.
 - Manual, authenticated acquisition and explicit install/verify/uninstall.
 
-This preview does not provide a user-facing office lifecycle command or a
-standardized endurance runner. Installation verifies package integrity; it
-does not grant operational office authority, start work, or publish anything.
+The installed Windows command exposes `status`, `claim`, `resume`, governed
+`run`, `release`, and explicit `recover`. Installation verifies package
+integrity but does not claim an office or start work. Installation alone does
+not authorize office work. Run the Python 3.12 and checksum-bound verification
+gates before O1-first dogfood:
+
+```powershell
+python -c "import sys; assert sys.version_info[:2] == (3, 12)"
+& "$InstallRoot\bin\ao-office-pool.ps1" status
+```
+
+The connected project must be outside the AO Office Pool installation. Exact
+copy-paste lifecycle examples are in the [operator guide](docs/OPERATOR_GUIDE.md).
 The archive contains no initialized mutable office state or reusable secrets;
 the installer creates fresh per-install governance and recovery material on the
 target machine.

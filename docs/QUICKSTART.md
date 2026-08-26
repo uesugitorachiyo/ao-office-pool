@@ -58,3 +58,17 @@ gate ends in exactly one decision:
 Keep the verified downloads outside the extraction and installation so they
 remain an independent anchor. Never use credential values or raw API responses
 as evidence.
+
+## 4. Verify the installed command
+
+After install and archive verification, run the non-mutating status command:
+
+```powershell
+python -c "import sys; assert sys.version_info[:2] == (3, 12)"
+& "$InstallRoot\bin\ao-office-pool.ps1" status
+```
+
+Installation alone does not authorize office work. Keep the connected project
+outside the AO Office Pool installation and use the [operator guide](OPERATOR_GUIDE.md#office-lifecycle)
+for the O1-first `claim`, `resume`, governed `run`, `release`, and exceptional
+`recover` procedure.

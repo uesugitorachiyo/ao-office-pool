@@ -68,6 +68,34 @@ class BootstrapContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
+    def test_documents_expose_the_installed_windows_lifecycle_command(self):
+        texts = {
+            name: (ROOT / name).read_text(encoding="utf-8") for name in DOCUMENTS
+        }
+        combined = "\n".join(texts.values())
+        for obsolete in (
+            "does not yet expose a user-facing office lifecycle command",
+            "no user-facing office lifecycle command",
+            "does not provide a user-facing office lifecycle command",
+        ):
+            self.assertNotIn(obsolete, combined)
+        for phrase in (
+            'python -c "import sys; assert sys.version_info[:2] == (3, 12)"',
+            '& "$InstallRoot\\bin\\ao-office-pool.ps1" status',
+            " claim ",
+            " resume ",
+            " run ",
+            " release ",
+            " recover ",
+            "outside the AO Office Pool installation",
+            "O1-first",
+            "Installation alone does not authorize office work",
+        ):
+            self.assertIn(phrase, combined)
+        ai = texts["docs/AI_OPERATOR_RUNBOOK.md"]
+        self.assertIn('& "$InstallRoot\\bin\\ao-office-pool.ps1" status', ai)
+        self.assertIn("Do not begin O1-first dogfood", ai)
+
     def test_every_relative_markdown_link_resolves(self):
         for name in DOCUMENTS:
             path = ROOT / name

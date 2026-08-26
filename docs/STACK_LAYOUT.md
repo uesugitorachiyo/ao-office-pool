@@ -98,6 +98,8 @@ The staging tree mirrors the final fixed NTFS installation root:
 │   ├── ao-sentinel\<version>\
 │   └── ao-promoter\<version>\
 ├── manifests\
+├── bin\ao-office-pool.ps1          installed Windows lifecycle launcher
+├── cmd\ao_office_pool.py           status/claim/resume/run/release/recover adapter
 ├── pool.json                        generated after initialization
 ├── offices\
 │   ├── O1\
@@ -123,6 +125,11 @@ receipts, manifests, or qualification records.
 AO Architecture stays in the ignored development source tree as guidance and
 contract evidence. It enters `components\` only if a later versioned lock
 identifies a qualified runtime asset with a real executable role.
+
+The launcher resolves this installation root from its own location and requires
+Python 3.12. Installation alone does not authorize office work. Connected
+projects remain outside the AO Office Pool installation; only authenticated
+project identity is recorded in office authority state.
 
 ## Connected-project state
 

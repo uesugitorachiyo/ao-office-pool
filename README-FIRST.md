@@ -69,9 +69,16 @@ Uninstall only when all five offices are free and verification succeeds:
 The uninstall script preserves the removed tree as a private recovery sibling.
 Retention or deletion of that tree is a separate operator decision.
 
-## Honest limitation
+## Installed lifecycle command
 
-The package coordinates and verifies the five-office runtime layout, but it
-does not yet expose a user-facing office lifecycle command or standardized
-endurance runner. Do not invent a command, infer work authorization from
-installation, or report an office operation that was not directly observed.
+After checksum-bound verification, confirm Python 3.12 and inspect all five
+offices without starting work:
+
+```powershell
+python -c "import sys; assert sys.version_info[:2] == (3, 12)"
+& "$InstallRoot\bin\ao-office-pool.ps1" status
+```
+
+Installation alone does not authorize office work. Keep the connected project
+outside the AO Office Pool installation and follow the [operator lifecycle
+examples](docs/OPERATOR_GUIDE.md#office-lifecycle) for O1-first dogfood.

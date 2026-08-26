@@ -13,7 +13,7 @@ from unittest import mock
 
 import scripts.build_preview as builder
 from tests.test_bootstrap_acquisition import ASSET_NAMES
-from tests.test_package_builder import REQUIRED_BOOTSTRAP_MEMBERS
+from tests.test_package_builder import LIFECYCLE_MEMBERS, REQUIRED_BOOTSTRAP_MEMBERS
 
 
 ROOT = Path(__file__).parents[1]
@@ -33,7 +33,7 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
 
     def build_archive(self):
         source = self.root / "product-source"
-        for relative in REQUIRED_BOOTSTRAP_MEMBERS | {
+        for relative in REQUIRED_BOOTSTRAP_MEMBERS | LIFECYCLE_MEMBERS | {
             "manifests/developer-preview-release.json"
         }:
             destination = source / relative
@@ -57,7 +57,8 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
             components[name] = (identity["version"], binary)
         lock_path = self.root / "components.lock.json"
         lock_path.write_text(
-            json.dumps({"components": list(identities.values())}), encoding="utf-8"
+            json.dumps({"schema_version": 1, "components": list(identities.values())}),
+            encoding="utf-8",
         )
         archive = self.root / "ao-office-pool-developer-preview.zip"
         with (

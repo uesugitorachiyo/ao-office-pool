@@ -208,6 +208,8 @@ boundary; do not start office work.
 ```powershell
 ./packaging/Verify-AOOfficePool.ps1 -InstallRoot $InstallRoot `
   -Archive $Archive -ChecksumFile $Sidecar
+python -c "import sys; assert sys.version_info[:2] == (3, 12)"
+& "$InstallRoot\bin\ao-office-pool.ps1" status
 ```
 
 **Expected:** Verification succeeds against the retained archive and checksum,
@@ -216,8 +218,10 @@ and all five offices have the accepted free-state shape.
 **Stop:** Choose `HOLD` for any drift or unavailable independent anchor. A
 successful install is not a substitute for this gate.
 
-**Evidence:** Verifier result and immutable identities. The preview has no
-user-facing lifecycle status command, so do not fabricate one.
+**Evidence:** Verifier result, immutable identities, and the bounded status JSON
+showing O1 through O5 free. Installation alone does not authorize office work.
+Do not begin O1-first dogfood until this checksum-bound gate passes. Keep every
+connected project outside the AO Office Pool installation.
 
 **Next:** `CONTINUE` to G09 when verified. Choose `REPAIR` through an authorized
 rollback or clean reinstall; otherwise `HOLD`.

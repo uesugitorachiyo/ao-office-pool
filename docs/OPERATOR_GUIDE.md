@@ -59,9 +59,42 @@ checks all offices free again, and records a private sibling recovery
 transaction before replacement. A later invocation restores the accepted
 prior tree when it finds an interrupted replacement.
 
-Installation does not start a service, create a queue, schedule work, or grant
-operational office authority. This preview has no user-facing office lifecycle
-command and no standardized endurance runner.
+Installation does not start a service, create a queue, schedule work, or claim
+an office. Installation alone does not authorize office work.
+
+## Office lifecycle
+
+Use Python 3.12. Keep `$ProjectRoot` outside the AO Office Pool installation.
+Start with one O1-first claim and retain the returned `authority_path` only for
+the lifetime of that claim.
+
+```powershell
+python -c "import sys; assert sys.version_info[:2] == (3, 12)"
+$Office = "$InstallRoot\bin\ao-office-pool.ps1"
+$ProjectRoot = (Resolve-Path ./connected-project).Path
+
+& $Office status
+$Claim = & $Office claim --owner 'operator-1' --task 'pilot-1' `
+  --project $ProjectRoot --mode pinned | ConvertFrom-Json
+& $Office resume --receipt $Claim.authority_path
+& $Office run --receipt $Claim.authority_path `
+  --envelope (Join-Path $ProjectRoot '.ao\governance-envelope.json')
+& $Office release --receipt $Claim.authority_path
+& $Office status
+```
+
+`recover` is not a normal release path. Use it only after a command returns
+`recovery-required`, with the exact office, current generation, and install-local
+key. Preserve the recovery evidence:
+
+```powershell
+& $Office recover --key (Join-Path $InstallRoot 'operator-secrets\recovery-key-O1') `
+  --office O1 --generation 1
+```
+
+Success is one JSON object on standard output. Operational failures are one
+bounded JSON object on standard error with exit code 2; unexpected internal
+failures use exit code 3 and omit tracebacks.
 
 ## Update and rollback
 
