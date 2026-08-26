@@ -20,12 +20,18 @@ _REQUIRED_BOOTSTRAP_MEMBERS = {
     "packaging/Install-AOOfficePool.ps1",
     "packaging/Verify-AOOfficePool.ps1",
     "packaging/Uninstall-AOOfficePool.ps1",
+    "bin/ao-office-pool.ps1",
+    "cmd/ao_office_pool.py",
     "schemas/developer-preview-release.schema.json",
     "schemas/developer-preview-candidate.schema.json",
     "skills/thought-experiment/SKILL.md",
     "skills/engineering-research/SKILL.md",
     "skills/scope-to-deliverable-workflow/SKILL.md",
 }
+_REQUIRED_BOOTSTRAP_MEMBERS.update(
+    path.relative_to(Path(__file__).parents[1]).as_posix()
+    for path in (Path(__file__).parents[1] / "internal").glob("*.py")
+)
 _CONTROL_CONTRACT = "manifests/developer-preview-release.json"
 # Compatibility hook for older tests; accepted identities come only from _LOCK_PATH.
 _S01_LOCKS = None

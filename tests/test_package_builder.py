@@ -24,12 +24,17 @@ REQUIRED_BOOTSTRAP_MEMBERS = {
     "skills/engineering-research/SKILL.md",
     "skills/scope-to-deliverable-workflow/SKILL.md",
 }
+LIFECYCLE_MEMBERS = {
+    "bin/ao-office-pool.ps1",
+    "cmd/ao_office_pool.py",
+    *(path.relative_to(ROOT).as_posix() for path in (ROOT / "internal").glob("*.py")),
+}
 
 
 class PackageBuilderTests(unittest.TestCase):
     def bootstrap_source(self, root):
         source = root / "source"
-        for relative in REQUIRED_BOOTSTRAP_MEMBERS | {
+        for relative in REQUIRED_BOOTSTRAP_MEMBERS | LIFECYCLE_MEMBERS | {
             "manifests/developer-preview-release.json"
         }:
             destination = source / relative
@@ -283,6 +288,29 @@ class PackageBuilderTests(unittest.TestCase):
                     data = package.read(relative)
                     self.assertEqual(rows[relative]["size"], len(data))
                     self.assertEqual(rows[relative]["sha256"], hashlib.sha256(data).hexdigest())
+                self.assertTrue(LIFECYCLE_MEMBERS <= names)
+
+    def test_preview_requires_the_installed_lifecycle_command(self):
+        import scripts.build_preview as builder
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.bootstrap_source(root)
+            (source / "bin" / "ao-office-pool.ps1").unlink()
+            component_root, components, lock_path, identities = self.portable_components(root)
+            with (
+                mock.patch.object(builder, "_LOCK_PATH", lock_path),
+                mock.patch.object(builder, "_S01_LOCKS", identities),
+                self.assertRaises(ValueError),
+            ):
+                builder.build_preview(
+                    source,
+                    components["ao2"][1],
+                    "v0.5.12",
+                    root / "preview.zip",
+                    components=components,
+                    component_root=component_root,
+                )
 
     def test_preview_is_deterministic_and_contains_no_mutable_files(self):
         import scripts.build_preview as builder
