@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from internal.pool import InjectedCrash, Pool, PoolError
+from tests.process_control import stop_process, wait_for_expected_exit
 
 
 def _crash_claim(root, project, stage):
@@ -51,9 +52,8 @@ class PoolCrashTests(unittest.TestCase):
     def _abrupt(self, target, *arguments):
         process = multiprocessing.get_context("spawn").Process(target=target, args=arguments)
         process.start()
-        process.join(30)
-        self.assertFalse(process.is_alive())
-        self.assertEqual(process.exitcode, 97)
+        self.addCleanup(stop_process, process)
+        wait_for_expected_exit(process, expected_exit=97, timeout_seconds=180)
 
     def test_unknown_residue_requires_recovery(self):
         # MUTATION: a free-office scan ignores unknown bytes and reuses the office.

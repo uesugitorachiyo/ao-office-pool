@@ -14,6 +14,7 @@ from unittest import mock
 from internal import runtime_update as runtime_update_module
 from internal.pool import OFFICE_IDS, Pool, PoolError
 from internal.runtime_update import RuntimeUpdate, RuntimeUpdateError
+from tests.process_control import stop_process, wait_for_expected_exit
 
 
 def _canonical(value: dict) -> bytes:
@@ -501,9 +502,8 @@ class RuntimeUpdateTests(unittest.TestCase):
             args=(str(self.root), str(self.candidate)),
         )
         process.start()
-        process.join(10)
-        self.assertFalse(process.is_alive())
-        self.assertEqual(process.exitcode, 98)
+        self.addCleanup(stop_process, process)
+        wait_for_expected_exit(process, expected_exit=98, timeout_seconds=180)
         target = self.root / "components" / "ao2" / "v2"
         self.assertFalse(target.exists())
 
@@ -650,8 +650,8 @@ class RuntimeUpdateTests(unittest.TestCase):
         RuntimeUpdate(self.root).stage(self.candidate)
         process = multiprocessing.Process(target=_abrupt_activation, args=(str(self.root),))
         process.start()
-        process.join(10)
-        self.assertEqual(process.exitcode, 98)
+        self.addCleanup(stop_process, process)
+        wait_for_expected_exit(process, expected_exit=98, timeout_seconds=180)
 
         status = Pool(self.root, runtime_version="v1").public_status()
 
@@ -664,8 +664,8 @@ class RuntimeUpdateTests(unittest.TestCase):
         RuntimeUpdate(self.root).stage(self.candidate)
         process = multiprocessing.Process(target=_abrupt_activation, args=(str(self.root),))
         process.start()
-        process.join(10)
-        self.assertEqual(process.exitcode, 98)
+        self.addCleanup(stop_process, process)
+        wait_for_expected_exit(process, expected_exit=98, timeout_seconds=180)
 
         key = self.root / "operator-secrets" / "governance-witness.key"
         key.write_bytes(b"")

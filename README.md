@@ -44,16 +44,34 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -m tests.windows_compiler
 python scripts/scan_public_tree.py .
 python scripts/verify_bootstrap_contract.py .
-python -m unittest discover -s tests -v
+$runId = [Guid]::NewGuid().ToString('N')
+$evidence = Join-Path (Get-Location) ".local/qualification/$runId"
+$taskRoot = Join-Path $env:LOCALAPPDATA "AOOfficePoolQualification/$runId"
+python -B scripts/run_windows_tests.py `
+  --evidence-dir $evidence `
+  --task-root $taskRoot
+if ($LASTEXITCODE -ne 0) {
+  throw "Windows source suite failed; inspect $evidence/summary.json"
+}
+Get-Content (Join-Path $evidence 'summary.json')
 Remove-Item Env:PYTHONDONTWRITEBYTECODE
 ```
 
 Expected results are `windows-c-compiler=ready`, `public-tree findings=0`, a
-bootstrap summary with 13 members and 5 documents, and a final `OK` test result.
+bootstrap summary with 13 members and 5 documents, and a runner summary with
+`"result": "PASS"`, `"worker_exit": 0`, and `"task_root_residue": false`.
 Privilege-dependent symlink tests may be reported as skips on Windows. Other
 compiler-dependent skips do not qualify the checkout. A missing compiler or
 any other failure is a stop signal; do not continue to release installation by
 bypassing it.
+
+The runner discovers tests in the same order as `unittest`, records each test's
+identity, UTC boundaries, duration, outcome, and skip reason, samples the exact
+worker process tree and task-root storage, retains only bounded output, and
+fails with the active test identity if a test exceeds the default ten-minute
+limit. Machine-readable evidence stays below the ignored `.local/qualification`
+tree. Mutable test state stays in the unique fixed-local-NTFS task root and the
+runner removes that root on clean completion.
 
 ## Copy-paste prompt for Windows Codex
 
@@ -72,10 +90,10 @@ as authority. Use only relative repository paths in commands and evidence.
 Confirm Git, Python 3, PowerShell 7, Windows x86-64, and the documented Windows
 C compiler preflight. Set PYTHONDONTWRITEBYTECODE=1, then run the compiler
 preflight, public-tree scanner, bootstrap-contract verifier, and complete
-unittest suite exactly as README.md specifies. Report commands, exit codes,
-test totals, and named skips. Treat a missing compiler or compiler-dependent
-skip as HOLD rather than native qualification. Stop on any unexpected failure;
-do not weaken a gate.
+instrumented suite exactly as README.md specifies. Report commands, exit codes,
+runner summary, test totals, and every skip grouped by exact reason. Treat a
+missing compiler or compiler-dependent skip as HOLD rather than native
+qualification. Stop on any unexpected failure; do not weaken a gate.
 
 After source validation, determine whether the pinned private release is
 available. Use GITHUB_TOKEN only if it already exists in the process
