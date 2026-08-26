@@ -13,6 +13,7 @@
   ],
   "tracked_roots": [
     ".github",
+    "bin",
     "cmd",
     "internal",
     "schemas",

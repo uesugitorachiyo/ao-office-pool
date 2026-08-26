@@ -19,6 +19,12 @@ DOCUMENTS = (
 
 
 class BootstrapContractTests(unittest.TestCase):
+    def test_public_release_allowlist_admits_the_installed_launcher(self):
+        value = json.loads(
+            (ROOT / "manifests/public-tree.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("bin", value["tracked_roots"])
+
     def test_build_time_verifier_accepts_the_portable_bootstrap_tree(self):
         result = verify_bootstrap_tree(ROOT)
         self.assertEqual(result["documents"], len(DOCUMENTS))
