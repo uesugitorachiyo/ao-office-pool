@@ -23,6 +23,7 @@ from internal.transactions import atomic_write_bytes
 
 MISSION_EXECUTABLE = Path(__file__).parents[1] / ".local/bin/ao-mission"
 COMPONENT_LOCK = Path(__file__).parents[1] / "manifests/components.lock.json"
+COMPONENT_ROOT = Path(__file__).parents[1] / "components"
 MISSION_SCHEMA = Path(__file__).parents[1] / "schemas/mission-record.schema.json"
 MAX_OUTPUT = 64 * 1024
 _AUTHORITY_FLAGS = (
@@ -900,8 +901,13 @@ def _locked_component() -> dict:
         component = next(
             item for item in lock["components"] if item.get("name") == "ao-mission"
         )
-        if component["asset"] != MISSION_EXECUTABLE.name or not _DIGEST.fullmatch(
-            component["sha256"]
+        if (
+            not isinstance(component.get("version"), str)
+            or not component["version"]
+            or not isinstance(component.get("asset"), str)
+            or not component["asset"]
+            or Path(component["asset"]).name != component["asset"]
+            or not _DIGEST.fullmatch(component["sha256"])
         ):
             raise ValueError("wrong locked identity")
         return component
@@ -1015,7 +1021,18 @@ def _open_verified_file(path: Path, expected_digest: str):
 @contextmanager
 def _open_verified_executable():
     component = _locked_component()
-    manager = _open_verified_file(MISSION_EXECUTABLE, component["sha256"])
+    installed = (
+        COMPONENT_ROOT
+        / "ao-mission"
+        / component["version"]
+        / component["asset"]
+    )
+    executable = (
+        MISSION_EXECUTABLE
+        if MISSION_EXECUTABLE.name == component["asset"]
+        else installed
+    )
+    manager = _open_verified_file(executable, component["sha256"])
     try:
         value = manager.__enter__()
     except MissionBridgeError as error:

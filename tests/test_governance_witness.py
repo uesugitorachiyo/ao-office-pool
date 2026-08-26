@@ -799,6 +799,29 @@ class GovernanceWitnessTests(unittest.TestCase):
                 .is_relative_to(self.project)
             )
 
+    def test_producers_use_versioned_installed_component_layout(self):
+        component_root = self.base / "components"
+        for component in self.components:
+            if component["name"] not in governance._PRODUCERS:
+                continue
+            source = self.bin_dir / component["asset"]
+            destination = (
+                component_root
+                / component["name"]
+                / component["version"]
+                / component["asset"]
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        with (
+            mock.patch.object(governance, "BIN_DIR", self.base / "missing-bin"),
+            mock.patch.object(governance, "COMPONENT_ROOT", component_root, create=True),
+        ):
+            envelope = issue_witness(
+                self.claim_path, self.task_text, self.valid_artifacts()
+            )
+        self.assertTrue(envelope.is_file())
+
     def test_missing_forge_runtime_schema_fails_before_forge_launch(self):
         self.forge_schema.unlink()
         self._assert_code(

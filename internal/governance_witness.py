@@ -39,6 +39,7 @@ from internal.pool import AuthorityLease, Pool, PoolError
 
 COMPONENT_LOCK = Path(__file__).parents[1] / "manifests/components.lock.json"
 BIN_DIR = Path(__file__).parents[1] / ".local/bin"
+COMPONENT_ROOT = Path(__file__).parents[1] / "components"
 FORGE_RUNTIME_ROOT = Path(__file__).parents[1] / "packaging/runtime/ao-forge"
 FORGE_SCHEMA_SHA256 = "1a1c48a29c6b35713b08d733191e88887795fb8482054801900ae4b37e5bda3c"
 ENVELOPE_SCHEMA = Path(__file__).parents[1] / "schemas/governance-envelope.schema.json"
@@ -643,9 +644,16 @@ def _run_producer(
                 previous_inheritable[descriptor] = os.get_inheritable(descriptor)
                 os.set_inheritable(descriptor, True)
         with ExitStack() as stack:
+            installed = (
+                COMPONENT_ROOT
+                / name
+                / component["version"]
+                / component["asset"]
+            )
+            executable_path = installed if installed.is_file() else BIN_DIR / component["asset"]
             executable = stack.enter_context(
                 _open_verified_file(
-                    BIN_DIR / component["asset"], component["sha256"]
+                    executable_path, component["sha256"]
                 )
             )
             launch_project = project

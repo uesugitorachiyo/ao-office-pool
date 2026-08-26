@@ -46,6 +46,52 @@ class WindowsBinaryDescriptorTests(unittest.TestCase):
         self.assertTrue(all("b" in mode for mode in fdopen_modes))
 
 
+class InstalledMissionLayoutTests(unittest.TestCase):
+    def test_verified_mission_uses_versioned_installed_component(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "components/ao-mission/v1/ao-mission.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"mission")
+            lock = root / "components.lock.json"
+            lock.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "components": [
+                            {
+                                "name": "ao-mission",
+                                "version": "v1",
+                                "asset": executable.name,
+                                "sha256": hashlib.sha256(b"mission").hexdigest(),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            opened = object()
+            manager = mock.MagicMock()
+            manager.__enter__.return_value = opened
+            with (
+                mock.patch.object(mission_bridge, "COMPONENT_LOCK", lock),
+                mock.patch.object(
+                    mission_bridge,
+                    "MISSION_EXECUTABLE",
+                    root / ".local/bin/ao-mission",
+                ),
+                mock.patch.object(mission_bridge, "COMPONENT_ROOT", root / "components", create=True),
+                mock.patch.object(
+                    mission_bridge, "_open_verified_file", return_value=manager
+                ) as open_file,
+            ):
+                with mission_bridge._open_verified_executable() as verified:
+                    self.assertIs(verified, opened)
+            open_file.assert_called_once_with(
+                executable, hashlib.sha256(b"mission").hexdigest()
+            )
+
+
 @unittest.skipIf(
     os.name == "nt"
     and not (
