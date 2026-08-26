@@ -42,7 +42,12 @@ class PackageBuilderTests(unittest.TestCase):
 
         component_root = root / "component-root"
         component_root.mkdir()
-        identities = json.loads(json.dumps(builder._S01_LOCKS))
+        identities = {
+            row["name"]: row
+            for row in json.loads(
+                (ROOT / "manifests/components.lock.json").read_text(encoding="utf-8")
+            )["components"]
+        }
         components = {}
         for index, (name, identity) in enumerate(sorted(identities.items())):
             data = f"portable {name} {index}\n".encode()
@@ -56,7 +61,6 @@ class PackageBuilderTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema_version": 1,
-                    "qualified_slice": "S01",
                     "components": list(identities.values()),
                 }
             ),
@@ -75,6 +79,37 @@ class PackageBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "component map"):
                 build_preview(source, root / "ao2.exe", "v0.5.12", root / "preview.zip")
 
+    def test_build_preview_derives_component_identity_only_from_the_lock(self):
+        import scripts.build_preview as builder
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.bootstrap_source(root)
+            component_root, components, lock_path, _identities = self.portable_components(root)
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            ao2 = next(row for row in lock["components"] if row["name"] == "ao2")
+            ao2["version"] = "v9.1.0"
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            components["ao2"] = ("v9.1.0", components["ao2"][1])
+            archive = root / "preview.zip"
+
+            with mock.patch.object(builder, "_LOCK_PATH", lock_path):
+                try:
+                    builder.build_preview(
+                        source,
+                        components["ao2"][1],
+                        "v9.1.0",
+                        archive,
+                        components,
+                        component_root,
+                    )
+                except ValueError as error:
+                    self.fail(f"builder used copied component identities: {error}")
+
+            with zipfile.ZipFile(archive) as package:
+                manifest = json.loads(package.read("developer-preview-manifest.json"))
+            self.assertEqual(manifest["runtime_version"], "v9.1.0")
+
     def test_build_preview_rejects_lock_binary_name_drift(self):
         import scripts.build_preview as builder
 
@@ -87,7 +122,7 @@ class PackageBuilderTests(unittest.TestCase):
             lock["components"][0]["asset"] = "unbound.exe"
             lock_path.write_text(json.dumps(lock))
 
-            with mock.patch.object(builder, "_LOCK_PATH", lock_path), mock.patch.object(builder, "_S01_LOCKS", identities), self.assertRaisesRegex(ValueError, "lock identity"):
+            with mock.patch.object(builder, "_LOCK_PATH", lock_path), mock.patch.object(builder, "_S01_LOCKS", identities), self.assertRaisesRegex(ValueError, "component identity"):
                 builder.build_preview(source, components["ao2"][1], "v0.5.12", root / "preview.zip", components, component_root)
 
     def test_build_preview_rejects_lock_repository_drift(self):
@@ -102,7 +137,7 @@ class PackageBuilderTests(unittest.TestCase):
             lock["components"][0]["repository"] = "https://example.invalid/ao2.git"
             lock_path.write_text(json.dumps(lock))
 
-            with mock.patch.object(builder, "_LOCK_PATH", lock_path), mock.patch.object(builder, "_S01_LOCKS", identities), self.assertRaisesRegex(ValueError, "lock identity"):
+            with mock.patch.object(builder, "_LOCK_PATH", lock_path), mock.patch.object(builder, "_S01_LOCKS", identities), self.assertRaisesRegex(ValueError, "component lock"):
                 builder.build_preview(source, components["ao2"][1], "v0.5.12", root / "preview.zip", components, component_root)
 
     def test_build_preview_rejects_missing_extra_duplicate_version_and_hash_lock_drift(self):

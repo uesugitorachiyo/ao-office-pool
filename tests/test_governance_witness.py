@@ -286,6 +286,24 @@ class ForgeRuntimePackageTests(unittest.TestCase):
             expected,
         )
 
+    def test_witness_derives_producer_identity_only_from_the_component_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock = json.loads(
+                governance.COMPONENT_LOCK.read_text(encoding="utf-8")
+            )
+            ao2 = next(row for row in lock["components"] if row["name"] == "ao2")
+            ao2["version"] = "v9.1.0"
+            path = Path(temporary) / "components.lock.json"
+            path.write_text(json.dumps(lock), encoding="utf-8")
+
+            with mock.patch.object(governance, "COMPONENT_LOCK", path):
+                try:
+                    components = governance._locked_components()
+                except GovernanceError as error:
+                    self.fail(f"governance used copied producer identities: {error.code}")
+
+            self.assertEqual(components["ao2"]["version"], "v9.1.0")
+
 
 class GovernanceWitnessTests(unittest.TestCase):
     def setUp(self):
@@ -343,6 +361,8 @@ class GovernanceWitnessTests(unittest.TestCase):
             self.components.append(self._component(name, binary_digest))
         self.ao2_digest = "c" * 64
         self.components.append(self._component("ao2", self.ao2_digest))
+        for name in ("ao-mission", "ao-command", "ao2-control-plane"):
+            self.components.append(self._component(name, "d" * 64))
         self.lock = self.base / "components.lock.json"
         self._write_lock()
         self.configuration = mock.patch.multiple(
@@ -366,11 +386,11 @@ class GovernanceWitnessTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def _component(self, name, digest, *, commit=None, version=None, asset=None):
-        pinned = _PRODUCER_COMPONENTS[name]
+        pinned = _REPOSITORY_COMPONENTS[name]
         return {
             "name": name,
             "version": pinned["version"] if version is None else version,
-            "repository": "https://example.invalid/" + name,
+            "repository": pinned["repository"],
             "commit": pinned["commit"] if commit is None else commit,
             "asset": pinned["asset"] if asset is None else asset,
             "license": "Apache-2.0",
@@ -1350,11 +1370,10 @@ class GovernanceWitnessTests(unittest.TestCase):
             with self.assertRaises(GovernanceError):
                 governance._readback("ao-atlas", raw)
 
-    def test_component_name_commit_version_asset_and_digest_are_enforced(self):
+    def test_component_lock_rejects_malformed_or_unusable_producer_identity(self):
         mutations = (
             lambda item: item.update(name="wrong"),
-            lambda item: item.update(commit="0" * 40),
-            lambda item: item.update(version="git-wrong"),
+            lambda item: item.update(commit="not-a-commit"),
             lambda item: item.update(asset="wrong"),
             lambda item: item.update(sha256="0" * 64),
         )

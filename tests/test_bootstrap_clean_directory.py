@@ -41,7 +41,12 @@ class BootstrapCleanDirectoryTests(unittest.TestCase):
             destination.write_bytes((ROOT / relative).read_bytes())
 
         component_root = self.root / "components"
-        identities = json.loads(json.dumps(builder._S01_LOCKS))
+        identities = {
+            row["name"]: row
+            for row in json.loads(
+                (ROOT / "manifests/components.lock.json").read_text(encoding="utf-8")
+            )["components"]
+        }
         components = {}
         for index, (name, identity) in enumerate(sorted(identities.items())):
             data = f"clean bootstrap {name} {index}\n".encode()

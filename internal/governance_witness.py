@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 
+from internal.component_lock import load_component_lock
+
 from internal.mission_bridge import (
     MissionBridgeError,
     MissionReadback,
@@ -48,13 +50,9 @@ _PRODUCERS = {
     "ao-forge": ("goal", "validate", "--goal-run", "{artifact}", "--json"),
     "ao-covenant": ("verify", "--ledger", "{ledger}", "--evidence", "{artifact}", "--json"),
 }
-_PINNED = {
-    "ao-blueprint": ("git-ec6a80b60b54", "ec6a80b60b54c0c0ac1822f873c1abf337fe5eb5", "ao-blueprint.exe"),
-    "ao-atlas": ("v0.2.1", "3603a2bb8af5adafcd9ff17b807ab89f32283d18", "ao-atlas.exe"),
-    "ao-forge": ("v0.1.5", "d1723769949269dcd0589916d83769dcb7275f98", "forge.exe"),
-    "ao-covenant": ("v0.1.1", "2fd72a0426a747868826581612fa1dc9727b53b9", "ao-covenant_v0.1.1_windows_amd64.exe"),
-    "ao2": ("v0.5.12", "68cf6914ae51cb4b638a7441ac05c1b4e86ec6d6", "ao2.exe"),
-}
+_GOVERNED_COMPONENTS = frozenset(
+    {"ao-blueprint", "ao-atlas", "ao-forge", "ao-covenant", "ao2"}
+)
 _ROOTS = {
     "ao-blueprint": (".ao", "evidence", "ao-blueprint"),
     "ao-atlas": (".ao", "evidence", "ao-atlas"),
@@ -290,30 +288,8 @@ def _pool(receipt: Path) -> Pool:
 
 def _locked_components() -> dict[str, dict]:
     try:
-        value = json.loads(COMPONENT_LOCK.read_text(encoding="utf-8"))
-        if value.get("schema_version") != 1 or not isinstance(
-            value.get("components"), list
-        ):
-            raise ValueError("wrong component lock")
-        result = {}
-        for name, (version, commit, asset) in _PINNED.items():
-            matches = [
-                item
-                for item in value["components"]
-                if isinstance(item, dict) and item.get("name") == name
-            ]
-            if len(matches) != 1:
-                raise ValueError("component count")
-            item = matches[0]
-            if (
-                item.get("commit") != commit
-                or item.get("version") != version
-                or item.get("asset") != asset
-                or not _DIGEST.fullmatch(item.get("sha256", ""))
-            ):
-                raise ValueError("component identity")
-            result[name] = item
-        return result
+        locked = load_component_lock(COMPONENT_LOCK)
+        return {name: locked[name] for name in _GOVERNED_COMPONENTS}
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise GovernanceError("governance-producer-identity-mismatch") from error
 

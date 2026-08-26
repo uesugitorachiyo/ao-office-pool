@@ -1,6 +1,8 @@
 import io
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -8,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.scan_public_tree import main, scan_tree
+import scripts.scan_public_tree as scanner
 
 
 def text(*parts): return "".join(parts)
@@ -19,6 +22,36 @@ class ScanPublicTreeTests(unittest.TestCase):
     def write(self, relative, contents="public\n"):
         path = self.root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(contents); return path
     def paths(self): return {finding.path for finding in scan_tree(self.root)}
+
+    def test_direct_entrypoint_can_load_the_component_lock(self):
+        completed = subprocess.run(
+            [sys.executable, "-B", "scripts/scan_public_tree.py", str(self.root)],
+            cwd=Path(__file__).parents[1],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "public-tree findings=0\n")
+
+    def test_preview_binary_allowlist_is_derived_from_the_component_lock(self):
+        lock = json.loads(
+            (Path(__file__).parents[1] / "manifests/components.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        ao2 = next(row for row in lock["components"] if row["name"] == "ao2")
+        ao2["version"] = "v9.1.0"
+        ao2["sha256"] = "a" * 64
+        lock_path = self.root / "components.lock.json"
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+        derive = getattr(scanner, "trusted_preview_binaries", None)
+        self.assertTrue(callable(derive), "scanner has no lock-derived allowlist")
+        trusted = derive(lock_path)
+        self.assertEqual(trusted["components/ao2/v9.1.0/ao2.exe"], "a" * 64)
+        self.assertEqual(
+            trusted["offices/O5/runtime/versions/v9.1.0/ao2.exe"], "a" * 64
+        )
 
     def test_reports_existing_public_boundary_leaks(self):
         cases = ((text(".", "env.production"), ""), (text("claim.", "receipt.json"), ""), ("owner.txt", text("owner", "Id: x")), ("prompt.txt", text("system ", "prompt", ": x")), ("path.txt", text("/", "Users/a")))
