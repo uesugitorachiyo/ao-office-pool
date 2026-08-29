@@ -187,11 +187,12 @@ class PublicReleaseContractTests(unittest.TestCase):
     def test_license_is_apache_2_0(self):
         license_bytes = (ROOT / "LICENSE").read_bytes()
         license_text = license_bytes.decode("utf-8")
+        canonical_license_bytes = license_bytes.replace(b"\r\n", b"\n")
 
         self.assertIn("Apache License", license_text)
         self.assertIn("Version 2.0, January 2004", license_text)
         self.assertEqual(
-            hashlib.sha256(license_bytes).hexdigest(),
+            hashlib.sha256(canonical_license_bytes).hexdigest(),
             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
         )
 

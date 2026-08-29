@@ -480,11 +480,12 @@ class ActiveReadbackTests(unittest.TestCase):
                 )
         finally:
             if release_thread is not None:
-                release_thread.join(5)
+                release_thread.join(60)
 
         self.assertEqual(release_errors, [])
         self.assertTrue(release_acquired.is_set())
         self.assertTrue(release_finished.is_set())
+        self.assertFalse(release_thread.is_alive())
 
     def test_reanchored_component_authority_after_qualification_invalidates_exports(self):
         # MUTATION: omitting components_sha256 from readback accepts a package

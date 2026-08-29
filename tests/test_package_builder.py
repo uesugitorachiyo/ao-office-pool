@@ -4,6 +4,8 @@ import tempfile
 import unittest
 import zipfile
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -34,6 +36,141 @@ LIFECYCLE_MEMBERS = {
 
 
 class PackageBuilderTests(unittest.TestCase):
+    def test_public_release_publication_is_create_only(self):
+        from scripts.build_public_release import _publish_create_only
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate.zip"
+            output = root / "release.zip"
+            candidate.write_bytes(b"candidate")
+            output.write_bytes(b"existing")
+
+            with self.assertRaises(FileExistsError):
+                _publish_create_only(candidate, output)
+
+            self.assertEqual(output.read_bytes(), b"existing")
+
+    def public_release_fixture(self, root):
+        source = root / "source-checkout"
+        shutil.copytree(
+            ROOT,
+            source,
+            ignore=shutil.ignore_patterns(".git", ".local", ".worktrees", "__pycache__", "*.pyc"),
+        )
+        component_root, _components, lock_path, _identities = self.portable_components(root)
+        shutil.copyfile(lock_path, source / "manifests" / "components.lock.json")
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Release Test"],
+            cwd=source,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "release-test@example.invalid"],
+            cwd=source,
+            check=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=source, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "fixture"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return source, component_root
+
+    def run_public_release(self, source, component_root, output):
+        return subprocess.run(
+            [
+                os.sys.executable,
+                "-B",
+                str(source / "scripts" / "build_public_release.py"),
+                "--source",
+                str(source.resolve()),
+                "--component-root",
+                str(component_root.resolve()),
+                "--output",
+                str(output.resolve()),
+            ],
+            cwd=source,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_public_release_cli_is_deterministic_and_allowlist_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, component_root = self.public_release_fixture(root)
+            excluded = source / "excluded-private.txt"
+            excluded.write_text("not packaged\n", encoding="utf-8")
+            subprocess.run(["git", "add", excluded.name], cwd=source, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "excluded fixture"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            first = root / "first.zip"
+            second = root / "second.zip"
+
+            results = [
+                self.run_public_release(source, component_root, output)
+                for output in (first, second)
+            ]
+
+            for result, output in zip(results, (first, second)):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                record = json.loads(result.stdout)
+                self.assertEqual(
+                    set(record), {"source_commit", "output", "size", "sha256"}
+                )
+                self.assertEqual(record["output"], output.name)
+                self.assertEqual(record["size"], output.stat().st_size)
+                self.assertEqual(
+                    record["sha256"], hashlib.sha256(output.read_bytes()).hexdigest()
+                )
+                self.assertNotIn(str(root), result.stdout)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as package:
+                names = set(package.namelist())
+            self.assertNotIn(excluded.name, names)
+            self.assertTrue({"LICENSE", "NOTICE"} <= names)
+            self.assertTrue(
+                all(
+                    f"offices/O{number}/runtime/versions/v0.5.12/ao2.exe" in names
+                    for number in range(1, 6)
+                )
+            )
+
+    def test_public_release_cli_rejects_dirty_source_and_component_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, component_root = self.public_release_fixture(root)
+            output = root / "release.zip"
+            (source / "README.md").write_text("dirty\n", encoding="utf-8")
+            dirty = self.run_public_release(source, component_root, output)
+            self.assertNotEqual(dirty.returncode, 0)
+            self.assertFalse(output.exists())
+
+            subprocess.run(
+                ["git", "restore", "README.md"], cwd=source, check=True
+            )
+            ao2 = next(component_root.rglob("ao2.exe"))
+            ao2.write_bytes(ao2.read_bytes() + b"drift")
+            drift = self.run_public_release(source, component_root, output)
+            self.assertNotEqual(drift.returncode, 0)
+            self.assertFalse(output.exists())
+
     def bootstrap_source(self, root):
         source = root / "source"
         for relative in REQUIRED_BOOTSTRAP_MEMBERS | LIFECYCLE_MEMBERS | {
@@ -59,8 +196,8 @@ class PackageBuilderTests(unittest.TestCase):
         for index, (name, identity) in enumerate(sorted(identities.items())):
             data = f"portable {name} {index}\n".encode()
             identity["sha256"] = hashlib.sha256(data).hexdigest()
-            binary = component_root / name / identity["asset"]
-            binary.parent.mkdir()
+            binary = component_root / name / identity["version"] / identity["asset"]
+            binary.parent.mkdir(parents=True)
             binary.write_bytes(data)
             components[name] = (identity["version"], binary)
         lock_path = root / "components.lock.json"
