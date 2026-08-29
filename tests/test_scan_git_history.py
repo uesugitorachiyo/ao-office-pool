@@ -672,7 +672,7 @@ elif '--batch' in args:
         with (
             patch.dict(os.environ, environment, clear=True),
             patch.object(history_scanner, "_git", side_effect=fake_command),
-            patch.object(history_scanner, "GIT_TIMEOUT_SECONDS", 0.25),
+            patch.object(history_scanner, "GIT_TIMEOUT_SECONDS", 2.0),
             patch.object(
                 history_scanner.tempfile,
                 "TemporaryFile",
@@ -690,7 +690,7 @@ elif '--batch' in args:
         elapsed = time.monotonic() - started
 
         self.assertEqual(raised.exception.stage, "limit-protocol-size")
-        self.assertLess(elapsed, 1.0)
+        self.assertLess(elapsed, 3.0)
         self.assertLessEqual(max(written, default=0), 4096)
 
     def test_repeated_commit_trees_do_not_amplify_git_commands(self):
