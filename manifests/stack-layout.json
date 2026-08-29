@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "mission": {
+    "working_directory": ".",
+    "handoff": ".local/handoffs/AO_MISSION_HANDOFF.md",
+    "state_root": ".ao/mission"
+  },
+  "development": {
+    "source_root": ".local/sources",
+    "download_root": ".local/downloads",
+    "cache_root": ".local/cache",
+    "windows_staging_root": ".local/staging/windows-x86_64",
+    "source_components": [
+      "ao-architecture",
+      "ao-mission",
+      "ao2",
+      "ao2-control-plane",
+      "ao-blueprint",
+      "ao-atlas",
+      "ao-foundry",
+      "ao-forge",
+      "ao-covenant",
+      "ao-command",
+      "ao-arena",
+      "ao-crucible",
+      "ao-sentinel",
+      "ao-promoter"
+    ]
+  },
+  "windows": {
+    "shared_component_root": "components",
+    "shared_components": [
+      "ao-mission",
+      "ao2",
+      "ao2-control-plane",
+      "ao-blueprint",
+      "ao-atlas",
+      "ao-foundry",
+      "ao-forge",
+      "ao-covenant",
+      "ao-command",
+      "ao-arena",
+      "ao-crucible",
+      "ao-sentinel",
+      "ao-promoter"
+    ],
+    "office_root": "offices",
+    "offices": ["O1", "O2", "O3", "O4", "O5"],
+    "office_runtime": "runtime/versions",
+    "office_local_component": "ao2",
+    "private_roots": [
+      "operator-secrets",
+      "updates",
+      "support-bundles"
+    ]
+  },
+  "connected_project": {
+    "state_roots": [
+      ".ao/mission",
+      ".ao/workgraphs",
+      ".ao/checkpoints",
+      ".ao/evidence"
+    ]
+  }
+}

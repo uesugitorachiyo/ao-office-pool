@@ -1,0 +1,20 @@
+AO Office Pool
+Copyright 2026 Torachiyo Uesugi
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+AO Office Pool is an independent project. It integrates with AO Stack
+components but is not currently an official member of the AO Stack family.
+
+The Windows distribution includes these Apache-2.0 components:
+- ao2
+- ao-mission
+- ao-command
+- ao-atlas
+- ao-forge
+- ao-covenant
+- ao2-control-plane
+- ao-blueprint
+
+Exact versions, source repositories, commits, asset names, and SHA-256 values
+are recorded in manifests/components.lock.json.

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AO office pool",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "office_count", "offices", "runtime_version"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "office_count": {"const": 5},
+    "offices": {"const": ["O1", "O2", "O3", "O4", "O5"]},
+    "runtime_version": {"type": "string", "minLength": 1}
+  }
+}

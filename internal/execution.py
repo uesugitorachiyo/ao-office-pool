@@ -1,0 +1,798 @@
+import hashlib
+import hmac
+import json
+import os
+import stat
+import sys
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from internal.governance_witness import (
+    GovernanceError,
+    GovernedExecution,
+    _consume_witness,
+    _create_private,
+    _unlink_private,
+)
+from internal.mission_bridge import (
+    MissionBridgeError,
+    _hash_descriptor,
+    _open_retained_file,
+    _open_verified_file,
+    _private_file,
+    _run_output,
+    _validate_schema,
+)
+from internal.pool import AuthorityLease, Pool, PoolError
+
+
+MAX_WORKFLOW = 64 * 1024 * 1024
+MAX_EXECUTION_IDS = 128
+EXECUTION_SCHEMA = Path(__file__).parents[1] / "schemas/execution-record.schema.json"
+
+
+class ExecutionError(RuntimeError):
+    def __init__(self, code: str, record: Path | None = None):
+        self.code = code
+        self.record = record
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    status: str
+    record: Path
+    request_digest: str
+    diagnostics: dict
+
+
+@dataclass(frozen=True)
+class _WrittenRecord:
+    path: Path
+
+
+def _canonical(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _digest(value) -> str:
+    return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _identifier() -> str:
+    return uuid.uuid4().hex
+
+
+def _execution_environment() -> dict[str, str]:
+    if os.name == "nt":
+        environment = {}
+        for name in ("SystemRoot", "WINDIR", "TEMP", "TMP"):
+            if os.environ.get(name):
+                environment[name] = os.environ[name]
+        environment["PATH"] = os.pathsep.join(
+            (str(Path(environment["SystemRoot"]) / "System32"), str(Path(sys.executable).parent))
+        )
+        return environment
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    if os.environ.get("TMPDIR"):
+        environment["TMPDIR"] = os.environ["TMPDIR"]
+    return environment
+
+
+def _pool(receipt: Path) -> Pool:
+    try:
+        root = receipt.parents[2]
+        metadata = json.loads((root / "pool.json").read_text(encoding="utf-8"))
+        return Pool(root, runtime_version=metadata["runtime_version"])
+    except (OSError, IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExecutionError("unauthorized") from error
+
+
+def _descriptor_bytes(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    size = 0
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, MAX_WORKFLOW + 1 - size))
+        if not chunk:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_WORKFLOW:
+            raise ExecutionError("workflow-identity-mismatch")
+
+
+def _workflow_identity(descriptor: int, digest: str) -> tuple[int, int, int, int, int]:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise ExecutionError("workflow-identity-mismatch")
+    if hasattr(os, "pread"):
+        calculated = hashlib.sha256()
+        offset = 0
+        while chunk := os.pread(descriptor, 64 * 1024, offset):
+            calculated.update(chunk)
+            offset += len(chunk)
+        calculated = calculated.hexdigest()
+    else:
+        calculated = _hash_descriptor(descriptor)
+    after = os.fstat(descriptor)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or not hmac.compare_digest(calculated, digest)
+    ):
+        raise ExecutionError("workflow-identity-mismatch")
+    return (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+
+
+def _sealed_workflow_descriptor(raw: bytes, digest: str) -> int | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    if not (
+        hasattr(os, "memfd_create")
+        and hasattr(os, "MFD_ALLOW_SEALING")
+        and Path("/proc/self/fd").is_dir()
+    ):
+        raise ExecutionError("workflow-identity-mismatch")
+    try:
+        import fcntl
+    except ImportError as error:
+        raise ExecutionError("workflow-identity-mismatch") from error
+
+    seal_names = (
+        "F_ADD_SEALS",
+        "F_GET_SEALS",
+        "F_SEAL_WRITE",
+        "F_SEAL_GROW",
+        "F_SEAL_SHRINK",
+        "F_SEAL_SEAL",
+    )
+    if not all(hasattr(fcntl, name) for name in seal_names):
+        raise ExecutionError("workflow-identity-mismatch")
+    required = (
+        fcntl.F_SEAL_WRITE
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_SEAL
+    )
+    descriptor = None
+    readonly = None
+    try:
+        descriptor = os.memfd_create(
+            "ao2-workflow", getattr(os, "MFD_CLOEXEC", 0) | os.MFD_ALLOW_SEALING
+        )
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("workflow snapshot write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required)
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & required != required:
+            raise OSError("workflow snapshot sealing failed")
+        if not hmac.compare_digest(_hash_descriptor(descriptor), digest):
+            raise ExecutionError("workflow-identity-mismatch")
+        readonly = os.open(f"/proc/self/fd/{descriptor}", os.O_RDONLY)
+        source = os.fstat(descriptor)
+        retained = os.fstat(readonly)
+        if (
+            not stat.S_ISREG(retained.st_mode)
+            or (source.st_dev, source.st_ino) != (retained.st_dev, retained.st_ino)
+            or not hmac.compare_digest(_hash_descriptor(readonly), digest)
+        ):
+            raise ExecutionError("workflow-identity-mismatch")
+        retained_descriptor = readonly
+        readonly = None
+        return retained_descriptor
+    except ExecutionError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ExecutionError("workflow-identity-mismatch") from error
+    except BaseException:
+        raise
+    finally:
+        if readonly is not None:
+            try:
+                os.close(readonly)
+            except BaseException:
+                pass
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+
+
+@contextmanager
+def _retained_workflow(governed: GovernedExecution):
+    source = _private_file(
+        governed.target,
+        (".ao", "governance", "office-pool", "workflows"),
+        governed.workflow_digest,
+    )
+    staged = _private_file(
+        governed.target,
+        (".ao", "governance", "office-pool", "staging"),
+        f"{governed.workflow_digest}-{_identifier()}",
+    )
+    staged_created = False
+    try:
+        with _open_retained_file(source) as source_descriptor:
+            raw = _descriptor_bytes(source_descriptor)
+            if not hmac.compare_digest(
+                _hash_descriptor(source_descriptor), governed.workflow_digest
+            ):
+                raise ExecutionError("workflow-identity-mismatch")
+            _create_private(staged, raw)
+            staged_created = True
+            with _open_retained_file(staged) as created_descriptor:
+                if os.name != "nt":
+                    os.fchmod(created_descriptor, 0o400)
+                    os.fsync(created_descriptor)
+            with _open_retained_file(staged) as snapshot_descriptor:
+                snapshot_identity = _workflow_identity(
+                    snapshot_descriptor, governed.workflow_digest
+                )
+                if os.name != "nt" and stat.S_IMODE(
+                    os.fstat(snapshot_descriptor).st_mode
+                ) != 0o400:
+                    raise ExecutionError("workflow-identity-mismatch")
+                sealed_descriptor = _sealed_workflow_descriptor(
+                    raw, governed.workflow_digest
+                )
+                launch_descriptor = sealed_descriptor or snapshot_descriptor
+
+                def verify_retained() -> None:
+                    try:
+                        if sealed_descriptor is not None:
+                            if not hmac.compare_digest(
+                                _hash_descriptor(sealed_descriptor),
+                                governed.workflow_digest,
+                            ):
+                                raise MissionBridgeError(
+                                    "workflow-identity-mismatch"
+                                )
+                            return
+                        if _workflow_identity(
+                            snapshot_descriptor, governed.workflow_digest
+                        ) != snapshot_identity:
+                            raise MissionBridgeError("workflow-identity-mismatch")
+                    except ExecutionError as error:
+                        raise MissionBridgeError(
+                            "workflow-identity-mismatch"
+                        ) from error
+
+                try:
+                    if os.name == "nt":
+                        launch_path = str(staged.path)
+                    elif sys.platform == "darwin":
+                        launch_path = f"/dev/fd/{launch_descriptor}"
+                    else:
+                        if not Path("/proc/self/fd").is_dir():
+                            raise ExecutionError("execution-launch-failed")
+                        launch_path = f"/proc/self/fd/{launch_descriptor}"
+                    yield launch_path, (launch_descriptor,), verify_retained
+                finally:
+                    if sealed_descriptor is not None:
+                        os.close(sealed_descriptor)
+    except ExecutionError:
+        raise
+    except (MissionBridgeError, OSError, TypeError, ValueError) as error:
+        raise ExecutionError("workflow-identity-mismatch") from error
+    finally:
+        failure = sys.exception()
+        cleanup_error = None
+        if staged_created:
+            try:
+                _unlink_private(staged)
+            except FileNotFoundError:
+                pass
+            except BaseException as error:
+                if failure is None:
+                    cleanup_error = error
+        for private in (staged, source):
+            try:
+                private.close()
+            except BaseException as error:
+                if failure is None and cleanup_error is None:
+                    cleanup_error = error
+        if failure is None and cleanup_error is not None:
+            if isinstance(cleanup_error, Exception):
+                raise ExecutionError("workflow-identity-mismatch") from cleanup_error
+            raise cleanup_error
+
+
+def _ao2_path(receipt: Path, authority: dict, governed: GovernedExecution) -> Path:
+    try:
+        root = receipt.parents[2]
+        runtime_version = json.loads(
+            (root / "pool.json").read_text(encoding="utf-8")
+        )["runtime_version"]
+        if governed.ao2 != {
+            "name": "ao2",
+            "commit": governed.ao2["commit"],
+            "asset": "ao2.exe",
+            "sha256": governed.ao2["sha256"],
+        }:
+            raise ValueError("invalid AO2 identity")
+        return (
+            root
+            / "offices"
+            / authority["office_id"]
+            / "runtime"
+            / "versions"
+            / runtime_version
+            / ("ao2.exe" if os.name == "nt" else "ao2")
+        )
+    except (OSError, IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ExecutionError("ao2-identity-mismatch") from error
+
+
+@contextmanager
+def _retained_windows_project(project):
+    if os.name != "nt":
+        yield
+        return
+    from internal.mission_bridge import _open_windows_directory
+    from internal.windows_identity import _kernel32
+
+    handle = _open_windows_directory(project.project_path, share_write=False)
+    try:
+        yield
+    finally:
+        _kernel32().CloseHandle(handle)
+
+
+def _diagnostics(stdout: bytes, run_id: str) -> dict:
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        try:
+            pairs = [
+                line.split("=", 1)
+                for line in stdout.decode("utf-8").splitlines()
+            ]
+            if any(len(pair) != 2 for pair in pairs):
+                raise ValueError("malformed native diagnostics")
+            value = dict(pairs)
+            if (
+                len(pairs) != len(value)
+                or set(value)
+                != {
+                    "run_id",
+                    "status",
+                    "run_record",
+                    "evidence_dir",
+                    "replay_state",
+                    "evidence_pack",
+                    "report",
+                }
+                or any(type(member) is not str for member in value.values())
+            ):
+                raise ValueError("invalid native diagnostics")
+            status = {
+                "Accepted": "accepted",
+                "Rejected": "rejected",
+                "Failed": "failed",
+            }.get(value["status"])
+        except (AttributeError, TypeError, UnicodeError, ValueError) as error:
+            raise ExecutionError("invalid-execution-readback") from error
+    except (AttributeError, TypeError, UnicodeError, ValueError) as error:
+        raise ExecutionError("invalid-execution-readback") from error
+    else:
+        if (
+            type(value) is not dict
+            or set(value) != {"status", "run_id"}
+            or type(value.get("status")) is not str
+            or type(value.get("run_id")) is not str
+        ):
+            raise ExecutionError("invalid-execution-readback")
+        status = value["status"]
+    if value.get("run_id") != run_id or status not in {
+        "accepted",
+        "rejected",
+        "failed",
+    }:
+        raise ExecutionError("invalid-execution-readback")
+    return {"status": status, "run_id": run_id}
+
+
+def _artifact_digest(governed: GovernedExecution, name: str) -> str | None:
+    artifact = governed.producer_artifacts[name]
+    return artifact["artifact_sha256"] if artifact is not None else None
+
+
+def _create_record_descriptor(record) -> int:
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        from internal.windows_identity import (
+            _BY_HANDLE_FILE_INFORMATION,
+            _FILE_ATTRIBUTE_DIRECTORY,
+            _FILE_ATTRIBUTE_REPARSE_POINT,
+            _FILE_SHARE_READ,
+            _INVALID_HANDLE_VALUE,
+            _final_path,
+            _kernel32,
+            _native_path,
+        )
+        from internal.windows_paths import canonical_windows_path
+
+        if not record.directory.handles:
+            raise ValueError("retained record directory handle required")
+        library = _kernel32()
+        parent_handle = record.directory.handles[-1]
+        retained_parent = _final_path(library, parent_handle)
+        handle = library.CreateFileW(
+            _native_path(canonical_windows_path(str(record.path))),
+            0x80000000 | 0x40000000,
+            _FILE_SHARE_READ,
+            None,
+            1,
+            0x00200000,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            code = ctypes.get_last_error()
+            if code in {80, 183}:
+                raise FileExistsError(code, "execution record already exists")
+            raise ctypes.WinError(code)
+        try:
+            information = _BY_HANDLE_FILE_INFORMATION()
+            if not library.GetFileInformationByHandle(
+                handle, ctypes.byref(information)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            created_path = _final_path(library, handle)
+            if (
+                information.file_attributes
+                & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT)
+                or information.number_of_links != 1
+                or created_path.parent != retained_parent
+                or _final_path(library, parent_handle) != retained_parent
+            ):
+                raise ValueError("unsafe created execution record")
+            descriptor = msvcrt.open_osfhandle(
+                handle, os.O_RDWR | getattr(os, "O_BINARY", 0)
+            )
+            handle = None
+            return descriptor
+        finally:
+            if handle is not None:
+                library.CloseHandle(handle)
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(
+        record.name,
+        flags,
+        0o600,
+        dir_fd=record.directory.directory_descriptor,
+    )
+
+
+def _record_identity(information, expected_size: int | None = None) -> tuple:
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or information.st_nlink != 1
+        or (expected_size is not None and information.st_size != expected_size)
+    ):
+        raise ValueError("unsafe execution record identity")
+    return (
+        information.st_dev,
+        information.st_ino,
+        information.st_mode,
+        information.st_nlink,
+        information.st_size,
+        information.st_mtime_ns,
+        information.st_ctime_ns,
+    )
+
+
+def _record_path_identity(record, expected_size: int) -> tuple | None:
+    if os.name == "nt":
+        # The created handle denies write and delete sharing until verification
+        # completes, while every ancestor directory handle denies delete sharing.
+        return None
+    information = os.stat(
+        record.name,
+        dir_fd=record.directory.directory_descriptor,
+        follow_symlinks=False,
+    )
+    return _record_identity(information, expected_size)
+
+
+def _write_record(
+    project,
+    authority: dict,
+    authority_bytes: bytes,
+    governed: GovernedExecution,
+    *,
+    phase: str,
+    diagnostics: dict,
+    failure_code: str | None,
+    exit_code: int | None,
+    authenticate=None,
+) -> _WrittenRecord:
+    workflow_path = project.joinpath(
+        ".ao",
+        "governance",
+        "office-pool",
+        "workflows",
+        governed.workflow_digest,
+    )
+    value = {
+        "schema_version": 1,
+        "phase": phase,
+        "request_digest": governed.request_digest,
+        "mission_id": governed.mission.mission_id,
+        "objective_digest": governed.mission.objective_digest,
+        "route_digest": governed.route.as_record()["decision_digest"],
+        "authority_digest": hashlib.sha256(authority_bytes).hexdigest(),
+        "office_id": authority["office_id"],
+        "generation": authority["generation"],
+        "project_path": str(project.project_path),
+        "target_path": str(project.project_path),
+        "workflow_path": str(workflow_path),
+        "workflow_sha256": governed.workflow_digest,
+        "run_id": governed.run_id,
+        "blueprint_digest": _artifact_digest(governed, "ao-blueprint"),
+        "atlas_digest": _artifact_digest(governed, "ao-atlas"),
+        "forge_digest": _artifact_digest(governed, "ao-forge"),
+        "covenant_digest": _artifact_digest(governed, "ao-covenant"),
+        "ao2_sha256": governed.ao2["sha256"],
+        "diagnostics": diagnostics,
+        "exit_code": exit_code,
+        "failure_code": failure_code,
+    }
+    record = None
+    descriptor = None
+    try:
+        candidate = {
+            **value,
+            "execution_id": "execution-" + "0" * 32,
+            "record_digest": "0" * 64,
+        }
+        _validate_schema(candidate, EXECUTION_SCHEMA)
+        for _attempt in range(MAX_EXECUTION_IDS):
+            value["execution_id"] = "execution-" + _identifier()
+            value["record_digest"] = _digest(
+                {
+                    name: member
+                    for name, member in value.items()
+                    if name != "record_digest"
+                }
+            )
+            _validate_schema(value, EXECUTION_SCHEMA)
+            expected = _canonical(value) + b"\n"
+            record = _private_file(
+                project,
+                (".ao", "evidence", "office-pool"),
+                value["execution_id"] + ".json",
+            )
+            try:
+                descriptor = _create_record_descriptor(record)
+            except FileExistsError:
+                record.close()
+                record = None
+                continue
+            created = _record_identity(os.fstat(descriptor))
+            view = memoryview(expected)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("execution record write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+            if record.directory.directory_descriptor is not None:
+                os.fsync(record.directory.directory_descriptor)
+            break
+        else:
+            raise ExecutionError("recovery-required")
+
+        before = _record_identity(os.fstat(descriptor), len(expected))
+        if created[:4] != before[:4]:
+            raise ValueError("created execution record identity changed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, len(expected) + 1)
+        after = _record_identity(os.fstat(descriptor), len(expected))
+        if before != after:
+            raise ValueError("execution record changed during readback")
+        path_identity = _record_path_identity(record, len(expected))
+        if path_identity is not None and path_identity != after:
+            raise ValueError("execution record path identity changed")
+        readback = json.loads(raw)
+        _validate_schema(readback, EXECUTION_SCHEMA)
+        digest_value = {
+            name: member
+            for name, member in readback.items()
+            if name != "record_digest"
+        }
+        if (
+            not hmac.compare_digest(readback["record_digest"], _digest(digest_value))
+            or raw != _canonical(readback) + b"\n"
+            or raw != expected
+        ):
+            raise ValueError("execution record readback mismatch")
+        if diagnostics.get("status") == "accepted":
+            if not callable(authenticate):
+                raise ValueError("missing execution authenticator")
+
+            def validated():
+                return {
+                    "witness_id": governed.witness_id,
+                    "authority_digest": governed.authority_digest,
+                    "request_digest": governed.request_digest,
+                    "record": readback,
+                    "execution_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+
+            try:
+                authenticate(validated)
+            except PoolError as error:
+                raise ExecutionError("recovery-required", record.path) from error
+        return _WrittenRecord(record.path)
+    except ExecutionError:
+        raise
+    except (
+        MissionBridgeError,
+        OSError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ExecutionError(
+            "recovery-required", None if record is None else record.path
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if record is not None:
+            record.close()
+
+
+def _process_error_code(error: MissionBridgeError) -> str:
+    if error.code == "workflow-identity-mismatch":
+        return error.code
+    return {
+        "timeout": "execution-timeout",
+        "output-too-large": "execution-output-too-large",
+        "failed": "execution-failed",
+    }.get(error.reason, "execution-launch-failed")
+
+
+def _execute_governed(
+    receipt, lease, governed, timeout_seconds, authenticate
+) -> ExecutionResult:
+    executable_path = _ao2_path(receipt, lease.authority, governed)
+    try:
+        executable_manager = _open_verified_file(
+            executable_path, governed.ao2["sha256"]
+        )
+        with (
+            executable_manager as executable,
+            _retained_workflow(governed) as workflow,
+            _retained_windows_project(governed.target),
+        ):
+            arguments = [
+                "run",
+                workflow[0],
+                "--target",
+                ".",
+                "--run-id",
+                governed.run_id,
+            ]
+            try:
+                stdout = _run_output(
+                    arguments,
+                    governed.target,
+                    executable,
+                    timeout_seconds=timeout_seconds,
+                    environment=_execution_environment(),
+                    retained_descriptors=workflow[1],
+                    retained_verifier=workflow[2],
+                )
+                diagnostics = _diagnostics(stdout, governed.run_id)
+            except (ExecutionError, MissionBridgeError) as error:
+                code = (
+                    error.code
+                    if isinstance(error, ExecutionError)
+                    else _process_error_code(error)
+                )
+                record = _write_record(
+                    governed.target,
+                    lease.authority,
+                    lease.authority_bytes,
+                    governed,
+                    phase="failed",
+                    diagnostics={},
+                    failure_code=code,
+                    exit_code=None,
+                )
+                raise ExecutionError(code, record.path) from error
+    except ExecutionError:
+        raise
+    except MissionBridgeError as error:
+        raise ExecutionError("ao2-identity-mismatch") from error
+    written = _write_record(
+        governed.target,
+        lease.authority,
+        lease.authority_bytes,
+        governed,
+        phase="completed",
+        diagnostics=diagnostics,
+        failure_code=None,
+        exit_code=0,
+        authenticate=authenticate,
+    )
+    return ExecutionResult(
+        diagnostics["status"],
+        written.path,
+        governed.request_digest,
+        diagnostics,
+    )
+
+
+def execute(
+    receipt: Path,
+    envelope: Path,
+    *,
+    timeout_seconds: int = 30,
+    _lease: AuthorityLease | None = None,
+    _authenticate=None,
+) -> ExecutionResult:
+    if (
+        not isinstance(receipt, Path)
+        or not isinstance(envelope, Path)
+        or type(timeout_seconds) is not int
+        or not 1 <= timeout_seconds <= 30
+    ):
+        raise ExecutionError("invalid-request")
+    try:
+        pool = _pool(receipt)
+        if _lease is None:
+            return pool.execute_governance_witness(
+                receipt, envelope, timeout_seconds=timeout_seconds
+            )
+        if type(_lease) is not AuthorityLease or not callable(_authenticate):
+            raise ExecutionError("invalid-request")
+        governed = _consume_witness(_lease, envelope)
+        try:
+            return _execute_governed(
+                receipt, _lease, governed, timeout_seconds, _authenticate
+            )
+        finally:
+            governed.target.close()
+    except ExecutionError:
+        raise
+    except GovernanceError as error:
+        raise ExecutionError(error.code) from error
+    except PoolError as error:
+        raise ExecutionError("unauthorized") from error

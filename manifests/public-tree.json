@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "tracked_root_files": [
+    ".gitignore",
+    ".env.example",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "README-FIRST.md",
+    "SECURITY.md"
+  ],
+  "tracked_roots": [
+    "bin",
+    "cmd",
+    "internal",
+    "schemas",
+    "skills",
+    "scripts",
+    "tests",
+    "docs",
+    "manifests",
+    "packaging"
+  ],
+  "excluded_roots": [
+    ".ao",
+    ".ao-mission",
+    ".local",
+    ".worktrees",
+    "build",
+    "dist",
+    "offices",
+    "operator-secrets",
+    "runtime",
+    "support-bundles",
+    "updates"
+  ],
+  "excluded_names": [
+    ".env",
+    "pool.json",
+    ".pool.lock"
+  ],
+  "excluded_patterns": [
+    "*.receipt.json",
+    "recovery-key*",
+    "*.pem",
+    "*.key",
+    "*.p12"
+  ]
+}

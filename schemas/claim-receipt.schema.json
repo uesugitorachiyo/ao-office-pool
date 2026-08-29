@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Private claim authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority_id",
+    "office_id",
+    "generation",
+    "holder_digest",
+    "task_digest",
+    "project_path",
+    "project_volume",
+    "project_file_id",
+    "mode"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "authority_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "office_id": {"enum": ["O1", "O2", "O3", "O4", "O5"]},
+    "generation": {"type": "integer", "minimum": 1},
+    "holder_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "task_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "project_path": {"type": "string", "minLength": 1},
+    "project_volume": {"type": "integer", "minimum": 0},
+    "project_file_id": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["conversation", "pinned"]}
+  }
+}

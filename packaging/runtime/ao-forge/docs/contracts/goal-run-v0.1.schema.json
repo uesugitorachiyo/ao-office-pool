@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/uesugitorachiyo/ao-forge/docs/contracts/goal-run-v0.1.schema.json",
+  "title": "AO Forge GoalRun v0.1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "goal_id",
+    "repo",
+    "objective",
+    "acceptance_criteria",
+    "allowed_scope",
+    "stop_conditions",
+    "current_phase",
+    "next_task",
+    "last_verified_at",
+    "continuation_prompt",
+    "loop_owner",
+    "next_action_guard"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "ao.forge.goal-run.v0.1"
+    },
+    "goal_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$"
+    },
+    "repo": {
+      "type": "string",
+      "minLength": 1
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "allowed_scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "stop_conditions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "current_phase": {
+      "type": "string",
+      "enum": [
+        "planning",
+        "implementation",
+        "verification",
+        "blocked",
+        "backoff",
+        "stopped",
+        "complete"
+      ]
+    },
+    "next_task": {
+      "type": "string",
+      "minLength": 1
+    },
+    "last_verified_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "continuation_prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "loop_owner": {
+      "type": "object",
+      "required": ["state_owner", "executor", "scheduler"],
+      "properties": {
+        "state_owner": {
+          "const": "ao-forge"
+        },
+        "executor": {
+          "type": "string",
+          "enum": ["ao2-pulse", "codex", "operator"]
+        },
+        "scheduler": {
+          "type": "string",
+          "enum": ["external-scheduler", "operator", "none"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "next_action_guard": {
+      "type": "object",
+      "required": [
+        "must_read_latest_goal_run",
+        "must_match_allowed_scope",
+        "must_satisfy_acceptance_criteria",
+        "on_mismatch"
+      ],
+      "properties": {
+        "must_read_latest_goal_run": {
+          "const": true
+        },
+        "must_match_allowed_scope": {
+          "const": true
+        },
+        "must_satisfy_acceptance_criteria": {
+          "const": true
+        },
+        "on_mismatch": {
+          "type": "string",
+          "enum": ["backoff_or_stop"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "last_iteration": {
+      "type": "object",
+      "required": ["status", "summary", "evidence"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["not_started", "passed", "failed", "blocked", "backoff", "stopped"]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "path"],
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

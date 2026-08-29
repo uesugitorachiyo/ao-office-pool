@@ -1,0 +1,48 @@
+# GitHub public content lives only in the roots and root files documented by
+# manifests/public-tree.json.
+
+# Local mission, handoff, and operator material: never publish
+/.local/
+/.ao/
+/.ao-mission/
+/.worktrees/
+/.github/
+/.superpowers/
+/docs/superpowers/
+/.env
+/.env.*
+!/.env.example
+
+# Generated pool and runtime state: never publish
+/pool.json
+/.pool.lock
+/offices/
+/operator-secrets/
+/runtime/
+/updates/
+/support-bundles/
+
+# Credentials and private receipts: never publish
+*.receipt.json
+recovery-key*
+*.pem
+*.key
+*.p12
+
+# Build and test output: rebuild locally, never publish
+/build/
+/dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local operating-system and editor files: never publish
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+Thumbs.db
+.idea/
+.vscode/

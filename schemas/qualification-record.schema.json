@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Hash-bound AO Office Pool qualification promotion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "runtime_version", "runtime_sha256", "runtime_state",
+    "qualification_state", "components_sha256", "project_identity_sha256",
+    "authority_sha256", "mission_id", "mission_sha256", "witness_id",
+    "governance_sha256", "execution_id", "execution_sha256",
+    "requirements_sha256", "critical_matrix_sha256", "semantic_fingerprint",
+    "assertion_count", "record_digest"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "runtime_version": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "minLength": 1, "maxLength": 128},
+    "runtime_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "runtime_state": {"const": "activated"},
+    "qualification_state": {"enum": ["candidate", "pilot-qualified", "release-qualified"]},
+    "components_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "project_identity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "authority_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "mission_id": {"type": "string", "pattern": "^mission-[0-9a-f]{16}$"},
+    "mission_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "witness_id": {"type": "string", "pattern": "^witness-[0-9a-f]{32}$"},
+    "governance_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"type": "string", "pattern": "^execution-[0-9a-f]{32}$"},
+    "execution_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "requirements_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "critical_matrix_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "semantic_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "assertion_count": {"const": 19},
+    "record_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Independently anchored AO2 runtime package",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name", "version", "commit", "asset", "sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "name": {"const": "ao2"},
+    "version": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "minLength": 1, "maxLength": 128},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "asset": {"const": "ao2.exe"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
