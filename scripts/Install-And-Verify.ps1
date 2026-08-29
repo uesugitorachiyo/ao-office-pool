@@ -1,12 +1,12 @@
 [CmdletBinding()]
 param(
   [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA '.ao-office-pool-private\AOOfficePool'),
-  [string]$DownloadRoot = (Join-Path $env:LOCALAPPDATA '.ao-office-pool-private\downloads-v0.1.1')
+  [string]$DownloadRoot = (Join-Path $env:LOCALAPPDATA '.ao-office-pool-private\downloads-v0.1.2')
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$ArchiveName = 'ao-office-pool-v0.1.1-windows-x86_64.zip'
+$ArchiveName = 'ao-office-pool-v0.1.2-windows-x86_64.zip'
 $SidecarName = "$ArchiveName.sha256"
 $ExpectedOffices = @('O1', 'O2', 'O3', 'O4', 'O5')
 $receipt = $null
@@ -368,7 +368,7 @@ function Read-TrustedPublicContract {
     if (-not (Test-ExactJsonInteger $contract.schema_version) -or [long]$contract.schema_version -ne 1 -or
         $contract.repository -isnot [string] -or $contract.repository -cne 'uesugitorachiyo/ao-office-pool' -or
         $contract.visibility -isnot [string] -or $contract.visibility -cne 'public' -or
-        $contract.tag -isnot [string] -or $contract.tag -cne 'v0.1.1' -or
+        $contract.tag -isnot [string] -or $contract.tag -cne 'v0.1.2' -or
         $contract.source_commit -isnot [string] -or $contract.source_commit -cnotmatch '^[0-9a-f]{40}$' -or
         $contract.source_commit -ceq ('0' * 40) -or
         $contract.architecture -isnot [string] -or $contract.architecture -cne 'windows-x86_64' -or

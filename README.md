@@ -1,4 +1,4 @@
-# AO Office Pool v0.1.1
+# AO Office Pool v0.1.2
 
 AO Office Pool coordinates five isolated offices, O1 through O5, over one
 immutable AO Stack runtime. It supports Windows x86-64 only; macOS and Linux
@@ -32,13 +32,13 @@ Set-Location .\ao-office-pool
 pwsh -File .\scripts\Install-And-Verify.ps1
 ```
 
-That one script acquires the two public v0.1.1 assets, independently checks the
+That one script acquires the two public v0.1.2 assets, independently checks the
 release contract, archive, and sidecar, installs into a new private local root,
 verifies the installed bytes, creates a disposable Git project, and exercises
 an O1 claim/resume/release lifecycle. The assets are:
 
-- `ao-office-pool-v0.1.1-windows-x86_64.zip`
-- `ao-office-pool-v0.1.1-windows-x86_64.zip.sha256`
+- `ao-office-pool-v0.1.2-windows-x86_64.zip`
+- `ao-office-pool-v0.1.2-windows-x86_64.zip.sha256`
 
 Exact success ends with a self-contained `Launcher:` command, the command list,
 and `READY FOR USE`. Any incomplete or unsafe result exits nonzero and writes a
@@ -54,7 +54,7 @@ After cloning the repository, paste this prompt into a Windows AI task opened
 in the clone:
 
 ```text
-Install and verify AO Office Pool v0.1.1 for this Windows user.
+Install and verify AO Office Pool v0.1.2 for this Windows user.
 
 Read README.md and docs/AI_OPERATOR_RUNBOOK.md completely before acting. Work
 only in this checkout and in the installer-created local paths. Confirm this is

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/uesugitorachiyo/ao-office-pool/schemas/public-release.schema.json",
-  "title": "AO Office Pool public v0.1.1 release contract",
+  "title": "AO Office Pool public v0.1.2 release contract",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -17,7 +17,7 @@
     "schema_version": {"type": "integer", "const": 1},
     "repository": {"const": "uesugitorachiyo/ao-office-pool"},
     "visibility": {"const": "public"},
-    "tag": {"const": "v0.1.1"},
+    "tag": {"const": "v0.1.2"},
     "source_commit": {
       "type": "string",
       "minLength": 40,
@@ -36,7 +36,7 @@
           "additionalProperties": false,
           "required": ["name", "size", "sha256"],
           "properties": {
-            "name": {"const": "ao-office-pool-v0.1.1-windows-x86_64.zip"},
+            "name": {"const": "ao-office-pool-v0.1.2-windows-x86_64.zip"},
             "size": {"type": "integer", "minimum": 1},
             "sha256": {
               "type": "string",
@@ -52,7 +52,7 @@
           "additionalProperties": false,
           "required": ["name", "size", "sha256"],
           "properties": {
-            "name": {"const": "ao-office-pool-v0.1.1-windows-x86_64.zip.sha256"},
+            "name": {"const": "ao-office-pool-v0.1.2-windows-x86_64.zip.sha256"},
             "size": {"type": "integer", "minimum": 1},
             "sha256": {
               "type": "string",

@@ -1,11 +1,12 @@
-# AO Office Pool v0.1.1 maintainer publication
+# AO Office Pool v0.1.2 maintainer publication
 
 This is an owner-only release procedure. End users should follow `README.md`.
 Do not put credentials, authenticated headers, local absolute paths, audit
 receipts, or raw GitHub administration output in Git.
 
-`v0.1.0 is unsupported and superseded` by v0.1.1. Preserve its tag and asset
-bytes. Change only its release title and description after v0.1.1 exists.
+`v0.1.0` and `v0.1.1` are unsupported and superseded by v0.1.2. Preserve their
+tags and asset bytes. Change only their release titles and descriptions after
+v0.1.2 exists.
 
 ## Required environment
 
@@ -79,7 +80,7 @@ $ComponentRoot = (Resolve-Path -LiteralPath `
 $DetachedRoot = Join-Path $env:LOCALAPPDATA "AOOfficePoolSource-$SourceCommit"
 $BuildA = Join-Path $env:LOCALAPPDATA "AOOfficePoolBuildA-$SourceCommit"
 $BuildB = Join-Path $env:LOCALAPPDATA "AOOfficePoolBuildB-$SourceCommit"
-$AssetName = 'ao-office-pool-v0.1.1-windows-x86_64.zip'
+$AssetName = 'ao-office-pool-v0.1.2-windows-x86_64.zip'
 
 git worktree add --detach $DetachedRoot $SourceCommit
 New-Item -ItemType Directory -Path $BuildA,$BuildB | Out-Null
@@ -144,7 +145,7 @@ native suite, `git diff --check`, and require a clean worktree.
 
 ## 4. Private audit evidence
 
-Keep audit evidence only under ignored `.local/publication-v0.1.1/`. Inventory
+Keep audit evidence only under ignored `.local/publication-v0.1.2/`. Inventory
 every existing release asset by name, size, and SHA-256. Extract archives
 without execution and scan each tree. Record v0.1.0 as unsupported because its
 old package lacks the final public licensing payload.
@@ -170,9 +171,9 @@ Immediately before mutation, repeat the clean-source, compiler, current-tree,
 history, contract, deterministic-asset, and audit gates.
 
 1. Push the reviewed default branch containing the finalized contract commit.
-2. Create and push an annotated `v0.1.1` tag at `$SourceCommit`, not at the
+2. Create and push an annotated `v0.1.2` tag at `$SourceCommit`, not at the
    later metadata-only commit.
-3. Create a non-draft, non-prerelease v0.1.1 release with exactly the archive
+3. Create a non-draft, non-prerelease v0.1.2 release with exactly the archive
    and sidecar.
 4. Perform release readback: tag peel target, release state, exact asset names,
    sizes, and freshly downloaded SHA-256 values.
@@ -186,7 +187,7 @@ history, contract, deterministic-asset, and audit gates.
 
 The required protection gate is `secret scanning and push protection`.
 
-Stop on any readback drift. Never move the tag or replace published v0.1.1
+Stop on any readback drift. Never move the tag or replace published v0.1.2
 asset bytes.
 
 ## 6. Unauthenticated Windows acceptance

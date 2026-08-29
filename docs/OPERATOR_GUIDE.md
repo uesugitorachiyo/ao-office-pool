@@ -1,9 +1,9 @@
-# AO Office Pool v0.1.1 operator guide
+# AO Office Pool v0.1.2 operator guide
 
 Begin with the public [installation block](../README.md#install). The supported
 entry point is `scripts/Install-And-Verify.ps1`; it acquires and authenticates
-`ao-office-pool-v0.1.1-windows-x86_64.zip` and
-`ao-office-pool-v0.1.1-windows-x86_64.zip.sha256`, installs, verifies, and
+`ao-office-pool-v0.1.2-windows-x86_64.zip` and
+`ao-office-pool-v0.1.2-windows-x86_64.zip.sha256`, installs, verifies, and
 proves an all-free O1 lifecycle before reporting `READY FOR USE`.
 
 The normal user path needs no credential or authenticated API. Maintainers with

@@ -45,7 +45,7 @@ class BootstrapContractTests(unittest.TestCase):
         for phrase in (
             "Windows x86-64",
             "local NTFS",
-            "ao-office-pool-v0.1.1-windows-x86_64.zip",
+            "ao-office-pool-v0.1.2-windows-x86_64.zip",
             "Install-And-Verify.ps1",
             "Install-AOOfficePool.ps1",
             "Verify-AOOfficePool.ps1",

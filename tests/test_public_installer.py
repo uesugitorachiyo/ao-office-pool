@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-ARCHIVE_NAME = "ao-office-pool-v0.1.1-windows-x86_64.zip"
+ARCHIVE_NAME = "ao-office-pool-v0.1.2-windows-x86_64.zip"
 SIDECAR_NAME = ARCHIVE_NAME + ".sha256"
 
 
@@ -45,7 +45,7 @@ class PublicAcquisitionTests(unittest.TestCase):
             "schema_version": 1,
             "repository": "uesugitorachiyo/ao-office-pool",
             "visibility": "public",
-            "tag": "v0.1.1",
+            "tag": "v0.1.2",
             "source_commit": "1" * 40,
             "architecture": "windows-x86_64",
             "assets": [
@@ -75,7 +75,7 @@ class PublicAcquisitionTests(unittest.TestCase):
                 "size": identity["size"],
                 "browser_download_url": (
                     "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/"
-                    f"v0.1.1/{identity['name']}"
+                    f"v0.1.2/{identity['name']}"
                 ),
             }
             for identity in contract["assets"]
@@ -87,7 +87,7 @@ class PublicAcquisitionTests(unittest.TestCase):
                 "visibility": "public",
             },
             "release": {
-                "tag_name": "v0.1.1",
+                "tag_name": "v0.1.2",
                 "draft": False,
                 "prerelease": False,
                 "assets": assets,
@@ -191,6 +191,20 @@ class PublicAcquisitionTests(unittest.TestCase):
         self.assertEqual(
             [ARCHIVE_NAME, SIDECAR_NAME],
             [path.name for path in self.destination.iterdir()],
+        )
+
+    def test_accepts_official_github_release_asset_redirect_host(self):
+        fixture = self.metadata_fixture()
+        for download in fixture["downloads"]:
+            download["final_url"] = (
+                "https://release-assets.githubusercontent.com/github-production-release-asset/"
+                f"123456/{download['name']}"
+            )
+        result = self.run_public_acquisition(fixture=fixture)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            sorted((ARCHIVE_NAME, SIDECAR_NAME)),
+            sorted(path.name for path in self.destination.iterdir()),
         )
 
     def test_public_acquisition_never_requires_or_emits_github_token(self):
@@ -338,7 +352,7 @@ class PublicAcquisitionTests(unittest.TestCase):
             lambda v: v["repository"].update(full_name="other/repo"),
             lambda v: v["repository"].update(private=True),
             lambda v: v["repository"].update(visibility="private"),
-            lambda v: v["release"].update(tag_name="v0.1.2"),
+            lambda v: v["release"].update(tag_name="v0.1.3"),
             lambda v: v["release"].update(draft=True),
             lambda v: v["release"].update(prerelease=True),
             lambda v: v["release"]["assets"].pop(),
@@ -428,13 +442,15 @@ class PublicAcquisitionTests(unittest.TestCase):
 
     def test_rejects_download_url_and_redirect_identity_drift(self):
         urls = (
-            "http://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.1/" + ARCHIVE_NAME,
-            "https://user@github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.1/" + ARCHIVE_NAME,
-            "https://github.com:444/uesugitorachiyo/ao-office-pool/releases/download/v0.1.1/" + ARCHIVE_NAME,
+            "http://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
+            "https://user@github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
+            "https://github.com:444/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
             "https://example.invalid/" + ARCHIVE_NAME,
-            "https://github.com/other/repo/releases/download/v0.1.1/" + ARCHIVE_NAME,
-            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
-            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.1/renamed.zip",
+            "https://objects.githubusercontent.com/release-assets/" + ARCHIVE_NAME,
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123456/" + ARCHIVE_NAME,
+            "https://github.com/other/repo/releases/download/v0.1.2/" + ARCHIVE_NAME,
+            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.3/" + ARCHIVE_NAME,
+            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/renamed.zip",
         )
         for url in urls:
             with self.subTest(url=url):
@@ -443,6 +459,7 @@ class PublicAcquisitionTests(unittest.TestCase):
                 self.assert_rejected(fixture=fixture)
         for url in (
             "https://example.invalid/" + ARCHIVE_NAME,
+            "https://release-assets.githubusercontent.com.example.invalid/x/" + ARCHIVE_NAME,
             "http://objects.githubusercontent.com/x/" + ARCHIVE_NAME,
             "https://user@objects.githubusercontent.com/x/" + ARCHIVE_NAME,
             "https://objects.githubusercontent.com:444/x/" + ARCHIVE_NAME,
@@ -463,7 +480,7 @@ class PublicAcquisitionTests(unittest.TestCase):
             ("schema_version", True),
             ("repository", "other/repo"),
             ("visibility", "private"),
-            ("tag", "v0.1.2"),
+            ("tag", "v0.1.3"),
             ("source_commit", "0" * 40),
             ("source_commit", "A" * 40),
             ("architecture", "linux-x86_64"),
@@ -922,8 +939,8 @@ $ErrorActionPreference='Stop'
 if ($env:AO_T4_FAIL_EVENT -ceq 'acquire') { exit 7 }
 Add-Content -LiteralPath $env:AO_T4_EVENT_LOG -Value 'acquire'
 New-Item -ItemType Directory -Path $Destination | Out-Null
-Copy-Item -LiteralPath $env:AO_T4_ARCHIVE -Destination (Join-Path $Destination 'ao-office-pool-v0.1.1-windows-x86_64.zip')
-Copy-Item -LiteralPath $env:AO_T4_SIDECAR -Destination (Join-Path $Destination 'ao-office-pool-v0.1.1-windows-x86_64.zip.sha256')
+Copy-Item -LiteralPath $env:AO_T4_ARCHIVE -Destination (Join-Path $Destination 'ao-office-pool-v0.1.2-windows-x86_64.zip')
+Copy-Item -LiteralPath $env:AO_T4_SIDECAR -Destination (Join-Path $Destination 'ao-office-pool-v0.1.2-windows-x86_64.zip.sha256')
 [pscustomobject]@{mode='public'} | ConvertTo-Json -Compress
 """,
             encoding="utf-8",
@@ -946,7 +963,7 @@ Copy-Item -LiteralPath $env:AO_T4_SIDECAR -Destination (Join-Path $Destination '
                     "schema_version": 1,
                     "repository": "uesugitorachiyo/ao-office-pool",
                     "visibility": "public",
-                    "tag": "v0.1.1",
+                    "tag": "v0.1.2",
                     "source_commit": "1" * 40,
                     "architecture": "windows-x86_64",
                     "assets": assets,

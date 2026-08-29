@@ -9,11 +9,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:Repository = 'uesugitorachiyo/ao-office-pool'
-$script:Tag = 'v0.1.1'
+$script:Tag = 'v0.1.2'
 $script:Architecture = 'windows-x86_64'
 $script:AssetNames = @(
-  'ao-office-pool-v0.1.1-windows-x86_64.zip',
-  'ao-office-pool-v0.1.1-windows-x86_64.zip.sha256'
+  'ao-office-pool-v0.1.2-windows-x86_64.zip',
+  'ao-office-pool-v0.1.2-windows-x86_64.zip.sha256'
 )
 
 Add-Type -TypeDefinition @'
@@ -257,12 +257,14 @@ function Assert-DownloadUri {
   if (
     -not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or -not $uri.IsDefaultPort -or
     -not [string]::IsNullOrEmpty($uri.UserInfo) -or
-    @('github.com', 'objects.githubusercontent.com') -cnotcontains $uri.Host -or
+    @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com') -cnotcontains $uri.Host -or
     -not $uri.AbsolutePath.EndsWith('/' + $Name, [StringComparison]::Ordinal)
   ) { throw 'download URI is invalid' }
-  if ($RequireGitHubPath -and $uri.Host -ceq 'github.com') {
+  if ($RequireGitHubPath) {
     $expected = '/' + $script:Repository + '/releases/download/' + $script:Tag + '/' + $Name
-    if ($uri.AbsolutePath -cne $expected) { throw 'download URI is invalid' }
+    if ($uri.Host -cne 'github.com' -or $uri.AbsolutePath -cne $expected) {
+      throw 'download URI is invalid'
+    }
   }
   return $uri
 }
