@@ -1,9 +1,16 @@
 import hashlib
 import json
 import re
+import shutil
+import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+
+from scripts.verify_bootstrap_contract import (
+    verify_bootstrap_tree,
+    verify_public_release_contract,
+)
 
 try:
     import jsonschema
@@ -20,6 +27,111 @@ ASSET_NAMES = [
 
 
 class PublicReleaseContractTests(unittest.TestCase):
+    def public_asset_fixture(self, root):
+        asset_root = root / "assets"
+        asset_root.mkdir()
+        archive = asset_root / ASSET_NAMES[0]
+        archive.write_bytes(b"public archive\n")
+        archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        sidecar = asset_root / ASSET_NAMES[1]
+        sidecar.write_bytes(f"{archive_digest}  {archive.name}\n".encode("ascii"))
+        contract = self.valid_contract_fixture()
+        contract["assets"] = [
+            {
+                "name": archive.name,
+                "size": archive.stat().st_size,
+                "sha256": archive_digest,
+            },
+            {
+                "name": sidecar.name,
+                "size": sidecar.stat().st_size,
+                "sha256": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+            },
+        ]
+        contract_path = root / "public-release.json"
+        contract_path.write_text(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return contract_path, asset_root, archive, sidecar
+
+    def test_public_release_verifier_binds_exact_archive_and_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract, asset_root, archive, sidecar = self.public_asset_fixture(root)
+
+            result = verify_public_release_contract(contract, asset_root)
+
+            self.assertEqual(result["source_commit"], "1" * 40)
+            self.assertEqual(
+                [asset["name"] for asset in result["assets"]], ASSET_NAMES
+            )
+            self.assertEqual(result["assets"][0]["size"], archive.stat().st_size)
+            self.assertEqual(result["assets"][1]["size"], sidecar.stat().st_size)
+
+    def test_public_release_verifier_rejects_asset_and_sidecar_drift(self):
+        for label, mutate in (
+            ("archive-bytes", lambda archive, sidecar: archive.write_bytes(b"drift")),
+            (
+                "sidecar-semantics",
+                lambda archive, sidecar: sidecar.write_text(
+                    "0" * 64 + f"  {archive.name}\n", encoding="ascii"
+                ),
+            ),
+            (
+                "extra-asset",
+                lambda archive, sidecar: (archive.parent / "extra.bin").write_bytes(
+                    b"extra"
+                ),
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                contract, asset_root, archive, sidecar = self.public_asset_fixture(root)
+                mutate(archive, sidecar)
+                with self.assertRaises(ValueError):
+                    verify_public_release_contract(contract, asset_root)
+
+    def test_bootstrap_tree_rejects_invalid_public_release_contract_when_present(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "tree"
+            shutil.copytree(
+                ROOT,
+                root,
+                ignore=shutil.ignore_patterns(".git", ".local", "__pycache__"),
+            )
+            contract = root / "manifests" / "public-release.json"
+            contract.write_text("{}\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                verify_bootstrap_tree(root)
+
+    def test_maintainer_publication_runbook_contains_every_release_gate(self):
+        path = ROOT / "docs" / "MAINTAINER_PUBLICATION.md"
+        self.assertTrue(path.is_file())
+        text = path.read_text(encoding="utf-8")
+        for phrase in (
+            "v0.1.0 is unsupported and superseded",
+            "tests.windows_compiler",
+            "scan_public_tree.py",
+            "scan_git_history.py",
+            "run_windows_tests.py",
+            "build_public_release.py",
+            "deterministic dual build",
+            "verify_public_release_contract",
+            "schema parse",
+            "extracted archive scan",
+            "GitHub-visible surfaces",
+            "redistribution rights",
+            "annotated `v0.1.1` tag",
+            "release readback",
+            "secret scanning and push protection",
+            "unauthenticated clean clone",
+            "Rollback",
+            "READY_FOR_PUBLICATION",
+        ):
+            self.assertIn(phrase, text)
+
     def valid_contract_fixture(self):
         return {
             "schema_version": 1,

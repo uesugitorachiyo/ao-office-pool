@@ -81,6 +81,19 @@ INSTALLER = {
     "verify": "packaging/Verify-AOOfficePool.ps1",
 }
 COMPONENT_LOCK = Path(__file__).parents[1] / "manifests" / "components.lock.json"
+PUBLIC_RELEASE_FIELDS = {
+    "schema_version",
+    "repository",
+    "visibility",
+    "tag",
+    "source_commit",
+    "architecture",
+    "assets",
+}
+PUBLIC_ASSET_NAMES = (
+    "ao-office-pool-v0.1.1-windows-x86_64.zip",
+    "ao-office-pool-v0.1.1-windows-x86_64.zip.sha256",
+)
 
 
 def _regular_json(path: Path) -> tuple[dict, bytes]:
@@ -138,6 +151,72 @@ def verify_release_manifest(path: Path) -> dict:
     normalized["candidate_manifest"] = _identity(
         value.get("candidate_manifest"), "candidate-manifest.json"
     )
+    return normalized
+
+
+def _public_identity(value: object, expected_name: str) -> dict:
+    identity = _identity(value, expected_name)
+    if identity["sha256"] == "0" * 64:
+        raise ValueError("invalid public release identity")
+    return identity
+
+
+def verify_public_release_contract(
+    path: Path, asset_root: Path | None = None
+) -> dict:
+    value, _ = _regular_json(path)
+    assets = value.get("assets")
+    if (
+        set(value) != PUBLIC_RELEASE_FIELDS
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or value.get("repository") != REPOSITORY
+        or value.get("visibility") != "public"
+        or value.get("tag") != "v0.1.1"
+        or value.get("architecture") != "windows-x86_64"
+        or not isinstance(value.get("source_commit"), str)
+        or HEX_40.fullmatch(value["source_commit"]) is None
+        or value["source_commit"] == "0" * 40
+        or not isinstance(assets, list)
+        or len(assets) != 2
+    ):
+        raise ValueError("invalid public release contract")
+    normalized = dict(value)
+    normalized["assets"] = [
+        _public_identity(asset, expected_name)
+        for asset, expected_name in zip(assets, PUBLIC_ASSET_NAMES)
+    ]
+    if asset_root is None:
+        return normalized
+
+    root = Path(asset_root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("public asset root must be a regular directory")
+    entries = list(root.iterdir())
+    if (
+        len(entries) != 2
+        or {entry.name for entry in entries} != set(PUBLIC_ASSET_NAMES)
+        or any(
+            entry.is_symlink()
+            or not entry.is_file()
+            or entry.stat(follow_symlinks=False).st_nlink != 1
+            for entry in entries
+        )
+    ):
+        raise ValueError("public asset root does not contain the closed set")
+    for identity in normalized["assets"]:
+        raw = (root / identity["name"]).read_bytes()
+        if (
+            len(raw) != identity["size"]
+            or hashlib.sha256(raw).hexdigest() != identity["sha256"]
+        ):
+            raise ValueError("public release asset identity mismatch")
+    archive = normalized["assets"][0]
+    expected_sidecar = (
+        f"{archive['sha256']}  {archive['name']}\n".encode("ascii")
+    )
+    if (root / PUBLIC_ASSET_NAMES[1]).read_bytes() != expected_sidecar:
+        raise ValueError("public release sidecar semantics mismatch")
     return normalized
 
 
@@ -247,6 +326,9 @@ def verify_bootstrap_tree(root: Path) -> dict:
         if path.is_symlink() or not path.is_file():
             raise ValueError("bootstrap tree is incomplete")
     verify_release_manifest(root / "manifests/developer-preview-release.json")
+    public_release = root / "manifests/public-release.json"
+    if public_release.exists() or public_release.is_symlink():
+        verify_public_release_contract(public_release)
     for relative in BOOTSTRAP_DOCUMENTS:
         path = root / relative
         text = path.read_text(encoding="utf-8")

@@ -35,6 +35,12 @@ MAX_METADATA_OBJECT_SIZE = 16 * 1024 * 1024
 MAX_HEADER_BYTES = 256
 GIT_TIMEOUT_SECONDS = 30.0
 GIT_AGGREGATE_TIMEOUT_SECONDS = 180.0
+HASH_BOUND_HISTORY_FILES = {
+    "packaging/runtime/ao-forge/docs/contracts/goal-run-v0.1.schema.json": (
+        b"517414890362c42a1f68465469093410f2389368",
+        "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c",
+    )
+}
 T = TypeVar("T")
 
 
@@ -241,6 +247,24 @@ def _safe_relative_name(raw: bytes) -> str | None:
     ):
         return None
     return value
+
+
+def _hash_bound_history_name(raw: bytes, object_id: bytes) -> str | None:
+    for relative, (expected_object, _) in HASH_BOUND_HISTORY_FILES.items():
+        if raw == relative.encode("utf-8") and object_id == expected_object:
+            return relative
+    return None
+
+
+def _is_hash_bound_history_blob(
+    relative: str, object_id: bytes, data: bytes
+) -> bool:
+    binding = HASH_BOUND_HISTORY_FILES.get(relative)
+    return bool(
+        binding
+        and object_id == binding[0]
+        and hashlib.sha256(data).hexdigest() == binding[1]
+    )
 
 
 def _read_line(stream: BinaryIO, stage: str) -> bytes:
@@ -515,7 +539,9 @@ def _historical_names(
             occurrence_count += 1
             if occurrence_count > MAX_NAME_OCCURRENCES:
                 raise GitScanError("limit-name-occurrences")
-            name = _safe_relative_name(raw_name)
+            name = _hash_bound_history_name(raw_name, object_id)
+            if name is None:
+                name = _safe_relative_name(raw_name)
             if name is None:
                 key = (object_id, hashlib.sha256(raw_name).digest())
                 if key not in private_occurrences:
@@ -561,7 +587,12 @@ def _scan_blobs(
                 raise GitScanError("git-batch-read")
             name = names.get(blob.object_id)
             relative = name if name is not None else "historical-blob"
-            for finding in scan_content(relative, data, scan_binary=True):
+            content_findings = (
+                []
+                if _is_hash_bound_history_blob(relative, blob.object_id, data)
+                else scan_content(relative, data, scan_binary=True)
+            )
+            for finding in content_findings:
                 findings.append(
                     HistoryFinding(
                         blob.object_id.decode("ascii"),

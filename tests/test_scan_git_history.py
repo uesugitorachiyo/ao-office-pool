@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -22,6 +23,13 @@ def text(*parts):
 
 
 class ScanGitHistoryTests(unittest.TestCase):
+    PINNED_FORGE_SCHEMA = (
+        "packaging/runtime/ao-forge/docs/contracts/goal-run-v0.1.schema.json"
+    )
+    PINNED_FORGE_SCHEMA_SHA256 = (
+        "68a0fb154124fb4c219cc68eeffcc432e2c5c445765e9dbe24b19718fb98d74c"
+    )
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory(
             dir=Path(tempfile.gettempdir()).resolve()
@@ -880,6 +888,39 @@ elif '--batch' in args:
         self.assertEqual({row["rule"] for row in rows}, {"content", "path"})
         self.assertTrue(all("path" not in row for row in rows))
         self.assertNotIn(private_name, completed.stdout + completed.stderr)
+
+    def test_accepts_only_the_hash_bound_historical_forge_schema(self):
+        schema = (ROOT / self.PINNED_FORGE_SCHEMA).read_bytes().replace(b"\r\n", b"\n")
+        self.assertEqual(
+            hashlib.sha256(schema).hexdigest(), self.PINNED_FORGE_SCHEMA_SHA256
+        )
+        self.write(self.PINNED_FORGE_SCHEMA, schema)
+        self.commit("pinned forge schema")
+
+        completed = self.scan()
+
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(self.rows(completed), [])
+
+    def test_rejects_byte_drift_at_the_hash_bound_historical_schema_path(self):
+        schema = (ROOT / self.PINNED_FORGE_SCHEMA).read_bytes().replace(b"\r\n", b"\n")
+        self.write(self.PINNED_FORGE_SCHEMA, schema + b" ")
+        self.commit("drifted forge schema")
+
+        completed = self.scan()
+
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertTrue(self.rows(completed))
+
+    def test_rejects_hash_bound_schema_bytes_at_a_private_alias(self):
+        schema = (ROOT / self.PINNED_FORGE_SCHEMA).read_bytes().replace(b"\r\n", b"\n")
+        self.write("operator-secrets/goal-run-v0.1.schema.json", schema)
+        self.commit("aliased forge schema")
+
+        completed = self.scan()
+
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertTrue(any(row["rule"] == "path" for row in self.rows(completed)))
 
     def test_non_repository_failure_is_bounded_and_path_private(self):
         not_a_repository = Path(self.temporary_directory.name) / "not-a-repository"
