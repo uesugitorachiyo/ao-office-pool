@@ -95,11 +95,9 @@ $ArchiveA = Join-Path $BuildA $AssetName
 $ArchiveB = Join-Path $BuildB $AssetName
 $DigestA = (Get-FileHash -Algorithm SHA256 $ArchiveA).Hash.ToLowerInvariant()
 $DigestB = (Get-FileHash -Algorithm SHA256 $ArchiveB).Hash.ToLowerInvariant()
-if ($DigestA -cne $DigestB -or
-    -not [IO.File]::ReadAllBytes($ArchiveA).AsSpan().SequenceEqual(
-      [IO.File]::ReadAllBytes($ArchiveB))) {
-  throw 'nondeterministic-release'
-}
+if ($DigestA -cne $DigestB) { throw 'nondeterministic-release-hash' }
+& "$env:SystemRoot\System32\fc.exe" /b $ArchiveA $ArchiveB
+if ($LASTEXITCODE -ne 0) { throw 'nondeterministic-release-bytes' }
 ```
 
 This deterministic dual build must also return the exact same `source_commit`
@@ -130,13 +128,13 @@ if ($LASTEXITCODE -ne 0) { throw 'public-contract-failed' }
 ```
 
 Create a new extraction directory, expand the archive without executing it,
-then perform the extracted archive scan and bootstrap verification:
+then perform the extracted archive scan and release-contract verification:
 
 ```powershell
 $Extracted = Join-Path $env:LOCALAPPDATA "AOOfficePoolExtract-$SourceCommit"
 Expand-Archive -LiteralPath $ArchiveA -DestinationPath $Extracted
 & $Python -B scripts/scan_public_tree.py $Extracted
-& $Python -B scripts/verify_bootstrap_contract.py $Extracted
+& $Python -B scripts/verify_release_contract.py $Extracted
 if ($LASTEXITCODE -ne 0) { throw 'archive-verification-failed' }
 ```
 

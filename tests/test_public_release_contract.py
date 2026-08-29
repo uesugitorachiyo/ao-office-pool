@@ -132,6 +132,15 @@ class PublicReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
+    def test_maintainer_runbook_uses_the_release_verifier_for_the_extracted_archive(self):
+        text = (ROOT / "docs" / "MAINTAINER_PUBLICATION.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("verify_release_contract.py $Extracted", text)
+        self.assertNotIn("verify_bootstrap_contract.py $Extracted", text)
+        self.assertIn('"$env:SystemRoot\\System32\\fc.exe" /b', text)
+        self.assertNotIn(".AsSpan().SequenceEqual", text)
+
     def valid_contract_fixture(self):
         return {
             "schema_version": 1,
