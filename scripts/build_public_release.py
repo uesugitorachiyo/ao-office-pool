@@ -79,17 +79,19 @@ def _extract_generated_archive(archive: Path, destination: Path) -> None:
         package.extractall(destination)
 
 
-def _publish_create_only(candidate: Path, output: Path) -> None:
+def _publish_create_only(candidate: Path, output: Path, expected_sha256: str) -> None:
+    if os.name != "nt":
+        raise ValueError("release publication requires Windows")
     before = candidate.stat(follow_symlinks=False)
     if _reparse_or_link(candidate) or not candidate.is_file() or before.st_nlink != 1:
         raise ValueError("release candidate must be a regular unlinked file")
-    os.link(candidate, output, follow_symlinks=False)
+    os.rename(candidate, output)
     after = output.stat(follow_symlinks=False)
     if (
         _reparse_or_link(output)
         or not output.is_file()
-        or (before.st_dev, before.st_ino, before.st_size)
-        != (after.st_dev, after.st_ino, after.st_size)
+        or before.st_size != after.st_size
+        or hashlib.sha256(output.read_bytes()).hexdigest() != expected_sha256
     ):
         raise ValueError("release output identity changed during publication")
 
@@ -136,7 +138,7 @@ def build_public_release(source: Path, component_root: Path, output: Path) -> di
                 component_root,
             )
             data = candidate.read_bytes()
-            _publish_create_only(candidate, output)
+            _publish_create_only(candidate, output, hashlib.sha256(data).hexdigest())
 
     return {
         "source_commit": source_commit,

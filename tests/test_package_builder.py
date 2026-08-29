@@ -47,7 +47,9 @@ class PackageBuilderTests(unittest.TestCase):
             output.write_bytes(b"existing")
 
             with self.assertRaises(FileExistsError):
-                _publish_create_only(candidate, output)
+                _publish_create_only(
+                    candidate, output, hashlib.sha256(b"candidate").hexdigest()
+                )
 
             self.assertEqual(output.read_bytes(), b"existing")
 
