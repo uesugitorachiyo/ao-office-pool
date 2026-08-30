@@ -21,8 +21,8 @@ except ImportError:  # The standard-library checks below remain authoritative.
 ROOT = Path(__file__).parents[1]
 SCHEMA_PATH = ROOT / "schemas" / "public-release.schema.json"
 ASSET_NAMES = [
-    "ao-office-pool-v0.1.2-windows-x86_64.zip",
-    "ao-office-pool-v0.1.2-windows-x86_64.zip.sha256",
+    "ao-office-pool-v0.1.3-windows-x86_64.zip",
+    "ao-office-pool-v0.1.3-windows-x86_64.zip.sha256",
 ]
 
 
@@ -111,7 +111,7 @@ class PublicReleaseContractTests(unittest.TestCase):
         self.assertTrue(path.is_file())
         text = path.read_text(encoding="utf-8")
         for phrase in (
-            "v0.1.0` and `v0.1.1` are unsupported and superseded",
+            "v0.1.0`, `v0.1.1`, and `v0.1.2` are unsupported and superseded",
             "tests.windows_compiler",
             "scan_public_tree.py",
             "scan_git_history.py",
@@ -123,7 +123,7 @@ class PublicReleaseContractTests(unittest.TestCase):
             "extracted archive scan",
             "GitHub-visible surfaces",
             "redistribution rights",
-            "annotated `v0.1.2` tag",
+            "annotated `v0.1.3` tag",
             "release readback",
             "secret scanning and push protection",
             "unauthenticated clean clone",
@@ -146,7 +146,7 @@ class PublicReleaseContractTests(unittest.TestCase):
             "schema_version": 1,
             "repository": "uesugitorachiyo/ao-office-pool",
             "visibility": "public",
-            "tag": "v0.1.2",
+            "tag": "v0.1.3",
             "source_commit": "1" * 40,
             "architecture": "windows-x86_64",
             "assets": [
@@ -173,7 +173,7 @@ class PublicReleaseContractTests(unittest.TestCase):
         self.assertEqual(contract["schema_version"], 1)
         self.assertEqual(contract["repository"], "uesugitorachiyo/ao-office-pool")
         self.assertEqual(contract["visibility"], "public")
-        self.assertEqual(contract["tag"], "v0.1.2")
+        self.assertEqual(contract["tag"], "v0.1.3")
         self.assertIs(type(contract["source_commit"]), str)
         self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", contract["source_commit"]))
         self.assertNotEqual(contract["source_commit"], "0" * 40)
@@ -214,7 +214,7 @@ class PublicReleaseContractTests(unittest.TestCase):
             "schema-version-wrong": {**self.valid_contract_fixture(), "schema_version": 2},
             "repository-drift": {**self.valid_contract_fixture(), "repository": "other/repository"},
             "visibility-drift": {**self.valid_contract_fixture(), "visibility": "private"},
-            "tag-drift": {**self.valid_contract_fixture(), "tag": "v0.1.3"},
+            "tag-drift": {**self.valid_contract_fixture(), "tag": "v0.1.4"},
             "architecture-drift": {**self.valid_contract_fixture(), "architecture": "linux-x86_64"},
             "assets-wrong-type": {**self.valid_contract_fixture(), "assets": {}},
         }

@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ARCHIVE = "ao-office-pool-v0.1.2-windows-x86_64.zip"
+ARCHIVE = "ao-office-pool-v0.1.3-windows-x86_64.zip"
 SIDECAR = f"{ARCHIVE}.sha256"
 
 
@@ -27,7 +27,7 @@ class StableReleaseDocumentationTests(unittest.TestCase):
         )
 
     def test_primary_install_path_is_public_and_single_command(self):
-        self.assertIn("# AO Office Pool v0.1.2", self.readme)
+        self.assertIn("# AO Office Pool v0.1.3", self.readme)
         blocks = re.findall(r"```powershell\n(.*?)\n```", self.readme, re.DOTALL)
         self.assertGreaterEqual(len(blocks), 1)
         self.assertEqual(

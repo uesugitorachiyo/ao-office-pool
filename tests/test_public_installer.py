@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-ARCHIVE_NAME = "ao-office-pool-v0.1.2-windows-x86_64.zip"
+ARCHIVE_NAME = "ao-office-pool-v0.1.3-windows-x86_64.zip"
 SIDECAR_NAME = ARCHIVE_NAME + ".sha256"
 
 
@@ -45,7 +45,7 @@ class PublicAcquisitionTests(unittest.TestCase):
             "schema_version": 1,
             "repository": "uesugitorachiyo/ao-office-pool",
             "visibility": "public",
-            "tag": "v0.1.2",
+            "tag": "v0.1.3",
             "source_commit": "1" * 40,
             "architecture": "windows-x86_64",
             "assets": [
@@ -75,7 +75,7 @@ class PublicAcquisitionTests(unittest.TestCase):
                 "size": identity["size"],
                 "browser_download_url": (
                     "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/"
-                    f"v0.1.2/{identity['name']}"
+                    f"v0.1.3/{identity['name']}"
                 ),
             }
             for identity in contract["assets"]
@@ -87,7 +87,7 @@ class PublicAcquisitionTests(unittest.TestCase):
                 "visibility": "public",
             },
             "release": {
-                "tag_name": "v0.1.2",
+                "tag_name": "v0.1.3",
                 "draft": False,
                 "prerelease": False,
                 "assets": assets,
@@ -195,10 +195,10 @@ class PublicAcquisitionTests(unittest.TestCase):
 
     def test_accepts_official_github_release_asset_redirect_host(self):
         fixture = self.metadata_fixture()
-        for download in fixture["downloads"]:
+        for index, download in enumerate(fixture["downloads"]):
             download["final_url"] = (
                 "https://release-assets.githubusercontent.com/github-production-release-asset/"
-                f"123456/{download['name']}"
+                f"1344607320/755460e2-9a2c-4948-a915-c623467c37f{index}"
             )
         result = self.run_public_acquisition(fixture=fixture)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -206,6 +206,18 @@ class PublicAcquisitionTests(unittest.TestCase):
             sorted((ARCHIVE_NAME, SIDECAR_NAME)),
             sorted(path.name for path in self.destination.iterdir()),
         )
+
+    def test_accepts_release_assets_at_the_installer_path_budget(self):
+        target_length = 175
+        fixed_length = len(str(self.root.resolve())) + 1 + len("\\assets\\") + len(ARCHIVE_NAME)
+        parent = self.root / ("p" * (target_length - fixed_length))
+        parent.mkdir()
+        destination = parent / "assets"
+
+        result = self.run_public_acquisition(destination=destination)
+
+        self.assertEqual(len(str((destination / ARCHIVE_NAME).resolve())), target_length)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_public_acquisition_never_requires_or_emits_github_token(self):
         result = self.run_public_acquisition()
@@ -352,7 +364,7 @@ class PublicAcquisitionTests(unittest.TestCase):
             lambda v: v["repository"].update(full_name="other/repo"),
             lambda v: v["repository"].update(private=True),
             lambda v: v["repository"].update(visibility="private"),
-            lambda v: v["release"].update(tag_name="v0.1.3"),
+            lambda v: v["release"].update(tag_name="v0.1.4"),
             lambda v: v["release"].update(draft=True),
             lambda v: v["release"].update(prerelease=True),
             lambda v: v["release"]["assets"].pop(),
@@ -442,15 +454,15 @@ class PublicAcquisitionTests(unittest.TestCase):
 
     def test_rejects_download_url_and_redirect_identity_drift(self):
         urls = (
-            "http://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
-            "https://user@github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
-            "https://github.com:444/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/" + ARCHIVE_NAME,
+            "http://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.3/" + ARCHIVE_NAME,
+            "https://user@github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.3/" + ARCHIVE_NAME,
+            "https://github.com:444/uesugitorachiyo/ao-office-pool/releases/download/v0.1.3/" + ARCHIVE_NAME,
             "https://example.invalid/" + ARCHIVE_NAME,
             "https://objects.githubusercontent.com/release-assets/" + ARCHIVE_NAME,
             "https://release-assets.githubusercontent.com/github-production-release-asset/123456/" + ARCHIVE_NAME,
-            "https://github.com/other/repo/releases/download/v0.1.2/" + ARCHIVE_NAME,
-            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.3/" + ARCHIVE_NAME,
-            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.2/renamed.zip",
+            "https://github.com/other/repo/releases/download/v0.1.3/" + ARCHIVE_NAME,
+            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.4/" + ARCHIVE_NAME,
+            "https://github.com/uesugitorachiyo/ao-office-pool/releases/download/v0.1.3/renamed.zip",
         )
         for url in urls:
             with self.subTest(url=url):
@@ -480,7 +492,7 @@ class PublicAcquisitionTests(unittest.TestCase):
             ("schema_version", True),
             ("repository", "other/repo"),
             ("visibility", "private"),
-            ("tag", "v0.1.3"),
+            ("tag", "v0.1.4"),
             ("source_commit", "0" * 40),
             ("source_commit", "A" * 40),
             ("architecture", "linux-x86_64"),
@@ -888,7 +900,9 @@ class InstallAndVerifyOrchestrationTests(unittest.TestCase):
         self.contract = self.distribution / "manifests" / "public-release.json"
         self.local_app_data = self.root / "local-app-data"
         self.local_app_data.mkdir()
-        self.private_anchor = self.local_app_data / ".ao-office-pool-private"
+        self.user_profile = self.root / "user-profile"
+        self.user_profile.mkdir()
+        self.private_anchor = self.user_profile / ".ao-office-pool-private"
         self.install_root = self.private_anchor / "installed"
         self.download_root = self.private_anchor / "downloads"
         self.fixture_root = self.root / "fixture"
@@ -939,8 +953,8 @@ $ErrorActionPreference='Stop'
 if ($env:AO_T4_FAIL_EVENT -ceq 'acquire') { exit 7 }
 Add-Content -LiteralPath $env:AO_T4_EVENT_LOG -Value 'acquire'
 New-Item -ItemType Directory -Path $Destination | Out-Null
-Copy-Item -LiteralPath $env:AO_T4_ARCHIVE -Destination (Join-Path $Destination 'ao-office-pool-v0.1.2-windows-x86_64.zip')
-Copy-Item -LiteralPath $env:AO_T4_SIDECAR -Destination (Join-Path $Destination 'ao-office-pool-v0.1.2-windows-x86_64.zip.sha256')
+Copy-Item -LiteralPath $env:AO_T4_ARCHIVE -Destination (Join-Path $Destination 'ao-office-pool-v0.1.3-windows-x86_64.zip')
+Copy-Item -LiteralPath $env:AO_T4_SIDECAR -Destination (Join-Path $Destination 'ao-office-pool-v0.1.3-windows-x86_64.zip.sha256')
 [pscustomobject]@{mode='public'} | ConvertTo-Json -Compress
 """,
             encoding="utf-8",
@@ -963,7 +977,7 @@ Copy-Item -LiteralPath $env:AO_T4_SIDECAR -Destination (Join-Path $Destination '
                     "schema_version": 1,
                     "repository": "uesugitorachiyo/ao-office-pool",
                     "visibility": "public",
-                    "tag": "v0.1.2",
+                    "tag": "v0.1.3",
                     "source_commit": "1" * 40,
                     "architecture": "windows-x86_64",
                     "assets": assets,
@@ -1103,6 +1117,7 @@ switch ($command) {
         environment.update(
             {
                 "LOCALAPPDATA": str(self.local_app_data),
+                "USERPROFILE": str(self.user_profile),
                 "AO_OFFICE_POOL_TEST_MODE": "1",
                 "AO_OFFICE_POOL_INSTALL_VERIFY_ACQUIRE_SCRIPT": str(self.acquire),
                 "AO_T4_EVENT_LOG": str(self.event_log),
@@ -1549,7 +1564,10 @@ switch ($command) {
     def test_success_prints_self_contained_launcher_for_default_install_root(self):
         result = self.run_installer(use_defaults=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = f'& "{self.private_anchor}\\AOOfficePool\\bin\\ao-office-pool.ps1" status'
+        expected = (
+            f'& "{self.user_profile}\\.ao-office-pool-private\\AOOfficePool'
+            '\\bin\\ao-office-pool.ps1" status'
+        )
         self.assertIn(expected, result.stdout)
         self.assertNotIn("$InstallRoot", result.stdout)
 

@@ -9,11 +9,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:Repository = 'uesugitorachiyo/ao-office-pool'
-$script:Tag = 'v0.1.2'
+$script:Tag = 'v0.1.3'
 $script:Architecture = 'windows-x86_64'
 $script:AssetNames = @(
-  'ao-office-pool-v0.1.2-windows-x86_64.zip',
-  'ao-office-pool-v0.1.2-windows-x86_64.zip.sha256'
+  'ao-office-pool-v0.1.3-windows-x86_64.zip',
+  'ao-office-pool-v0.1.3-windows-x86_64.zip.sha256'
 )
 
 Add-Type -TypeDefinition @'
@@ -257,14 +257,21 @@ function Assert-DownloadUri {
   if (
     -not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or -not $uri.IsDefaultPort -or
     -not [string]::IsNullOrEmpty($uri.UserInfo) -or
-    @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com') -cnotcontains $uri.Host -or
-    -not $uri.AbsolutePath.EndsWith('/' + $Name, [StringComparison]::Ordinal)
+    @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com') -cnotcontains $uri.Host
   ) { throw 'download URI is invalid' }
   if ($RequireGitHubPath) {
     $expected = '/' + $script:Repository + '/releases/download/' + $script:Tag + '/' + $Name
     if ($uri.Host -cne 'github.com' -or $uri.AbsolutePath -cne $expected) {
       throw 'download URI is invalid'
     }
+  }
+  elseif ($uri.Host -ceq 'release-assets.githubusercontent.com') {
+    if ($uri.AbsolutePath -cnotmatch '^/github-production-release-asset/[0-9]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+      throw 'download URI is invalid'
+    }
+  }
+  elseif (-not $uri.AbsolutePath.EndsWith('/' + $Name, [StringComparison]::Ordinal)) {
+    throw 'download URI is invalid'
   }
   return $uri
 }
@@ -445,6 +452,18 @@ function Invoke-PublicAsset {
         throw 'public asset request failed'
       }
       [void](Assert-DownloadUri $response.RequestMessage.RequestUri.AbsoluteUri $Identity.name $false)
+      $disposition = $response.Content.Headers.ContentDisposition
+      $responseName = if ($null -ne $disposition -and -not [string]::IsNullOrEmpty($disposition.FileNameStar)) {
+        $disposition.FileNameStar
+      }
+      elseif ($null -ne $disposition) { $disposition.FileName }
+      else { $null }
+      if (
+        $null -eq $disposition -or $disposition.DispositionType -cne 'attachment' -or
+        $responseName -cne $Identity.name -or
+        ($null -ne $response.Content.Headers.ContentLength -and
+          [long]$response.Content.Headers.ContentLength -ne [long]$Identity.size)
+      ) { throw 'asset identity mismatch' }
       $input = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
       try { Write-VerifiedStream $input $DestinationStream $Identity } finally { $input.Dispose() }
     }

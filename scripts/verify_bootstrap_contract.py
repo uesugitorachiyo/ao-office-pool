@@ -91,8 +91,8 @@ PUBLIC_RELEASE_FIELDS = {
     "assets",
 }
 PUBLIC_ASSET_NAMES = (
-    "ao-office-pool-v0.1.2-windows-x86_64.zip",
-    "ao-office-pool-v0.1.2-windows-x86_64.zip.sha256",
+    "ao-office-pool-v0.1.3-windows-x86_64.zip",
+    "ao-office-pool-v0.1.3-windows-x86_64.zip.sha256",
 )
 
 
@@ -172,7 +172,7 @@ def verify_public_release_contract(
         or value.get("schema_version") != 1
         or value.get("repository") != REPOSITORY
         or value.get("visibility") != "public"
-        or value.get("tag") != "v0.1.2"
+        or value.get("tag") != "v0.1.3"
         or value.get("architecture") != "windows-x86_64"
         or not isinstance(value.get("source_commit"), str)
         or HEX_40.fullmatch(value["source_commit"]) is None

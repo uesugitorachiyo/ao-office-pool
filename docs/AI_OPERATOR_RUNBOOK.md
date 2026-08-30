@@ -1,4 +1,4 @@
-# AO Office Pool v0.1.2 Windows AI operator runbook
+# AO Office Pool v0.1.3 Windows AI operator runbook
 
 This runbook has one operational authority:
 `scripts/Install-And-Verify.ps1`. Run it unchanged. Do not reproduce its public
@@ -6,8 +6,8 @@ acquisition, contract validation, extraction, installation, verification, or
 O1 smoke lifecycle. Stop at the first failed gate; later success cannot repair
 an earlier failure.
 
-The public assets are `ao-office-pool-v0.1.2-windows-x86_64.zip` and
-`ao-office-pool-v0.1.2-windows-x86_64.zip.sha256`.
+The public assets are `ao-office-pool-v0.1.3-windows-x86_64.zip` and
+`ao-office-pool-v0.1.3-windows-x86_64.zip.sha256`.
 
 ## G00 — Read and bound the task
 

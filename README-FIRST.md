@@ -1,8 +1,8 @@
-# Start here inside the AO Office Pool v0.1.2 archive
+# Start here inside the AO Office Pool v0.1.3 archive
 
 This is the Windows x86-64 payload named
-`ao-office-pool-v0.1.2-windows-x86_64.zip`. Its external checksum sidecar is
-`ao-office-pool-v0.1.2-windows-x86_64.zip.sha256`.
+`ao-office-pool-v0.1.3-windows-x86_64.zip`. Its external checksum sidecar is
+`ao-office-pool-v0.1.3-windows-x86_64.zip.sha256`.
 
 The archive cannot authenticate itself. The supported public installation path
 starts in the repository checkout and runs `scripts/Install-And-Verify.ps1`,
